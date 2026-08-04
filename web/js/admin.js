@@ -266,7 +266,14 @@ async function renderFolderScreen(main) {
       tbody.append(tr);
     }
     table.append(thead, tbody);
-    catalogSec.append(table);
+    // Own horizontal scroll container — same treatment as the technician
+    // sheet grid (web/js/form-view.js) — so a genuinely tabular admin
+    // listing pans sideways on narrow screens instead of forcing the page
+    // to scroll horizontally.
+    const scroller = document.createElement('div');
+    scroller.className = 'table-scroll';
+    scroller.append(table);
+    catalogSec.append(scroller);
     if (!forms.length) {
       const p = document.createElement('p');
       p.className = 'sig-meta';
@@ -475,7 +482,12 @@ async function renderUsersScreen(main) {
       tbody.append(tr);
     }
     table.append(thead, tbody);
-    tableSec.append(table);
+    // Own horizontal scroll container — see the matching comment in
+    // refreshCatalog() above.
+    const scroller = document.createElement('div');
+    scroller.className = 'table-scroll';
+    scroller.append(table);
+    tableSec.append(scroller);
     if (!users.length) {
       const p = document.createElement('p');
       p.className = 'sig-meta';
@@ -670,7 +682,12 @@ async function renderFieldEditor(container, form) {
   thead.append(headRow);
   const tbody = document.createElement('tbody');
   table.append(thead, tbody);
-  sec.append(table);
+  // Own horizontal scroll container — see the matching comment in
+  // renderFolderScreen()'s refreshCatalog() above.
+  const scroller = document.createElement('div');
+  scroller.className = 'table-scroll';
+  scroller.append(table);
+  sec.append(scroller);
 
   const statusMsg = noticeEl();
   statusMsg.setAttribute('role', 'alert');

@@ -46,5 +46,13 @@ export function renderForm(container, form, { grid, inScopeRows } = {}) {
     body.append(tr);
   }
   table.append(body);
-  container.append(table);
+  // The task grid is a spreadsheet reproduction — it must never reflow/stack
+  // on narrow screens (that would destroy its meaning). Instead it gets its
+  // own horizontal scroll container, so the table can pan sideways while the
+  // page body itself never needs to scroll horizontally. See `.table-scroll`
+  // in app.css.
+  const scroller = document.createElement('div');
+  scroller.className = 'table-scroll';
+  scroller.append(table);
+  container.append(scroller);
 }

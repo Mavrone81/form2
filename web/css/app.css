@@ -48,8 +48,11 @@ a{color:var(--ink)}
 #login[hidden]{display:none}
 #login h1{font-size:16px;font-weight:600;margin:0 0 18px;letter-spacing:-.01em}
 #login label{display:block;font-size:11.5px;color:var(--mute);margin:12px 0 4px}
+/* font-size:16px on mobile (dropped to 13px at `sm`, see the responsive
+   section) avoids iOS Safari's automatic zoom-on-focus for any input under
+   16px — a real mobile usability bug, not just a cosmetic one. */
 #login input{width:100%;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
-  padding:9px 10px;font:inherit;font-size:13px;border-radius:0}
+  padding:9px 10px;font:inherit;font-size:16px;border-radius:0}
 #login button{margin-top:18px;width:100%;border:0;background:var(--ink);color:#fff;
   font:600 12px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
   padding:13px;cursor:pointer}
@@ -58,7 +61,11 @@ a{color:var(--ink)}
 #login-error:empty{margin:0}
 
 /* ---------- Control strip: the running header of the controlled record ---------- */
-#control-strip{display:flex;background:var(--ink);color:#fff;
+/* flex-wrap, not a fixed row: at narrow widths the chips wrap onto more than
+   one line rather than clipping or scrolling out of view. There is no nav
+   bar/hamburger in this app — the record's state chip must always stay
+   visible, so wrapping (never hiding) is the only acceptable behaviour. */
+#control-strip{display:flex;flex-wrap:wrap;background:var(--ink);color:#fff;
   font:500 11px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase}
 #control-strip div{padding:11px 16px;border-right:1px solid var(--line-dark)}
 #control-strip .grow{margin-left:auto;text-align:right;color:var(--mute-on-dark);border-right:0}
@@ -66,29 +73,57 @@ a{color:var(--ink)}
 #control-strip .state[data-state="approved"]{background:var(--ok)}
 
 /* ---------- Two-pane split: the form on the left, fill-in on the right ---------- */
-.split{display:grid;grid-template-columns:1fr 400px;gap:1px;background:var(--rule)}
-#pane-left,#pane-right{background:var(--paper);min-height:76vh}
+/* Mobile-first: a single column by default (the form, then the fill-in panel,
+   in DOM order) — the fixed 400px right pane used to be the main source of
+   horizontal overflow below ~900px, clipping field labels down to a couple
+   of letters. The two-column layout returns at the `lg` breakpoint (see the
+   responsive section at the end of this file), matching this project's
+   original single-column cutoff (~900px) rather than Tailwind's `md`. */
+.split{display:grid;grid-template-columns:1fr;gap:1px;background:var(--rule)}
+#pane-left,#pane-right{background:var(--paper);min-height:76vh;
+  /* Grid/flex items default to a content-based automatic minimum size, which
+     is exactly how a wide child (the task-grid table, before it got its own
+     `.table-scroll` container below) used to force this whole track — and
+     the page itself — wider than the viewport, even at desktop widths.
+     min-width:0 opts back into "shrink to the assigned track size". */
+  min-width:0}
 /* Padding is set per-selector, not via source-order override at equal
    specificity, so re-ordering these rules cannot silently swap the layout. */
-#pane-left{padding:26px 28px}
+#pane-left{padding:16px}
 #pane-right{background:var(--soft);padding:0}
 
 /* ---------- Document sheet header ---------- */
-.sheet-hd{display:grid;grid-template-columns:1fr 150px 60px 66px;border:1px solid var(--ink);border-bottom:0}
-.sheet-hd>div{padding:7px 9px;border-right:1px solid var(--rule);font-size:12px}
+/* Not currently rendered by any script in web/js (a leftover from the design
+   mockup, see docs/design/directions.html) — fixed defensively anyway so it
+   can never reintroduce the same fixed-column overflow as `.split` did if
+   it's ever wired up. Mobile-first: flex-wrap instead of a rigid 4-column
+   grid; the original grid returns at `lg`. */
+.sheet-hd{display:flex;flex-wrap:wrap;border:1px solid var(--ink);border-bottom:0}
+.sheet-hd>div{padding:7px 9px;border-right:1px solid var(--rule);font-size:12px;min-width:0}
 .sheet-hd>div:last-child{border-right:0}
 .sheet-hd .lab{display:block;font:500 9px/1.4 var(--mono);letter-spacing:.1em;
   text-transform:uppercase;color:var(--mute);margin-bottom:3px}
 .sheet-hd .ttl{font-size:14px;font-weight:600}
 
-/* Interval band: which codes (3M / 6M / Y) this record covers */
+/* Interval band: which codes (3M / 6M / Y) this record covers. flex-wrap so
+   three items never force horizontal overflow on the narrowest screens;
+   harmless at wider widths since all three already fit on one line there. */
 .band{padding:9px;border:1px solid var(--ink);border-top:0;border-bottom:1px solid var(--rule);
   font:500 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
-  color:var(--mute);display:flex;gap:20px;justify-content:center}
+  color:var(--mute);display:flex;flex-wrap:wrap;gap:8px 20px;justify-content:center}
 .band b{color:var(--ink)}
 .band .sel{color:var(--stamp)}
 
 /* ---------- Task grid ---------- */
+/* The table itself must NOT reflow into a stacked/card layout on narrow
+   screens — it reproduces a spreadsheet, and stacking it destroys that. It
+   is the one deliberate exception to this file's "mobile-first, never
+   fixed-width" rule: `.table-scroll` gives it its own horizontal scroll
+   container (used here and by the admin listing/mapper tables in
+   web/js/admin.js) so the TABLE pans sideways while the page body itself
+   never needs to. -webkit-overflow-scrolling:touch keeps that scroll
+   momentum-based on iOS. */
+.table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .sheet{border-collapse:collapse;width:100%;font-size:12.5px;border:1px solid var(--ink);border-top:0}
 .sheet th{background:var(--soft);font:600 9.5px/1 var(--mono);letter-spacing:.1em;
   text-transform:uppercase;color:var(--mute);text-align:left;padding:8px 9px;border:1px solid var(--rule)}
@@ -98,8 +133,11 @@ a{color:var(--ink)}
 .sheet td.status-cell{width:96px;padding:0}
 /* Editable status cell: a neutral tint marks it as fillable. Monochrome —
    no warm/yellow highlight, just the --soft grey used elsewhere. */
+/* min-height:44px is the mobile tap-target floor (WCAG 2.5.5 / iOS HIG); it
+   is dropped again at `lg` (see the responsive section) to restore the
+   original compact desktop row height. */
 .sheet td.status-cell input{width:100%;border:0;background:var(--soft);color:var(--ink);
-  padding:6px 9px;font:inherit;font-size:12px}
+  padding:6px 9px;font:inherit;font-size:12px;min-height:44px}
 .sheet td.status-cell input:focus-visible{outline:2px solid var(--ink);outline-offset:-2px;
   background:var(--paper);color:var(--ink)}
 
@@ -119,11 +157,19 @@ a{color:var(--ink)}
 .fld{margin-bottom:13px}
 .fld:last-child{margin:0}
 .fld label{display:block;font-size:11.5px;color:var(--mute);margin-bottom:4px}
-.fld input,.fld textarea{width:100%;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
-  padding:8px 10px;font:inherit;font-size:13px;border-radius:0}
+/* font-size:16px on mobile, dropped to 13px at `sm` — see the #login input
+   comment above; same iOS zoom-on-focus avoidance. min-height:44px is the
+   mobile tap-target floor, dropped again at `lg` (see the responsive
+   section) to restore the original compact desktop height. `select` shares
+   this rule (the admin "New user" role picker, web/js/admin.js) — it had no
+   dedicated rule before and was rendering at the browser default ~22px. */
+.fld input,.fld textarea,.fld select{width:100%;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
+  padding:8px 10px;font:inherit;font-size:16px;border-radius:0;min-height:44px}
 
-.segs{display:flex;border:1px solid var(--ink)}
-.segs button{flex:1;font:600 12px/1 var(--mono);padding:10px 0;border:0;color:var(--ink);
+.segs{display:flex;flex-wrap:wrap;border:1px solid var(--ink)}
+/* min-height:44px is the mobile tap-target floor, dropped again at `lg` (see
+   the responsive section) to restore the original compact desktop height. */
+.segs button{flex:1;font:600 12px/1 var(--mono);padding:10px 0;min-height:44px;border:0;color:var(--ink);
   border-right:1px solid var(--rule);background:var(--paper);cursor:pointer}
 .segs button:last-child{border-right:0}
 .segs button[aria-pressed="true"]{background:var(--ink);color:#fff}
@@ -144,8 +190,11 @@ a{color:var(--ink)}
 
 /* Form / queue picker: full-width buttons choosing a form to start, or an
    existing record to resume from the queue. */
+/* padding:12px (was 11px) clears the 44px tap-target floor at this font
+   size/line-height — a 1px bump, imperceptible at any width, so no
+   breakpoint override is needed. */
 .form-pick{display:block;width:100%;text-align:left;border:1px solid var(--rule);background:var(--paper);
-  color:var(--ink);padding:11px 13px;margin-bottom:8px;font:inherit;font-size:12.5px;cursor:pointer}
+  color:var(--ink);padding:12px 13px;margin-bottom:8px;font:inherit;font-size:12.5px;cursor:pointer}
 .form-pick:last-child{margin-bottom:0}
 .form-pick:hover{border-color:var(--ink)}
 
@@ -156,8 +205,14 @@ a{color:var(--ink)}
    number/revision, interval) are set in var(--mono), matching the control
    strip and interval band elsewhere. The state chip reuses the exact
    red/unapproved · green/approved rule as #control-strip .state. */
-.queue-row{display:grid;grid-template-columns:1fr auto auto auto auto;align-items:center;gap:16px}
-.queue-row .queue-title{font-size:12.5px;color:var(--ink)}
+/* flex-wrap, not a rigid 5-column grid: the fixed 400px right pane (see
+   .split) is too narrow for five nowrap columns at any width once the title
+   is a real sentence-length string, which forced horizontal overflow even
+   at desktop widths, not just mobile. flex-wrap lets the row stay on one
+   line whenever it fits (unchanged at desktop) and wrap onto more when it
+   doesn't, rather than clipping or forcing the page wider. */
+.queue-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px}
+.queue-row .queue-title{flex:1 1 140px;min-width:0;font-size:12.5px;color:var(--ink)}
 .queue-row .queue-doc{font:500 11px/1 var(--mono);letter-spacing:.02em;color:var(--mute);white-space:nowrap}
 .queue-row .queue-machine{font-size:11.5px;color:var(--mute);white-space:nowrap}
 .queue-row .queue-freq{font:600 11px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;
@@ -171,8 +226,11 @@ a{color:var(--ink)}
 .sig canvas{display:block;width:100%;height:112px;touch-action:none;cursor:crosshair}
 .sig .bar{display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--rule);
   padding:6px 10px;font:500 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--mute)}
+/* padding+min-height give Clear a real 44px tap target on mobile; both are
+   dropped again at `lg` (see the responsive section) to restore the
+   original text-sized control. */
 .sig .bar button{border:0;background:none;font:inherit;color:var(--stamp);cursor:pointer;
-  text-transform:uppercase;letter-spacing:.08em}
+  text-transform:uppercase;letter-spacing:.08em;padding:12px;min-height:44px}
 
 /* A completed signature, rendered as a plain image plus signer/timestamp
    text — never a disabled input pretending to hold a drawing. */
@@ -181,8 +239,10 @@ a{color:var(--ink)}
 
 /* ---------- Sign-and-submit action ---------- */
 .act{padding:18px 22px}
+/* padding:16px (was 15px) clears the 44px tap-target floor at this font
+   size/line-height — a 1px bump, imperceptible at any width. */
 .act button{width:100%;border:0;background:var(--ink);color:#fff;font:600 12px/1 var(--mono);
-  letter-spacing:.1em;text-transform:uppercase;padding:15px;cursor:pointer}
+  letter-spacing:.1em;text-transform:uppercase;padding:16px;cursor:pointer}
 .act button:hover{background:var(--stamp);color:#fff}
 .act p{font-size:11.5px;color:var(--mute);margin:11px 0 0;text-align:center}
 
@@ -192,16 +252,16 @@ a{color:var(--ink)}
    "approved" accent (--ok, green) appears outside the state chips —
    consistent with the sheet's single-accent rule, since this link only
    ever renders once the record actually IS approved. */
-.pdf-actions{display:flex;gap:8px;padding:18px 22px;border-bottom:1px solid var(--rule)}
-.pdf-actions a{flex:1;text-align:center;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
-  padding:11px 13px;font:600 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
-  text-decoration:none;cursor:pointer}
+.pdf-actions{display:flex;flex-wrap:wrap;gap:8px;padding:18px 22px;border-bottom:1px solid var(--rule)}
+.pdf-actions a{flex:1 1 140px;text-align:center;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
+  padding:12px 13px;font:600 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+  text-decoration:none;cursor:pointer;min-height:44px;display:flex;align-items:center;justify-content:center}
 .pdf-actions a:hover{border-color:var(--ink)}
 .pdf-actions a.download{background:var(--ok);color:#fff;border-color:var(--ok)}
 .pdf-actions a.download:hover{background:var(--ink);border-color:var(--ink)}
 
 /* ---------- Sign-off chain ---------- */
-.chain{display:flex;gap:0;border:1px solid var(--rule);margin-top:14px;background:var(--paper)}
+.chain{display:flex;flex-wrap:wrap;gap:0;border:1px solid var(--rule);margin-top:14px;background:var(--paper)}
 .chain div{flex:1;padding:9px 10px;border-right:1px solid var(--rule);font:500 9px/1.4 var(--mono);
   letter-spacing:.08em;text-transform:uppercase;color:var(--mute)}
 .chain div:last-child{border-right:0}
@@ -235,14 +295,22 @@ a{color:var(--ink)}
    on every value. */
 .row-tint td{background:var(--tint);color:var(--tint-ink)}
 
+/* The users table's "active" cell is a bare <label> (web/js/admin.js) wrapping
+   a checkbox and a state chip — label semantics already make the whole thing
+   clickable, this just gives that clickable area real tap-target size on
+   mobile rather than only the ~13px checkbox itself. */
+.sheet td label{display:inline-flex;align-items:center;gap:8px;min-height:44px}
+
 /* Editable cell inside an admin listing table (e.g. a field-mapper row's
    label/section/kind, or a user row's full name/role): the same quiet
    "this is fillable" treatment as .sheet td.status-cell, generalised to
    accept a <select> as well as an <input> since these tables also need
    dropdowns, not just free text. */
 .sheet td.edit-cell{padding:0}
+/* min-height:44px is the mobile tap-target floor, dropped again at `lg`
+   (see the responsive section) to restore the original compact row height. */
 .sheet td.edit-cell input,.sheet td.edit-cell select{width:100%;border:0;background:var(--soft);color:var(--ink);
-  padding:6px 9px;font:inherit;font-size:12px}
+  padding:6px 9px;font:inherit;font-size:12px;min-height:44px}
 .sheet td.edit-cell input:focus-visible,.sheet td.edit-cell select:focus-visible{outline:2px solid var(--ink);
   outline-offset:-2px;background:var(--paper);color:var(--ink)}
 
@@ -250,15 +318,56 @@ a{color:var(--ink)}
    distinct from .act button (a single full-width primary action), since
    several of these sit side by side in one narrow cell. */
 .sheet td.actions{width:1%;white-space:nowrap}
+/* min-width/min-height:44px give the reorder/remove buttons a real tap
+   target on mobile (they measured ~25x25px before); dropped again at `lg`
+   (see the responsive section) to restore the original compact buttons. */
 .sheet td.actions button{border:1px solid var(--rule);background:var(--paper);color:var(--ink);
-  font:600 11px/1 var(--mono);padding:6px 8px;margin-right:4px;cursor:pointer}
+  font:600 11px/1 var(--mono);padding:6px 8px;margin-right:4px;cursor:pointer;
+  min-width:44px;min-height:44px}
 .sheet td.actions button:last-child{margin-right:0}
 .sheet td.actions button:hover{border-color:var(--ink)}
 .sheet td.actions button:disabled{color:var(--mute);cursor:not-allowed}
 
-/* ---------- Responsive: single column under 900px ---------- */
-@media (max-width:900px){
-  .split{grid-template-columns:1fr}
+/* ---------- Responsive ----------
+   Mobile-first: every rule above this point targets the smallest screen
+   (375px minimum) by default. These three breakpoints — matching Tailwind's
+   sm/md/lg scale, since that's the vocabulary this was specified in, even
+   though the project has no Tailwind dependency — progressively restore the
+   original desktop layout as more width becomes available. There is
+   deliberately no single "collapse everything under 900px" rule any more
+   (the project's previous, desktop-down breakpoint): each component now
+   states its own mobile baseline above, and only what genuinely needs to
+   change at a wider width is overridden here. */
+
+/* sm (>=640px): plenty of room for a 13px input again — the 16px mobile
+   size above exists solely to dodge iOS's zoom-on-focus below this width. */
+@media (min-width:640px){
+  #login input,.fld input,.fld textarea,.fld select{font-size:13px}
+}
+
+/* md (>=768px): still a single-column `.split` (see lg below) — a fixed
+   400px fill-in pane would leave a cramped, sub-370px form pane at exactly
+   this width — but there's room to restore the original left-pane padding. */
+@media (min-width:768px){
+  #pane-left{padding:26px 28px}
+}
+
+/* lg (>=1024px): restores the exact original desktop layout — the two-column
+   split (this project's own previous cutoff was ~900px; 1024 is the closest
+   Tailwind step and keeps a comfortable margin above it), the sheet header's
+   4-column grid, and every tap target this file enlarged for touch back down
+   to its original compact size. 1280px (this project's desktop target) falls
+   well inside this range, so the desktop layout is pixel-identical to before
+   this change. */
+@media (min-width:1024px){
+  .split{grid-template-columns:1fr 400px}
+  .sheet-hd{display:grid;grid-template-columns:1fr 150px 60px 66px}
+  .fld input,.fld textarea,.fld select{min-height:0}
+  .segs button{padding:10px 0;min-height:0}
+  .sheet td.status-cell input{min-height:0}
+  .sheet td.edit-cell input,.sheet td.edit-cell select{min-height:0}
+  .sheet td.actions button{min-width:0;min-height:0}
+  .sig .bar button{padding:0;min-height:0}
 }
 
 /* ---------- Reduced motion ---------- */
