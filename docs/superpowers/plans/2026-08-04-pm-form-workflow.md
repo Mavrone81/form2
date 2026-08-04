@@ -2801,6 +2801,91 @@ A "Preview PDF" button in the right pane, shown only when the signed-in user's s
 
 ---
 
+### Task 20: Queue view — the missing entry point
+
+Found by auditing all 19 API endpoints against planned UI. `GET /api/submissions` returns the queue for the signed-in role, and `api.queue()` exists in the client, but **nothing renders it**. Task 14 builds only a form picker, which is the technician's "start something new" path.
+
+Without this, a team leader signs in, sees a list of blank forms, and has no way to open the record awaiting their signature. The three-stage workflow is reachable in the API and unreachable in the UI for stages 2 and 3 — the app cannot actually complete a sign-off.
+
+Build to approved Direction A: monochrome, grid-forward, codes in monospace, one accent for state.
+
+**Files:**
+- Create: `web/js/queue-view.js`
+- Modify: `web/js/app.js` (route to the queue on sign-in), `web/css/app.css`
+
+**Interfaces:**
+- Consumes: `api.queue()`, `api.forms()`, `api.submission(id)`.
+- Produces: `renderQueue(container, {submissions, forms, user, onOpen, onNew}) -> void`.
+
+Per role, the queue is what that person is expected to act on:
+
+| Role | Sees | Primary action |
+|---|---|---|
+| technician | own records, any state | "Start a new record" → form picker |
+| team_leader | records at `pending_lead` | open and sign |
+| engineer | records at `pending_engineer` | open and approve |
+| admin | everything | open (read-only) |
+
+- [ ] **Step 1: Write the failing test**
+
+`test/queue-view.static.test.js` — a static guard, labelled as such:
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+// Static guards. These check the source's shape, not its runtime behaviour —
+// there is no DOM here. Real behaviour is verified in the browser in Task 19.
+const src = readFileSync(new URL('../web/js/queue-view.js', import.meta.url), 'utf8');
+
+test('queue view never interprets record text as markup', () => {
+  for (const bad of ['innerHTML', 'insertAdjacentHTML', 'outerHTML', 'document.write']) {
+    assert.ok(!src.includes(bad), `${bad} must not appear`);
+  }
+});
+
+test('queue view renders an empty state rather than a blank pane', () => {
+  assert.match(src, /empty|nothing|no records/i);
+});
+
+test('app routes to the queue after sign-in', () => {
+  const app = readFileSync(new URL('../web/js/app.js', import.meta.url), 'utf8');
+  assert.match(app, /renderQueue/);
+});
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `node --test test/queue-view.static.test.js`
+Expected: FAIL — cannot find `web/js/queue-view.js`.
+
+- [ ] **Step 3: Build the queue**
+
+`web/js/queue-view.js` renders one row per submission: machine ID, form title, document number and revision in monospace, the interval code, who it is with, when it last moved, and a state chip using the same `#control-strip .state` colours (red unapproved, green approved). Clicking a row calls `onOpen(submission.id)`.
+
+Use `textContent` throughout. Reuse `.sec`, `.sheet` and the tokens; add rules only where genuinely needed, and set `color` on any control.
+
+**Empty state matters.** A team leader with nothing pending must see a plain sentence — "Nothing is waiting for you." — not an empty pane they mistake for a loading failure. A technician with no records sees an invitation to start one.
+
+For a technician, show "Start a new record" leading to the existing form picker. Do not show that button to a team leader or engineer: they never create records.
+
+- [ ] **Step 4: Route sign-in to the queue**
+
+In `web/js/app.js`, after `boot()` establishes the user, render the queue rather than the form picker. The form picker becomes what "Start a new record" opens, for technicians only.
+
+- [ ] **Step 5: Verify every role can complete the chain**
+
+Run the app. As `tech`, create and submit a record. Sign out. As `lead`, confirm it appears in the queue, open it, sign, submit. As `eng`, confirm it appears, open, approve. This is the first time the full chain is walkable in a browser rather than over HTTP.
+
+- [ ] **Step 6: Run the suite and commit**
+
+```bash
+git add web/js/queue-view.js web/js/app.js web/css/app.css test/queue-view.static.test.js
+git commit -m "Add queue view so team leaders and engineers can reach their records"
+```
+
+---
+
 ### Task 19: Visual design pass
 
 Direction **A — Document control** was reviewed and approved by the user on 2026-08-04, after the contrast defect in the mockup was fixed. Monochrome, grid-forward, codes set as codes; one accent carries record state.
