@@ -25,3 +25,6 @@ npm-debug.log*
 # Design mockups render real form content (task text, doc numbers) for
 # fidelity. That content is sensitive, so mockups stay local.
 docs/design/
+
+# Generated from the sensitive forms folder
+test/fixtures.local.json
