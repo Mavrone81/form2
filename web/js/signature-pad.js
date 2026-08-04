@@ -7,12 +7,26 @@
 // touches the DOM node it is given and the design tokens already defined
 // in web/css/app.css (via the `.sig` class family).
 //
-// Resize safety: canvas.width/height reset the bitmap to blank as a side
-// effect of the browser reallocating the backing store. fit() snapshots the
-// current drawing to a data URL first and redraws it after resizing, so a
-// signature already on the pad survives a window resize or device
-// rotation. Without this, rotating a tablet mid-signature would silently
-// wipe the stroke and the technician could go on to "sign" a blank pad.
+// Resize safety: canvas.width/height reset the visible bitmap to blank as a
+// side effect of the browser reallocating the backing store — even when the
+// numeric value doesn't change. A resize BURST (dragging a window edge, a
+// tablet rotation firing several resize/orientationchange events) can queue
+// more than one fit() run. An async restore — snapshot via toDataURL(),
+// then redraw once a deferred image-decode callback fires later — is a
+// race: a second fit() can run before that earlier callback fires, snapshot
+// the now-blank canvas, and the signature is gone forever — while `dirty`
+// stays true, so isEmpty() and toPNG() keep lying that a signature is
+// present. That is worse than losing the drawing: the app would go on to
+// submit a blank-but-"present" signature on a signed quality record.
+//
+// Fix: keep an offscreen `backing` canvas as the source of truth, updated
+// synchronously after every completed stroke segment. fit() restores from
+// it with a SYNCHRONOUS ctx.drawImage(backing, ...) — no deferred decode
+// step, no data URL, no asynchronous gap for another fit() or a new stroke
+// to land in. Repeated/rapid resizes and rotations are safe by
+// construction, not by a dedup flag alone (a dedup flag is still applied to
+// requestAnimationFrame itself, see scheduleFit(), but the correctness
+// guarantee comes from the restore being synchronous).
 export function createSignaturePad(container, { name = '' } = {}) {
   container.replaceChildren();
   container.className = 'sig';
@@ -39,27 +53,55 @@ export function createSignaturePad(container, { name = '' } = {}) {
   const ctx = canvas.getContext('2d');
   let dirty = false;
 
+  // Offscreen backing canvas: holds a full copy of the visible canvas's
+  // pixels as of the last completed stroke segment. It is never touched by
+  // fit() except as a read-only drawImage() source, so it is unaffected by
+  // however many times the visible canvas gets resized.
+  const backing = document.createElement('canvas');
+  const backingCtx = backing.getContext('2d');
+
+  function syncBacking() {
+    // Resizing `backing` itself blanks it, same as the visible canvas — but
+    // that's safe here because we immediately overwrite it with a full,
+    // fresh copy of the (already up to date) visible canvas, all
+    // synchronously, in the same call.
+    if (backing.width !== canvas.width) backing.width = canvas.width;
+    if (backing.height !== canvas.height) backing.height = canvas.height;
+    backingCtx.clearRect(0, 0, backing.width, backing.height);
+    backingCtx.drawImage(canvas, 0, 0);
+  }
+
   function fit() {
     const rect = canvas.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
     const dpr = window.devicePixelRatio || 1;
-    // Snapshot BEFORE touching canvas.width/height — assigning either
-    // property clears the bitmap even if the numeric value is unchanged.
-    const snapshot = dirty ? canvas.toDataURL() : null;
+    const hadContent = dirty;
     canvas.width = rect.width * dpr;
     canvas.height = rect.height * dpr;
     ctx.scale(dpr, dpr);
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.strokeStyle = '#16181d';
-    if (snapshot) {
-      const img = new Image();
-      img.onload = () => ctx.drawImage(img, 0, 0, rect.width, rect.height);
-      img.src = snapshot;
+    if (hadContent) {
+      // Synchronous restore, scaling the backing canvas's pixels (whatever
+      // size they were captured at) into the newly-sized bitmap. Completes
+      // before this function returns — there is no frame in which the
+      // canvas is visibly/actually blank while dirty is still true.
+      ctx.drawImage(backing, 0, 0, backing.width, backing.height, 0, 0, rect.width, rect.height);
     }
   }
-  requestAnimationFrame(fit);
-  window.addEventListener('resize', () => requestAnimationFrame(fit));
+
+  // Dedup the animation-frame scheduling itself: a burst of resize events
+  // (window drag, rotation) only ever has one fit() pending at a time, and
+  // it always runs against the most recent rect.
+  let fitHandle = null;
+  function scheduleFit() {
+    if (fitHandle !== null) cancelAnimationFrame(fitHandle);
+    fitHandle = requestAnimationFrame(() => { fitHandle = null; fit(); });
+  }
+  scheduleFit();
+  const onResize = () => scheduleFit();
+  window.addEventListener('resize', onResize);
 
   let drawing = false;
   const at = (e) => {
@@ -86,13 +128,22 @@ export function createSignaturePad(container, { name = '' } = {}) {
     ctx.beginPath();
     ctx.moveTo(x, y);
     dirty = true;
+    // Commit this segment to the backing canvas immediately, synchronously,
+    // in the same tick as the stroke itself. A resize that lands between
+    // this pointermove and the next one restores from an up-to-date
+    // backing, so an in-progress signature can never be caught mid-air.
+    syncBacking();
   });
   const stop = () => { drawing = false; };
   canvas.addEventListener('pointerup', stop);
   canvas.addEventListener('pointercancel', stop);
   canvas.addEventListener('pointerleave', stop);
 
-  const clear = () => { ctx.clearRect(0, 0, canvas.width, canvas.height); dirty = false; };
+  const clear = () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    backingCtx.clearRect(0, 0, backing.width, backing.height);
+    dirty = false;
+  };
   clearBtn.addEventListener('click', clear);
 
   return {
@@ -101,6 +152,14 @@ export function createSignaturePad(container, { name = '' } = {}) {
     // Returns null when nothing has been drawn. The submit workflow relies
     // on this to refuse an unsigned record — an empty-but-non-null data URL
     // (a blank PNG) would defeat that check by looking like a real signature.
-    toPNG: () => (dirty ? canvas.toDataURL('image/png') : null)
+    toPNG: () => (dirty ? canvas.toDataURL('image/png') : null),
+    // Every record open recreates a pad; without this the window resize
+    // listener (and everything it closes over — both canvases, contexts,
+    // DOM nodes) is retained by `window` forever. Additive: existing
+    // callers that only use {clear, isEmpty, toPNG} are unaffected.
+    destroy: () => {
+      if (fitHandle !== null) cancelAnimationFrame(fitHandle);
+      window.removeEventListener('resize', onResize);
+    }
   };
 }

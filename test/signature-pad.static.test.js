@@ -46,18 +46,51 @@ test('pressure drives stroke width, with a fallback when the device only reports
   assert.match(src, /!==\s*0\.5/);
 });
 
-test('resize path snapshots the canvas before resizing and redraws it after, so an in-progress signature is not wiped', () => {
-  // Order matters: the snapshot must be taken before canvas.width/height
-  // are reassigned, because assigning either property clears the bitmap.
+test('resize path restores the signature with a SYNCHRONOUS drawImage — no Image()/onload round trip', () => {
+  // Regression guard for the Critical finding: an async restore
+  // (toDataURL() -> new Image() -> onload -> drawImage) leaves a window in
+  // which a second resize (a burst from a window drag, or an
+  // orientationchange firing multiple resize events) can run before the
+  // first restore lands, snapshot an already-blank canvas, and permanently
+  // erase the signature while `dirty` stays true — the pad then lies about
+  // having a signature. A synchronous drawImage() from an offscreen backing
+  // canvas closes that window entirely: nothing async, nothing to race.
+  assert.doesNotMatch(src, /new Image\(/, 'must not reintroduce the async Image()/onload restore path');
+  assert.doesNotMatch(src, /\.onload\s*=/, 'must not reintroduce an async onload restore callback');
+
   const fitBody = /function fit\(\)\s*\{([\s\S]*?)\n  \}/.exec(src);
   assert.ok(fitBody, 'expected a fit() function in signature-pad.js');
   const body = fitBody[1];
-  const snapshotIdx = body.indexOf('toDataURL');
-  const widthAssignIdx = body.indexOf('canvas.width =');
-  assert.ok(snapshotIdx !== -1, 'expected a canvas.toDataURL() snapshot in fit()');
-  assert.ok(widthAssignIdx !== -1, 'expected canvas.width to be reassigned in fit()');
-  assert.ok(snapshotIdx < widthAssignIdx, 'snapshot must be taken before canvas.width is reassigned');
-  assert.match(body, /drawImage/, 'expected the snapshot to be redrawn back onto the canvas');
+  assert.match(body, /ctx\.drawImage\(\s*backing\s*,/, 'fit() must restore synchronously from the backing canvas');
+});
+
+test('completed stroke segments are committed to an offscreen backing canvas synchronously', () => {
+  // The backing canvas is what fit() restores from. It must be kept
+  // up to date synchronously, in the same call stack as the stroke that
+  // produced it — not deferred — or a resize landing between a stroke and
+  // a later sync could still restore stale content.
+  assert.match(src, /const backing = document\.createElement\(\s*['"]canvas['"]\s*\)/);
+  assert.match(src, /backingCtx\.drawImage\(\s*canvas\s*,/, 'expected the backing canvas to be synced from the visible canvas');
+  // Called from within the pointermove handler, not from a callback/promise.
+  const pointermove = /addEventListener\(\s*['"]pointermove['"][\s\S]*?\}\);/.exec(src);
+  assert.ok(pointermove, 'expected a pointermove handler');
+  assert.match(pointermove[0], /syncBacking\(\)/, 'expected the pointermove handler to sync the backing canvas synchronously');
+});
+
+test('resize scheduling is deduped: a pending animation frame is cancelled before scheduling a new one', () => {
+  // Findings 1/2's real fix is the synchronous restore above; this dedup is
+  // the accompanying hygiene fix so a resize burst does not pile up
+  // redundant fit() calls.
+  assert.match(src, /cancelAnimationFrame\(/, 'expected cancelAnimationFrame to appear alongside requestAnimationFrame');
+  assert.match(src, /requestAnimationFrame\(/);
+});
+
+test('clear() empties the backing canvas too, not just the visible one', () => {
+  // Otherwise Clear followed by a resize would resurrect the cleared
+  // signature from a stale backing copy.
+  const clearBody = /const clear = \(\) => \{([\s\S]*?)\};/.exec(src);
+  assert.ok(clearBody, 'expected a clear() implementation');
+  assert.match(clearBody[1], /backingCtx\.clearRect/);
 });
 
 test('isEmpty() reflects the same dirty flag that clear() resets', () => {
@@ -68,4 +101,15 @@ test('isEmpty() reflects the same dirty flag that clear() resets', () => {
 test('the canvas is keyboard-focusable and has an accessible label', () => {
   assert.match(src, /canvas\.tabIndex\s*=\s*0/);
   assert.match(src, /setAttribute\(\s*['"]aria-label['"]/);
+});
+
+test('the pad exposes destroy() to remove the window resize listener and stop leaking', () => {
+  // Every record open recreates a pad. Without a teardown, the window
+  // resize listener added at module scope keeps the whole closure (both
+  // canvases, both contexts, DOM nodes) alive forever, once per pad ever
+  // created in the session.
+  const returned = /return\s*\{([\s\S]*?)\n  \};/.exec(src);
+  assert.ok(returned, 'expected the module to return an object literal');
+  assert.match(returned[1], /destroy:/, 'expected the returned object to expose destroy()');
+  assert.match(src, /removeEventListener\(\s*['"]resize['"]/, 'destroy() must remove the resize listener it added');
 });
