@@ -28,3 +28,6 @@ docs/design/
 
 # Generated from the sensitive forms folder
 test/fixtures.local.json
+
+# Completed/signed PM records (the expected output format). Sensitive.
+PM Document 2026/

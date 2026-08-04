@@ -2579,6 +2579,228 @@ git commit -m "Add Docker Compose deployment"
 
 ---
 
+### Task 17: PDF/A-2u record generation
+
+Render a completed record as an archival PDF. **Verified by spike before planning** (PDFKit 0.19.1): `subset: 'PDF/A-2'` alone produces conformance **B** with no embedded font and no `ToUnicode`. Registering a real TTF yields `FontFile2` and `ToUnicode`. The conformance letter and the ICC OutputIntent must be supplied explicitly.
+
+**Files:**
+- Create: `server/pdf-record.js`
+- Create: `assets/fonts/DejaVuSans.ttf`, `assets/fonts/DejaVuSans-Bold.ttf` (vendored — a container has no system fonts)
+- Create: `assets/sRGB.icc`
+- Create: `test/pdf-record.test.js`
+- Modify: `package.json` (add `pdfkit`)
+
+**Interfaces:**
+- Consumes: `buildGrid`, `parseWorkbook`, the submission record and its signatures.
+- Produces: `renderRecordPdf({form, submission, snapshot, values, signatures, grid}) -> Promise<Buffer>`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/pdf-record.test.js`:
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { renderRecordPdf } from '../server/pdf-record.js';
+
+const FIXTURE = {
+  form: { file_name: 'x.xlsx', title: 'Sample Record', doc_number: 'DOC 001', revision: 'A', file_type: 'xlsx' },
+  submission: { id: 1, machine_id: 'AA01', frequency: 'Y', state: 'approved', created_at: '2026-08-01T00:00:00Z' },
+  snapshot: [
+    { field_key: 'machine_id', label: 'Machine ID', section: 'Record', kind: 'text' },
+    { field_key: 'task_28', label: 'Check the widget', section: 'Tasks', kind: 'text' }
+  ],
+  values: [{ field_key: 'machine_id', value: 'AA01' }, { field_key: 'task_28', value: 'OK' }],
+  signatures: [{ stage: 'technician', full_name: 'A Person', image_png: null, signed_at: '2026-08-02T09:00:00Z' }],
+  grid: { columns: [{ index: 1, width: 60 }], rows: [{ index: 1, height: 15, cells: [
+    { col: 1, span: { rows: 1, cols: 1 }, text: 'Header', bold: true, align: 'left',
+      borders: { t: true, r: true, b: true, l: true } }] }] }
+};
+
+test('produces a PDF carrying every PDF/A-2u structure', async () => {
+  const buf = await renderRecordPdf(FIXTURE);
+  const s = buf.toString('latin1');
+  assert.match(s.slice(0, 9), /^%PDF-1\.7/);
+  assert.ok(s.includes('FontFile2'), 'font must be embedded');
+  assert.ok(s.includes('ToUnicode'), 'text must carry a Unicode map — this is what the "u" means');
+  assert.ok(s.includes('ICCBased'), 'OutputIntent needs a real ICC profile stream');
+  assert.ok(s.includes('OutputIntent'), 'PDF/A requires an OutputIntent');
+  assert.match(s, /pdfaid:part[^0-9]*2/, 'must declare part 2');
+  assert.match(s, /pdfaid:conformance[^A-Z]*U/, 'must declare conformance U, not the PDFKit default B');
+  assert.ok(!s.includes('/Encrypt'), 'PDF/A forbids encryption');
+});
+
+test('embeds a signature image when present', async () => {
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const buf = await renderRecordPdf({ ...FIXTURE,
+    signatures: [{ stage: 'technician', full_name: 'A Person', image_png: png, signed_at: '2026-08-02T09:00:00Z' }] });
+  assert.ok(buf.toString('latin1').includes('/Image'), 'signature image should be drawn');
+});
+
+test('a malformed signature image does not abort the record', async () => {
+  // A record must still be producible even if one signature blob is corrupt.
+  const buf = await renderRecordPdf({ ...FIXTURE,
+    signatures: [{ stage: 'technician', full_name: 'A Person', image_png: 'data:image/png;base64,NOTVALID', signed_at: 'x' }] });
+  assert.ok(buf.length > 1000);
+});
+
+// Real conformance is a claim an archive will reject if wrong. Validate it for
+// real where veraPDF is available, and skip cleanly where it is not.
+const hasVera = (() => {
+  try { execFileSync('verapdf', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
+})();
+
+test('veraPDF confirms PDF/A-2U conformance', { skip: hasVera ? false : 'veraPDF not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdfa-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    writeFileSync(file, await renderRecordPdf(FIXTURE));
+    const out = execFileSync('verapdf', ['-f', '2u', '--format', 'text', file], { encoding: 'utf8' });
+    assert.match(out, /PASS/, `veraPDF reported: ${out}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `node --test test/pdf-record.test.js`
+Expected: FAIL — cannot find module `../server/pdf-record.js`.
+
+- [ ] **Step 3: Vendor the font and colour profile**
+
+Fonts must be vendored: a container has no system fonts, and PDF/A requires embedding. Use DejaVu Sans (public-domain-equivalent licence, broad Unicode coverage). Place `DejaVuSans.ttf` and `DejaVuSans-Bold.ttf` in `assets/fonts/`, and an sRGB IEC61966-2.1 ICC profile at `assets/sRGB.icc`.
+
+`.gitignore` blocks `*.pdf` but not `.ttf`/`.icc`; these are program assets, not form content, and are committed deliberately. Confirm with `git status --short` that they stage.
+
+- [ ] **Step 4: Write the generator**
+
+`server/pdf-record.js`:
+```js
+import PDFDocument from 'pdfkit';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const asset = (p) => fileURLToPath(new URL(`../assets/${p}`, import.meta.url));
+const REGULAR = asset('fonts/DejaVuSans.ttf');
+const BOLD = asset('fonts/DejaVuSans-Bold.ttf');
+const ICC = asset('sRGB.icc');
+
+export async function renderRecordPdf({ form, submission, snapshot, values, signatures, grid }) {
+  const doc = new PDFDocument({
+    pdfVersion: '1.7', subset: 'PDF/A-2', tagged: true, lang: 'en-GB',
+    size: 'A4', margin: 28,
+    info: {
+      Title: `${form.title || form.file_name} — ${submission.machine_id}`,
+      Author: 'Preventive maintenance records',
+      Subject: `${form.doc_number} rev ${form.revision}`,
+      CreationDate: new Date(submission.created_at)
+    }
+  });
+  doc.registerFont('body', REGULAR);
+  doc.registerFont('bold', BOLD);
+  doc.font('body');
+
+  // PDFKit hardcodes conformance B and does not embed an ICC profile. Both are
+  // required for 2u, so patch the XMP and attach the OutputIntent explicitly.
+  forcePdfA2u(doc);
+  attachOutputIntent(doc, readFileSync(ICC));
+
+  drawHeader(doc, form, submission);
+  drawGrid(doc, grid);
+  drawValues(doc, snapshot, values);
+  drawSignatures(doc, signatures);
+
+  doc.end();
+  return await streamToBuffer(doc);
+}
+```
+
+Implement the helpers:
+- `forcePdfA2u(doc)` — replace `pdfaid:conformance` `B` with `U` in the XMP packet PDFKit emits. The spike confirmed PDFKit writes `B` unconditionally.
+- `attachOutputIntent(doc, iccBuffer)` — add an `/OutputIntent` with an `ICCBased` stream (`/N 3` for sRGB), referenced from the catalog.
+- `drawGrid` — walk `grid.rows`/`grid.cells`, honouring `span`, `borders`, `bold`, `align` and `columns[].width`, scaled to the page width. This is what reproduces the form's layout.
+- `drawSignatures` — draw each signature's PNG (strip the `data:image/png;base64,` prefix) with the signer's name and server timestamp beneath. Wrap each in try/catch so one corrupt blob cannot abort the record.
+- `streamToBuffer(doc)` — collect `data` events into a Buffer, resolve on `end`.
+
+- [ ] **Step 5: Run tests**
+
+Run: `node --test test/pdf-record.test.js`
+Expected: PASS. The veraPDF test skips unless veraPDF is installed.
+
+To validate conformance for real (recommended once before shipping):
+```bash
+brew install verapdf     # or download from verapdf.org
+npm test                 # the conformance test now runs instead of skipping
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add server/pdf-record.js assets/ test/pdf-record.test.js package.json package-lock.json
+git commit -m "Add PDF/A-2u record generation"
+```
+
+---
+
+### Task 18: Preview and download
+
+Team leader and engineer can preview the record as a PDF once they have signed; the engineer can download it after approving.
+
+**Files:**
+- Modify: `server/routes.js`
+- Modify: `web/js/app.js`, `web/css/app.css`
+- Test: `test/pdf-routes.test.js`
+
+**Interfaces:**
+- `GET /api/submissions/:id/pdf` — inline preview (`Content-Disposition: inline`)
+- `GET /api/submissions/:id/pdf?download=1` — attachment, filename `<machine_id>.pdf`
+
+Access rules, enforced server-side:
+
+| Role | Before they sign | After they sign |
+|---|---|---|
+| technician | ✗ 403 | ✗ 403 |
+| team_leader | ✗ 403 | ✓ preview |
+| engineer | ✗ 403 | ✓ preview + download |
+| admin | ✓ preview | ✓ preview |
+
+- [ ] **Step 1: Write the failing test**
+
+`test/pdf-routes.test.js` — using the same in-process server pattern as `test/api.test.js`:
+```js
+test('a team leader cannot preview before signing, and can after', async () => { /* … */ });
+test('a technician is refused the pdf in every state', async () => { /* … */ });
+test('download sets an attachment filename from the machine id', async () => { /* … */ });
+test('an unknown submission returns 404, not a stack trace', async () => { /* … */ });
+```
+Assert real status codes and the `content-disposition` header; assert the body starts with `%PDF`.
+
+- [ ] **Step 2: Run to verify it fails, then implement the route**
+
+```js
+r.get('/submissions/:id/pdf', signedIn, async (req, res) => {
+  const sub = db.prepare('select * from submissions where id=?').get(req.params.id);
+  if (!sub) return res.status(404).json({ error: 'Record not found.' });
+  const user = req.session.user;
+  const signed = db.prepare('select stage from signatures where submission_id=?').all(sub.id).map((s) => s.stage);
+  const allowed = user.role === 'admin'
+    || ((user.role === 'team_leader' || user.role === 'engineer') && signed.includes(user.role));
+  if (!allowed) return res.status(403).json({ error: 'Available once you have signed this record.' });
+  // …build inputs, call renderRecordPdf, set headers, send buffer
+});
+```
+
+- [ ] **Step 3: Add the UI**
+
+A "Preview PDF" button in the right pane, shown only when the signed-in user's stage signature exists. It opens the inline URL. For the engineer on an approved record, also show "Download for archive", pointing at `?download=1`.
+
+- [ ] **Step 4: Run the suite and commit**
+
+---
+
 ## Verification checklist
 
 Before calling this done, confirm each by running it — not by reading the code:
