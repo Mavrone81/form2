@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Preventive maintenance records</title>
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <form id="login" hidden>
+    <h1>Preventive maintenance records</h1>
+    <label for="u">Username</label><input id="u" name="username" autocomplete="username" required>
+    <label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+    <p id="login-error" role="alert"></p>
+  </form>
+
+  <div id="app" hidden>
+    <div id="control-strip"></div>
+    <main class="split">
+      <section id="pane-left" aria-label="The form"></section>
+      <section id="pane-right" aria-label="Fill in"></section>
+    </main>
+  </div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
