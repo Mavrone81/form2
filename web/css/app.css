@@ -9,6 +9,11 @@
   --ink:#16181d; --paper:#fff; --shell:#e9eaed; --rule:#c8cbd1;
   --soft:#f4f5f7; --mute:#6b7078; --stamp:#b4232a; --ok:#0f6e5c;
   --mono:Menlo,"SF Mono",monospace;
+  /* Neutral extensions of the eight base tokens — same monochrome family,
+     for shades the eight tokens don't cover: a divider and a muted label on
+     the dark control strip, and the out-of-scope row tint/text. None of
+     these introduce a hue; they stay grey/near-black like their parents. */
+  --line-dark:#33373e; --mute-on-dark:#9ba1a9; --tint:#eef0f3; --tint-ink:#3d434b;
   color-scheme:light;                 /* never inherit a dark UA form palette */
 }
 *,*::before,*::after{box-sizing:border-box}
@@ -17,7 +22,10 @@ body{margin:0;background:var(--shell);color:var(--ink);
   font:400 15px/1.5 "Helvetica Neue",Helvetica,Arial,sans-serif}
 
 /* Controls do not inherit colour. Declare it, or a white input in a
-   dark-mode browser renders white text on a white background. */
+   dark-mode browser renders white text on a white background. Every rule
+   below that sets a background on a control also restates colour locally —
+   deliberately redundant so no control's readability depends on a distant
+   rule staying unchanged. */
 input,textarea,select,button{font:inherit;color:var(--ink)}
 ::placeholder{color:var(--mute);opacity:1}
 :focus-visible{outline:2px solid var(--ink);outline-offset:2px}
@@ -32,26 +40,29 @@ a{color:var(--ink)}
 }
 #login h1{font-size:16px;font-weight:600;margin:0 0 18px;letter-spacing:-.01em}
 #login label{display:block;font-size:11.5px;color:var(--mute);margin:12px 0 4px}
-#login input{width:100%;border:1px solid var(--rule);background:var(--paper);
+#login input{width:100%;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
   padding:9px 10px;font:inherit;font-size:13px;border-radius:0}
 #login button{margin-top:18px;width:100%;border:0;background:var(--ink);color:#fff;
   font:600 12px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
   padding:13px;cursor:pointer}
-#login button:hover{background:var(--stamp)}
+#login button:hover{background:var(--stamp);color:#fff}
 #login-error{min-height:1.4em;color:var(--stamp);font-size:12.5px;margin:12px 0 0}
 #login-error:empty{margin:0}
 
 /* ---------- Control strip: the running header of the controlled record ---------- */
 #control-strip{display:flex;background:var(--ink);color:#fff;
   font:500 11px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase}
-#control-strip div{padding:11px 16px;border-right:1px solid #33373e}
-#control-strip .grow{margin-left:auto;text-align:right;color:#9ba1a9;border-right:0}
+#control-strip div{padding:11px 16px;border-right:1px solid var(--line-dark)}
+#control-strip .grow{margin-left:auto;text-align:right;color:var(--mute-on-dark);border-right:0}
 #control-strip .state{margin-left:auto;background:var(--stamp);border-right:0}
 #control-strip .state[data-state="approved"]{background:var(--ok)}
 
 /* ---------- Two-pane split: the form on the left, fill-in on the right ---------- */
 .split{display:grid;grid-template-columns:1fr 400px;gap:1px;background:var(--rule)}
-#pane-left,#pane-right{background:var(--paper);min-height:76vh;padding:26px 28px}
+#pane-left,#pane-right{background:var(--paper);min-height:76vh}
+/* Padding is set per-selector, not via source-order override at equal
+   specificity, so re-ordering these rules cannot silently swap the layout. */
+#pane-left{padding:26px 28px}
 #pane-right{background:var(--soft);padding:0}
 
 /* ---------- Document sheet header ---------- */
@@ -77,17 +88,21 @@ a{color:var(--ink)}
 .sheet td.n{width:32px;text-align:right;color:var(--mute);font-family:var(--mono);font-size:11px}
 .sheet td.f{width:44px;font-family:var(--mono);font-size:11px;font-weight:600}
 .sheet td.status-cell{width:96px;padding:0}
-.sheet td.status-cell input{width:100%;border:0;background:#fffbea;padding:6px 9px;font:inherit;font-size:12px}
-.sheet td.status-cell input:focus-visible{outline:2px solid var(--ink);outline-offset:-2px;background:#fff}
+/* Editable status cell: a neutral tint marks it as fillable. Monochrome —
+   no warm/yellow highlight, just the --soft grey used elsewhere. */
+.sheet td.status-cell input{width:100%;border:0;background:var(--soft);color:var(--ink);
+  padding:6px 9px;font:inherit;font-size:12px}
+.sheet td.status-cell input:focus-visible{outline:2px solid var(--ink);outline-offset:-2px;
+  background:var(--paper);color:var(--ink)}
 
 /* Out of scope: tint the row, never fade the words. Instruction and Freq stay
    at full reading contrast — a technician must be able to read every line,
    including the tasks this visit does not cover. */
-.row-out td{background:#eef0f3;color:#3d434b}
+.row-out td{background:var(--tint);color:var(--tint-ink)}
 .row-out .status-cell{position:relative}
 .row-out .status-cell input{visibility:hidden}
 .row-out .status-cell::after{content:"not in scope";position:absolute;inset:0;
-  display:flex;align-items:center;padding-left:9px;background:#eef0f3;
+  display:flex;align-items:center;padding-left:9px;background:var(--tint);
   color:var(--mute);font:500 9.5px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase}
 
 /* ---------- Right-hand panel: sections, fields, segmented controls ---------- */
@@ -96,11 +111,11 @@ a{color:var(--ink)}
 .fld{margin-bottom:13px}
 .fld:last-child{margin:0}
 .fld label{display:block;font-size:11.5px;color:var(--mute);margin-bottom:4px}
-.fld input,.fld textarea{width:100%;border:1px solid var(--rule);background:var(--paper);
+.fld input,.fld textarea{width:100%;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
   padding:8px 10px;font:inherit;font-size:13px;border-radius:0}
 
 .segs{display:flex;border:1px solid var(--ink)}
-.segs button{flex:1;font:600 12px/1 var(--mono);padding:10px 0;border:0;
+.segs button{flex:1;font:600 12px/1 var(--mono);padding:10px 0;border:0;color:var(--ink);
   border-right:1px solid var(--rule);background:var(--paper);cursor:pointer}
 .segs button:last-child{border-right:0}
 .segs button[aria-pressed="true"]{background:var(--ink);color:#fff}
@@ -118,13 +133,13 @@ a{color:var(--ink)}
 .act{padding:18px 22px}
 .act button{width:100%;border:0;background:var(--ink);color:#fff;font:600 12px/1 var(--mono);
   letter-spacing:.1em;text-transform:uppercase;padding:15px;cursor:pointer}
-.act button:hover{background:var(--stamp)}
+.act button:hover{background:var(--stamp);color:#fff}
 .act p{font-size:11.5px;color:var(--mute);margin:11px 0 0;text-align:center}
 
 /* ---------- Sign-off chain ---------- */
 .chain{display:flex;gap:0;border:1px solid var(--rule);margin-top:14px;background:var(--paper)}
 .chain div{flex:1;padding:9px 10px;border-right:1px solid var(--rule);font:500 9px/1.4 var(--mono);
-  letter-spacing:.08em;text-transform:uppercase;color:#6b7078}
+  letter-spacing:.08em;text-transform:uppercase;color:var(--mute)}
 .chain div:last-child{border-right:0}
 .chain div.now{color:var(--ink)}
 .chain div.done{color:var(--ok)}
