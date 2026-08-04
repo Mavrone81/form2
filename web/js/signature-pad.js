@@ -87,7 +87,32 @@ export function createSignaturePad(container, { name = '' } = {}) {
       // size they were captured at) into the newly-sized bitmap. Completes
       // before this function returns — there is no frame in which the
       // canvas is visibly/actually blank while dirty is still true.
-      ctx.drawImage(backing, 0, 0, backing.width, backing.height, 0, 0, rect.width, rect.height);
+      //
+      // Scale rule: use a single UNIFORM scale factor — the SMALLER of the
+      // two axis ratios (new CSS box size / backing's CSS size) — for both
+      // axes, instead of stretching each axis independently. A CSS box that
+      // changes SHAPE (tablet rotation, a breakpoint hop between
+      // 375/768/1024) must not distort the ink; drawing with two different
+      // scale factors per axis is exactly what squashes or elongates a
+      // signature. Anchored at (0, 0) — top-left — rather than centred, so
+      // the fix never crops the tail of a signature off the edge. Also
+      // clamp the scale at 1: if the new box is bigger than the backing's
+      // CSS size, the signature stays its natural size (anchored top-left)
+      // instead of being blown up into a blurry, pixelated enlargement.
+      //
+      // Units: rect.{width,height} are CSS px. backing.{width,height} are
+      // device px captured at whatever dpr was in effect at the time (this
+      // assumes dpr is unchanged since that capture — the same assumption
+      // the pre-existing stretch-to-fill code relied on, since backing
+      // tracks no dpr of its own). Divide by the CURRENT dpr to get the
+      // backing's own CSS size back, so the ratio is a true CSS-to-CSS
+      // scale factor and not distorted by device-pixel density.
+      const backingCssWidth = backing.width / dpr;
+      const backingCssHeight = backing.height / dpr;
+      const scale = Math.min(1, rect.width / backingCssWidth, rect.height / backingCssHeight);
+      const drawWidth = backingCssWidth * scale;
+      const drawHeight = backingCssHeight * scale;
+      ctx.drawImage(backing, 0, 0, backing.width, backing.height, 0, 0, drawWidth, drawHeight);
     }
   }
 

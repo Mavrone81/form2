@@ -64,6 +64,29 @@ test('resize path restores the signature with a SYNCHRONOUS drawImage — no Ima
   assert.match(body, /ctx\.drawImage\(\s*backing\s*,/, 'fit() must restore synchronously from the backing canvas');
 });
 
+test('resize restore preserves aspect ratio with a single uniform scale, and stays synchronous', () => {
+  // STATIC GUARD ONLY: there is no DOM/canvas harness in this project, so
+  // this cannot exercise fit() against a real non-uniformly-resized canvas
+  // and check actual pixels. It only proves the right code shape is present
+  // — that fit() computes ONE scale factor (via Math.min, so the smaller of
+  // the two axis ratios wins) and applies it to both axes, instead of
+  // stretching width and height independently. It does NOT prove a real
+  // tablet rotation or 375/768/1024 breakpoint hop renders an undistorted
+  // signature on screen. Verify that by hand.
+  const fitBody = /function fit\(\)\s*\{([\s\S]*?)\n  \}/.exec(src);
+  assert.ok(fitBody, 'expected a fit() function in signature-pad.js');
+  const body = fitBody[1];
+
+  // Uniform scale: a single Math.min(...) computation feeding both the
+  // width and height destination extents, not two independent ratios.
+  assert.match(body, /Math\.min\(/, 'fit() must compute a uniform scale via Math.min, not stretch each axis independently');
+
+  // Still no async restore path reintroduced.
+  assert.doesNotMatch(body, /new Image\(/, 'fit() must not reintroduce an async Image()/onload restore path');
+  assert.doesNotMatch(body, /\.onload\s*=/, 'fit() must not reintroduce an async onload restore callback');
+  assert.doesNotMatch(body, /toDataURL/, 'fit() must not read via toDataURL() — that belongs only in toPNG()');
+});
+
 test('completed stroke segments are committed to an offscreen backing canvas synchronously', () => {
   // The backing canvas is what fit() restores from. It must be kept
   // up to date synchronously, in the same call stack as the stroke that
