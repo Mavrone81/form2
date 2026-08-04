@@ -185,9 +185,9 @@ async function paint() {
   // genuinely no filter (no frequency chosen yet). Whenever a frequency IS
   // selected, the real array from the server is passed through as-is, even
   // when it is empty (a frequency that covers zero tasks on this form) —
-  // never coerced to null to "make it work". See the report for why
-  // form-view.js's own guard still cannot act correctly on that empty case;
-  // that is a pre-existing bug in a file this task must not modify.
+  // never coerced to null to "make it work". form-view.js relies on exactly
+  // that distinction: null means dim nothing, an empty array means dim every
+  // task row, because none of them apply to this visit.
   renderForm($('#pane-left'), form, { grid, inScopeRows: frequency ? spec.inScope : null });
 
   const saveError = document.createElement('p');
