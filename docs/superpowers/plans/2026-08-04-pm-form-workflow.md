@@ -2375,6 +2375,210 @@ git commit -m "Add admin screens for folder, users and PDF field mapping"
 
 ---
 
+### Task 16: Docker Compose deployment
+
+Package the app so deployment is `docker compose up`. Two volumes: the forms folder mounted **read-only**, and a named volume for the database. The read-only mount makes the spec's "source form files are never modified" guarantee structural rather than conventional.
+
+**Files:**
+- Create: `Dockerfile`
+- Create: `compose.yaml`
+- Create: `.dockerignore`
+- Create: `.env.example`
+- Modify: `server/index.js` (read `PORT`, `SESSION_SECRET`, `FORMS_DIR`, `DB_PATH` from env)
+- Modify: `README.md` (deployment section)
+- Test: `test/config.test.js`
+
+**Interfaces:**
+- Consumes: `createApp({db})`, `openDb(path)`, `seedDemoUsers(db)`.
+- Produces: `resolveConfig(env) -> {port, dbPath, formsDir, sessionSecret}` exported from `server/config.js`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/config.test.js`:
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { resolveConfig } from '../server/config.js';
+
+test('defaults suit local development', () => {
+  const c = resolveConfig({});
+  assert.equal(c.port, 3000);
+  assert.equal(c.dbPath, 'data/pm.sqlite');
+  assert.equal(c.formsDir, '');
+  assert.ok(c.sessionSecret.length >= 32, 'a secret is generated when unset');
+});
+
+test('environment overrides every default', () => {
+  const c = resolveConfig({ PORT: '8080', DB_PATH: '/data/pm.sqlite', FORMS_DIR: '/forms', SESSION_SECRET: 'x'.repeat(40) });
+  assert.equal(c.port, 8080);
+  assert.equal(c.dbPath, '/data/pm.sqlite');
+  assert.equal(c.formsDir, '/forms');
+  assert.equal(c.sessionSecret, 'x'.repeat(40));
+});
+
+test('a short SESSION_SECRET is rejected rather than silently accepted', () => {
+  // A weak secret lets an attacker forge a session cookie and sign a QA
+  // record as someone else. Fail loudly at boot instead.
+  assert.throws(() => resolveConfig({ SESSION_SECRET: 'short' }), /SESSION_SECRET/);
+});
+
+test('generated secrets differ between boots', () => {
+  assert.notEqual(resolveConfig({}).sessionSecret, resolveConfig({}).sessionSecret);
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `node --test test/config.test.js`
+Expected: FAIL — cannot find module `../server/config.js`.
+
+- [ ] **Step 3: Write the config module**
+
+`server/config.js`:
+```js
+import { randomBytes } from 'node:crypto';
+
+const MIN_SECRET = 32;
+
+export function resolveConfig(env = process.env) {
+  const secret = env.SESSION_SECRET ?? '';
+  if (secret && secret.length < MIN_SECRET)
+    throw new Error(`SESSION_SECRET must be at least ${MIN_SECRET} characters.`);
+  return {
+    port: Number(env.PORT ?? 3000),
+    dbPath: env.DB_PATH ?? 'data/pm.sqlite',
+    formsDir: env.FORMS_DIR ?? '',
+    // Unset means a fresh secret each boot: sessions do not survive a restart,
+    // which is acceptable locally but wrong for a deployment. compose.yaml sets it.
+    sessionSecret: secret || randomBytes(32).toString('hex')
+  };
+}
+```
+
+Then modify `server/index.js` to use it: `createApp({ db, sessionSecret })` passes the secret into `express-session`, and the boot block uses `resolveConfig()` for port and db path. If `formsDir` is set and the `forms_folder` setting is empty, write it into `settings` and run an initial scan at boot — so a container comes up already pointing at its mounted folder.
+
+- [ ] **Step 4: Write the Dockerfile**
+
+`Dockerfile`:
+```dockerfile
+FROM node:22-bookworm-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+# better-sqlite3 ships prebuilt binaries; python3/make/g++ are the fallback
+# if a prebuild is unavailable for this platform.
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
+ && npm ci --omit=dev \
+ && apt-get purge -y python3 make g++ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
+
+FROM node:22-bookworm-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY server ./server
+COPY web ./web
+# The database lives on a volume; the app must own the mount point.
+RUN mkdir -p /data && chown -R node:node /data /app
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT??3000)+'/api/me').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "server/index.js"]
+```
+
+- [ ] **Step 5: Write compose.yaml and .dockerignore**
+
+`compose.yaml`:
+```yaml
+services:
+  app:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      DB_PATH: /data/pm.sqlite
+      FORMS_DIR: /forms
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env — see .env.example}
+    volumes:
+      # Forms are mounted READ-ONLY. The app must never modify a source form,
+      # and :ro makes that structural rather than a convention.
+      - ${FORMS_HOST_DIR:?set FORMS_HOST_DIR in .env}:/forms:ro
+      - pm-data:/data
+    restart: unless-stopped
+
+volumes:
+  pm-data:
+```
+
+`.dockerignore`:
+```
+node_modules
+npm-debug.log*
+.git
+.gitignore
+.superpowers
+data
+docs
+test
+scripts
+*.xlsx
+*.xls
+*.pdf
+Sample of Forms
+.env
+.DS_Store
+```
+
+`.env.example`:
+```bash
+# Absolute path on the host to the folder holding the form files.
+# Mounted read-only into the container at /forms.
+FORMS_HOST_DIR=/absolute/path/to/your/forms
+
+# Required. Generate with: openssl rand -hex 32
+# Without a stable value every restart invalidates all sessions.
+SESSION_SECRET=
+
+# Host port to publish. Optional, defaults to 3000.
+PORT=3000
+```
+
+Note `.env` is already git-ignored. `.env.example` is committed; `.env` never is.
+
+- [ ] **Step 6: Verify the build and run**
+
+```bash
+cp .env.example .env
+# edit .env: set FORMS_HOST_DIR to the real forms folder, and
+# SESSION_SECRET=$(openssl rand -hex 32)
+docker compose build
+docker compose up -d
+sleep 5
+curl -fsS localhost:3000/api/me
+docker compose ps        # expect healthy
+```
+Expected: `/api/me` returns `null` (signed out), and the container reports healthy. Sign in as `admin` and confirm the forms folder is already populated from `/forms` without manual configuration.
+
+Then confirm the read-only mount actually holds:
+```bash
+docker compose exec app sh -c 'touch /forms/should-fail 2>&1 || echo "read-only confirmed"'
+```
+Expected: "read-only confirmed".
+
+- [ ] **Step 7: Run the suite and commit**
+
+Run: `npm test`
+Expected: all tests pass, including the four new config tests.
+
+```bash
+git add Dockerfile compose.yaml .dockerignore .env.example server/config.js server/index.js test/config.test.js README.md
+git commit -m "Add Docker Compose deployment"
+```
+
+---
+
 ## Verification checklist
 
 Before calling this done, confirm each by running it — not by reading the code:
