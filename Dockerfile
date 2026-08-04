@@ -11,6 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 make g+
 FROM node:22-bookworm-slim
 WORKDIR /app
 ENV NODE_ENV=production
+# The container listens on 3000 inside its own network namespace, always.
+# Declared here so the app, the healthcheck and EXPOSE cannot drift apart —
+# the host-facing default (30000) is a compose/.env concern, not the image's.
+ENV PORT=3000
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY server ./server
