@@ -505,6 +505,21 @@ const DEFAULT_FIELDS = [
   { field_key: 'sig_engineer', label: 'Verified by (Workshop Supervisor/Engr)', section: 'Sign-off', kind: 'signature' }
 ];
 
+// FIX (Task 15, review round 1, Finding 1): every form must always keep all
+// three sign-off blocks. Without one, the matching actor's stage can never
+// be signed (field-panel.js only builds a pad for a stage present in the
+// snapshot as kind:'signature'; server/workflow.js signAndAdvance rejects an
+// empty signaturePng) — every record on that form gets permanently stuck at
+// that stage. REQUIRED_SIGNATURE_FIELDS is the backstop both the row-removal
+// guard and the save-time guard check against; REQUIRED_SIGNATURE_NAMES is
+// only for human-readable messages.
+const REQUIRED_SIGNATURE_FIELDS = DEFAULT_FIELDS.filter((f) => f.kind === 'signature');
+const REQUIRED_SIGNATURE_NAMES = {
+  sig_technician: 'Technician',
+  sig_team_leader: 'Workshop Team Leader',
+  sig_engineer: 'Workshop Supervisor/Engineer'
+};
+
 function slugify(text) {
   return String(text)
     .trim()
@@ -513,9 +528,31 @@ function slugify(text) {
     .replace(/^_+|_+$/g, '');
 }
 
+function formPickRow(f, onClick, extraChip) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'form-pick queue-row';
+  const titleEl = document.createElement('span');
+  titleEl.className = 'queue-title';
+  titleEl.textContent = f.title || f.file_name;
+  const fileEl = document.createElement('span');
+  fileEl.className = 'queue-doc code';
+  fileEl.textContent = f.file_name;
+  b.append(titleEl, fileEl);
+  if (extraChip) b.append(extraChip);
+  b.addEventListener('click', onClick);
+  return b;
+}
+
 async function renderMapperScreen(main) {
   const forms = await api.forms();
   const needsSetup = forms.filter((f) => f.state === 'needs_setup');
+  // FIX (Finding 1b): a form must be reopenable after Save flips it to
+  // ready — otherwise a mapping mistake (or the missing-signature guard
+  // below) is unrecoverable through this UI. Kept in a clearly separate
+  // section from the needs_setup to-do list so that list keeps its original
+  // meaning ("blocking technicians right now").
+  const reopenable = forms.filter((f) => f.state === 'ready' || f.state === 'inactive');
 
   if (!mapperFormId) {
     const sec = section('Map a form’s fields');
@@ -532,20 +569,25 @@ async function renderMapperScreen(main) {
       sec.append(p);
     }
     for (const f of needsSetup) {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'form-pick queue-row';
-      const titleEl = document.createElement('span');
-      titleEl.className = 'queue-title';
-      titleEl.textContent = f.title || f.file_name;
-      const fileEl = document.createElement('span');
-      fileEl.className = 'queue-doc code';
-      fileEl.textContent = f.file_name;
-      b.append(titleEl, fileEl);
-      b.addEventListener('click', () => { mapperFormId = f.id; renderScreen(); });
-      sec.append(b);
+      sec.append(formPickRow(f, () => { mapperFormId = f.id; renderScreen(); }));
     }
     main.append(sec);
+
+    const otherSec = section('Reopen an existing mapping');
+    const otherHint = document.createElement('p');
+    otherHint.className = 'sig-meta';
+    otherHint.textContent = 'Ready and inactive forms already have a mapping — open one here to correct it.';
+    otherSec.append(otherHint);
+    if (!reopenable.length) {
+      const p = document.createElement('p');
+      p.className = 'sig-meta';
+      p.textContent = 'No other forms are catalogued yet.';
+      otherSec.append(p);
+    }
+    for (const f of reopenable) {
+      otherSec.append(formPickRow(f, () => { mapperFormId = f.id; renderScreen(); }, stateChip(f.state)));
+    }
+    main.append(otherSec);
     return;
   }
 
@@ -596,6 +638,26 @@ async function renderFieldEditor(container, form) {
   backBtn.addEventListener('click', () => { mapperFormId = null; renderScreen(); });
   sec.append(backBtn);
 
+  // FIX (Finding 1b): reopening a form that already has submissions must
+  // say plainly that existing records are unaffected — each submission
+  // stores its own form_snapshot at fill time (server/workflow.js
+  // createSubmission) — rather than let an admin infer a risk of data loss.
+  // GET /api/submissions already returns every record for an admin
+  // (server/workflow.js queueFor), so no new endpoint is needed.
+  const allSubmissions = await api.queue();
+  const submissionCount = allSubmissions.filter((s) => s.form_id === form.id).length;
+  if (submissionCount > 0) {
+    const warn = noticeEl();
+    warn.textContent =
+      `This form already has ${submissionCount} record${submissionCount === 1 ? '' : 's'}. ` +
+      'They are unaffected — each one stores its own snapshot of the fields as they were ' +
+      'when it was filled. This change only applies to new records created after saving.';
+    sec.append(warn);
+  }
+
+  const missingWarnBox = document.createElement('div');
+  sec.append(missingWarnBox);
+
   const table = document.createElement('table');
   table.className = 'sheet';
   const thead = document.createElement('thead');
@@ -617,10 +679,43 @@ async function renderFieldEditor(container, form) {
     return fields.some((f, i) => i !== exceptIndex && f.field_key === key);
   }
 
+  // FIX (Finding 1a): recomputed on every render so it always reflects the
+  // in-memory `fields` state, including right after a Remove or a "Restore"
+  // click below. This is advisory in the UI; saveBtn's own check (further
+  // down) is the actual backstop and refuses the API call regardless of
+  // whether this box is visible.
+  function renderMissingSignatureWarning() {
+    missingWarnBox.replaceChildren();
+    const missing = REQUIRED_SIGNATURE_FIELDS.filter(
+      (rf) => !fields.some((f) => f.field_key === rf.field_key && f.kind === 'signature')
+    );
+    if (!missing.length) return;
+    const p = noticeEl();
+    p.setAttribute('role', 'alert');
+    p.textContent =
+      `Missing required signature block(s): ${missing.map((rf) => REQUIRED_SIGNATURE_NAMES[rf.field_key]).join(', ')}. ` +
+      'Every form needs all three sign-off stages — saving is refused until they are restored.';
+    missingWarnBox.append(p);
+    for (const rf of missing) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'form-pick';
+      b.textContent = `+ Restore: ${REQUIRED_SIGNATURE_NAMES[rf.field_key]} signature`;
+      b.addEventListener('click', () => { fields.push({ ...rf }); renderRows(); });
+      missingWarnBox.append(b);
+    }
+  }
+
   function renderRows() {
     tbody.replaceChildren();
     fields.forEach((f, i) => {
       const tr = document.createElement('tr');
+      // FIX (Finding 1a): a form is unusable forever for whichever stage
+      // loses its signature block (see REQUIRED_SIGNATURE_FIELDS comment
+      // above) — lock both the escape hatches (Remove, and switching Kind
+      // away from 'signature') for these three specific rows, on top of the
+      // save-time backstop below.
+      const isRequiredSignature = REQUIRED_SIGNATURE_FIELDS.some((rf) => rf.field_key === f.field_key);
 
       const keyTd = document.createElement('td');
       keyTd.className = 'code';
@@ -675,6 +770,10 @@ async function renderFieldEditor(container, form) {
         kindSelect.append(opt);
       }
       kindSelect.addEventListener('change', () => { f.kind = kindSelect.value; });
+      if (isRequiredSignature) {
+        kindSelect.disabled = true;
+        kindSelect.title = 'Every form needs this signature block — its kind cannot be changed.';
+      }
       kindTd.append(kindSelect);
 
       const reorderTd = document.createElement('td');
@@ -704,15 +803,21 @@ async function renderFieldEditor(container, form) {
       const removeBtn = document.createElement('button');
       removeBtn.type = 'button';
       removeBtn.textContent = 'Remove';
-      removeBtn.addEventListener('click', () => {
-        fields.splice(i, 1);
-        renderRows();
-      });
+      if (isRequiredSignature) {
+        removeBtn.disabled = true;
+        removeBtn.title = 'Every form needs this signature block — it cannot be removed.';
+      } else {
+        removeBtn.addEventListener('click', () => {
+          fields.splice(i, 1);
+          renderRows();
+        });
+      }
       removeTd.append(removeBtn);
 
       tr.append(keyTd, labelTd, sectionTd, kindTd, reorderTd, removeTd);
       tbody.append(tr);
     });
+    renderMissingSignatureWarning();
   }
   renderRows();
 
@@ -744,6 +849,20 @@ async function renderFieldEditor(container, form) {
         return;
       }
       seenKeys.add(f.field_key);
+    }
+    // FIX (Finding 1a) — the backstop: even though the UI above already
+    // disables removing/retyping the three required signature rows, this
+    // check refuses the save regardless of how `fields` got into a bad
+    // state (e.g. a mapping saved by an earlier version of this screen, or
+    // directly via the API). Refuses with a specific, named message — never
+    // a generic or silent failure.
+    for (const rf of REQUIRED_SIGNATURE_FIELDS) {
+      const present = fields.some((f) => f.field_key === rf.field_key && f.kind === 'signature');
+      if (!present) {
+        statusMsg.textContent =
+          `A record cannot be signed off without the ${REQUIRED_SIGNATURE_NAMES[rf.field_key]} signature block.`;
+        return;
+      }
     }
     try {
       await api.saveFormFields(

@@ -104,6 +104,30 @@ test('out-of-scope rows are tinted, never faded, and the "not in scope" label st
   assert.match(css, /not in scope/, 'the out-of-scope label text must still be present');
 });
 
+test('.row-tint rows (inactive users/forms, added in Task 15) are tinted, never faded', () => {
+  // Same "never fade, only tint" rule as .row-out, extended to the admin
+  // screens' inactive-user/inactive-form rows (review round 1, Finding 2).
+  // .row-tint has no hidden-label mechanism like .row-out's "not in scope"
+  // text, so only the fade/background checks apply here.
+  const rowTintRules = rules.filter((r) => /\.row-tint\b/.test(r.selector));
+  assert.ok(rowTintRules.length > 0, 'expected at least one .row-tint rule');
+
+  for (const r of rowTintRules) {
+    assert.doesNotMatch(
+      r.body,
+      /opacity\s*:\s*0?\.[0-6]\b/,
+      `"${r.selector}" must not fade the text (opacity below 0.7)`
+    );
+    assert.doesNotMatch(r.body, /visibility\s*:\s*hidden/, `"${r.selector}" must not hide its content`);
+    assert.doesNotMatch(r.body, /display\s*:\s*none/, `"${r.selector}" must not remove its content`);
+  }
+
+  assert.ok(
+    rowTintRules.some((r) => /background(-color)?\s*:/.test(r.body)),
+    'de-emphasis is by background tint'
+  );
+});
+
 test('reduced motion is honoured', () => {
   assert.match(css, /prefers-reduced-motion/);
 });

@@ -65,6 +65,49 @@ test('static: the field mapper seeds the three sign-off signature blocks plus th
   }
 });
 
+test('static guard: saving a mapping is refused unless all three required signature blocks are present', () => {
+  // Review round 1, Finding 1(a): nothing originally stopped an admin
+  // removing a sig_* row and saving — the matching stage could then never
+  // sign any record on that form again (field-panel.js only builds a pad
+  // for a stage present in the snapshot as kind:'signature';
+  // server/workflow.js signAndAdvance rejects an empty signaturePng). This
+  // is the save-time backstop: the click handler on "Save mapping" must
+  // check for all three required keys BEFORE calling api.saveFormFields(...),
+  // not after and not silently.
+  // admin.js declares `saveBtn` twice (the folder screen's "Save and scan"
+  // button and the field mapper's "Save mapping" button) — anchor on the
+  // mapper's own button label so this test can't accidentally match the
+  // wrong handler.
+  const mapperAnchor = adminSrc.indexOf("saveBtn.textContent = 'Save mapping'");
+  assert.ok(mapperAnchor >= 0, "expected a saveBtn with textContent 'Save mapping' in admin.js");
+  const handlerBody = adminSrc.slice(mapperAnchor);
+
+  assert.match(handlerBody, /REQUIRED_SIGNATURE_FIELDS/, 'expected the save handler to check REQUIRED_SIGNATURE_FIELDS');
+
+  const saveCallIdx = handlerBody.indexOf('api.saveFormFields(');
+  const requiredCheckIdx = handlerBody.indexOf('REQUIRED_SIGNATURE_FIELDS');
+  assert.ok(saveCallIdx >= 0, 'expected the save handler to call api.saveFormFields(...)');
+  assert.ok(
+    requiredCheckIdx >= 0 && requiredCheckIdx < saveCallIdx,
+    'expected the required-signature check to run before api.saveFormFields(...) is called'
+  );
+
+  // REQUIRED_SIGNATURE_FIELDS must actually be derived from all three
+  // signature rows, not declared and left empty/unused.
+  assert.match(
+    adminSrc,
+    /const REQUIRED_SIGNATURE_FIELDS\s*=\s*DEFAULT_FIELDS\.filter/,
+    'expected REQUIRED_SIGNATURE_FIELDS to be derived from DEFAULT_FIELDS'
+  );
+  for (const key of ['sig_technician', 'sig_team_leader', 'sig_engineer']) {
+    assert.match(
+      adminSrc,
+      new RegExp(`${key}:\\s*'[^']+'`),
+      `expected REQUIRED_SIGNATURE_NAMES to name ${key} for the refusal message`
+    );
+  }
+});
+
 test('static: no response shape anywhere renders a password hash', () => {
   // GET /api/admin/users only ever selects id/username/full_name/role/active
   // (server/routes.js), and POST /api/admin/users strips password_hash
