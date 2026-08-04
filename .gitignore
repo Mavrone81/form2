@@ -1,0 +1,27 @@
+# Sensitive: source PM record forms. Never commit these.
+# Forms may be Excel or PDF, and the forms folder is configurable at runtime,
+# so ignore the formats themselves rather than relying on one folder name.
+Sample of Forms/
+forms/
+*.xlsx
+*.xls
+*.pdf
+
+# Local database and uploaded signatures
+*.sqlite
+*.sqlite3
+*.db
+data/
+
+# Node
+node_modules/
+npm-debug.log*
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Design mockups render real form content (task text, doc numbers) for
+# fidelity. That content is sensitive, so mockups stay local.
+docs/design/
