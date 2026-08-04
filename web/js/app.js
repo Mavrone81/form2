@@ -226,6 +226,7 @@ async function paint() {
   $('#pane-right').append(saveError);
   addBackBar();
   addSubmitBar(detail.submission, canAct);
+  addPdfBar(detail.submission, detail.signatures);
 }
 
 function addBackBar() {
@@ -276,6 +277,46 @@ function addSubmitBar(sub, canAct) {
     msg.textContent = actor ? `Waiting on ${actor.replace('_', ' ')}.` : '';
   }
   bar.append(msg);
+  right.append(bar);
+}
+
+// Preview/download links, shown only when this rule — mirroring the server's
+// own GET /api/submissions/:id/pdf check (server/routes.js) — says the
+// signed-in user is allowed to have the PDF at all: an admin always; a team
+// leader or engineer only once THEIR OWN signature row exists on this
+// record. A technician never matches either branch, even though their own
+// stage signature exists once they've submitted — the server refuses them
+// unconditionally, and hiding the control here just avoids sending them
+// somewhere they'd immediately get a 403. This is a convenience, not the
+// access control — the route enforces the real rule independently.
+function addPdfBar(sub, signatures) {
+  const canPreview = user.role === 'admin'
+    || ((user.role === 'team_leader' || user.role === 'engineer') &&
+        (signatures ?? []).some((s) => s.stage === user.role));
+  if (!canPreview) return;
+
+  const right = $('#pane-right');
+  const bar = document.createElement('div');
+  bar.className = 'pdf-actions';
+
+  const preview = document.createElement('a');
+  preview.href = api.submissionPdfUrl(sub.id);
+  preview.target = '_blank';
+  preview.rel = 'noopener';
+  preview.textContent = 'Preview PDF';
+  bar.append(preview);
+
+  // Archival download: engineer only, and only once the record has actually
+  // reached 'approved' — which, per server/workflow.js's STAGES table, is
+  // exactly the state an engineer's own signature always produces.
+  if (user.role === 'engineer' && sub.state === 'approved') {
+    const download = document.createElement('a');
+    download.href = api.submissionPdfDownloadUrl(sub.id);
+    download.className = 'download';
+    download.textContent = 'Download for archive';
+    bar.append(download);
+  }
+
   right.append(bar);
 }
 

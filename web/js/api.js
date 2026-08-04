@@ -55,5 +55,15 @@ export const api = {
   // Not a JSON endpoint — the raw file is loaded directly as an <iframe src>,
   // so this is just a URL builder, not a fetch() wrapper like the rest of
   // this module.
-  formFileUrl: (id) => `/api/forms/${id}/file`
+  formFileUrl: (id) => `/api/forms/${id}/file`,
+
+  // ---- record PDF (Task 18) ----
+  // Also plain URL builders, not fetch() wrappers: a PDF response is binary,
+  // so it must never be routed through call()'s `res.json()` parsing above.
+  // The browser is left to do the actual GET itself (an <a href> for
+  // preview/download), which — unlike a fetch() this module would have to
+  // drive by hand — sends the session cookie automatically and lets the
+  // server's own Content-Disposition header name the downloaded file.
+  submissionPdfUrl: (id) => `/api/submissions/${id}/pdf`,
+  submissionPdfDownloadUrl: (id) => `/api/submissions/${id}/pdf?download=1`
 };

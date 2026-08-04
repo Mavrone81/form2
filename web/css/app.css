@@ -186,6 +186,20 @@ a{color:var(--ink)}
 .act button:hover{background:var(--stamp);color:#fff}
 .act p{font-size:11.5px;color:var(--mute);margin:11px 0 0;text-align:center}
 
+/* ---------- Record PDF: preview / archive download (Task 18) ---------- */
+/* Neutral by default (a plain document-control action, like the back
+   button); the archive-download link is the one place the record's
+   "approved" accent (--ok, green) appears outside the state chips —
+   consistent with the sheet's single-accent rule, since this link only
+   ever renders once the record actually IS approved. */
+.pdf-actions{display:flex;gap:8px;padding:18px 22px;border-bottom:1px solid var(--rule)}
+.pdf-actions a{flex:1;text-align:center;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
+  padding:11px 13px;font:600 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+  text-decoration:none;cursor:pointer}
+.pdf-actions a:hover{border-color:var(--ink)}
+.pdf-actions a.download{background:var(--ok);color:#fff;border-color:var(--ok)}
+.pdf-actions a.download:hover{background:var(--ink);border-color:var(--ink)}
+
 /* ---------- Sign-off chain ---------- */
 .chain{display:flex;gap:0;border:1px solid var(--rule);margin-top:14px;background:var(--paper)}
 .chain div{flex:1;padding:9px 10px;border-right:1px solid var(--rule);font:500 9px/1.4 var(--mono);

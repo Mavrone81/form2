@@ -6,6 +6,7 @@ import { buildGrid } from './grid-model.js';
 import { parseWorkbook } from './excel-parser.js';
 import { tasksInScope, scopeSummary } from './intervals.js';
 import { createSubmission, saveFields, signAndAdvance, queueFor, assertCanEdit, completenessFor } from './workflow.js';
+import { renderRecordPdf } from './pdf-record.js';
 
 const signedIn = requireRole(...ROLES);
 
@@ -148,6 +149,59 @@ export function makeRoutes(db) {
       }));
     } catch (err) { res.status(statusFor(err, 400)).json({ error: err.message }); }
   });
+
+  // Preview/download the record as an archival PDF. Access is enforced here,
+  // server-side, not merely by hiding the button in the UI: a technician is
+  // refused in every state (they are never a party to the reviewed record's
+  // PDF); a team leader or engineer may only see it once THEIR OWN signature
+  // row exists (proof they have signed this record); an admin may always
+  // preview. Awaits renderRecordPdf, so — per the asyncRoute contract at the
+  // top of this file — it MUST be wrapped, or a form whose file has moved
+  // since the last scan (parseWorkbook/buildGrid rejecting) becomes an
+  // unhandled rejection that kills the whole process for every signed-in
+  // user, not just this request.
+  r.get('/submissions/:id/pdf', signedIn, asyncRoute(async (req, res) => {
+    const sub = db.prepare('select * from submissions where id=?').get(req.params.id);
+    if (!sub) return res.status(404).json({ error: 'Record not found.' });
+
+    const user = req.session.user;
+    const signedStages = db.prepare('select stage from signatures where submission_id=?')
+      .all(sub.id).map((s) => s.stage);
+    const allowed = user.role === 'admin'
+      || ((user.role === 'team_leader' || user.role === 'engineer') && signedStages.includes(user.role));
+    if (!allowed) return res.status(403).json({ error: 'Available once you have signed this record.' });
+
+    const form = db.prepare('select * from form_catalog where id=?').get(sub.form_id);
+    if (!form) return res.status(404).json({ error: 'Record not found.' });
+
+    let grid = null;
+    if (form.file_type === 'xlsx') {
+      try {
+        const def = await parseWorkbook(form.file_path);
+        grid = await buildGrid(form.file_path, def);
+      } catch (err) {
+        return unreadableForm(res, form.id, err);
+      }
+    }
+
+    const snapshot = JSON.parse(sub.form_snapshot);
+    const values = db.prepare('select field_key, value from submission_fields where submission_id=?').all(sub.id);
+    const signatures = db.prepare('select stage, full_name, image_png, signed_at from signatures where submission_id=?').all(sub.id);
+
+    const buffer = await renderRecordPdf({ form, submission: sub, snapshot, values, signatures, grid });
+
+    // A machine id typed into a spreadsheet cell is untrusted input reaching
+    // an HTTP response header — strip everything but alphanumerics, dash,
+    // dot and underscore so it cannot inject header content (e.g. CRLF or a
+    // stray quote breaking out of the filename parameter).
+    const safeMachineId = String(sub.machine_id ?? '').replace(/[^A-Za-z0-9._-]/g, '');
+    const filename = `${safeMachineId || `record-${sub.id}`}.pdf`;
+    const disposition = req.query.download === '1' ? 'attachment' : 'inline';
+
+    res.type('application/pdf');
+    res.set('Content-Disposition', `${disposition}; filename="${filename}"`);
+    res.send(buffer);
+  }));
 
   // ---- admin ----
   const admin = requireRole('admin');
