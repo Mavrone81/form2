@@ -161,3 +161,73 @@ test('completeness warns about unfilled in-scope tasks but never blocks signing'
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// --- Fix round 1 ---
+
+test('a form whose file has gone missing since the last scan returns a clean 500, not a crash, from grid/fields/file', async () => {
+  const { db, server, call } = await boot();
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/nonexistent/gone.xlsx','gone.xlsx','xlsx','ready')`).run();
+  const { id } = db.prepare("select id from form_catalog where file_name='gone.xlsx'").get();
+
+  await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+
+  const grid = await call('GET', `/api/forms/${id}/grid`);
+  assert.equal(grid.status, 500);
+  assert.equal(grid.body.error, 'This form could not be read. Ask an admin to rescan.');
+
+  const fields = await call('GET', `/api/forms/${id}/fields`);
+  assert.equal(fields.status, 500);
+  assert.equal(fields.body.error, 'This form could not be read. Ask an admin to rescan.');
+
+  const file = await call('GET', `/api/forms/${id}/file`);
+  assert.equal(file.status, 500);
+  assert.equal(file.body.error, 'This form could not be read. Ask an admin to rescan.');
+
+  // The whole point: the process must have survived all three failures.
+  // Prove it by making one more ordinary request on the same server.
+  const me = await call('GET', '/api/me');
+  assert.equal(me.status, 200);
+  assert.equal(me.body.role, 'technician');
+
+  server.close();
+});
+
+test('a failed form-file request never leaks a stack trace or an absolute filesystem path', async () => {
+  const { db, server, call } = await boot();
+  const path = '/nonexistent/very/specific/gone.xlsx';
+  db.prepare('insert into form_catalog (file_path,file_name,file_type,state) values (?,?,?,?)')
+    .run(path, 'gone.xlsx', 'xlsx', 'ready');
+  const { id } = db.prepare("select id from form_catalog where file_name='gone.xlsx'").get();
+
+  await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+  const res = await call('GET', `/api/forms/${id}/file`);
+  const raw = JSON.stringify(res.body);
+  assert.ok(!raw.includes(path), 'response must not contain the absolute file path');
+  assert.ok(!/\bat\s+\S+\s*\(/.test(raw), 'response must not contain stack-trace frames');
+  server.close();
+});
+
+test('signing with the wrong role returns 403, matching PATCH\'s status for the same kind of failure', async () => {
+  const { db, server, call } = await boot();
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/f.xlsx','f.xlsx','xlsx','ready')`).run();
+
+  await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+  const sub = (await call('POST', '/api/submissions', { formId: 1, machineId: 'ED04', frequency: 'Y' })).body;
+
+  // The record is in draft — only the technician who created it may sign it
+  // right now. An engineer signing is a permission failure, exactly like the
+  // PATCH 403 case above, and must return the same status code, not 400.
+  await call('POST', '/api/login', { username: 'eng', password: 'eng' });
+  const wrongRole = await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+  assert.equal(wrongRole.status, 403);
+
+  // A genuine input problem (no signature) is not a permission failure and
+  // must still be a 400.
+  await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+  const noSignature = await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: '' });
+  assert.equal(noSignature.status, 400);
+
+  server.close();
+});

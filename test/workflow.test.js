@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb } from '../server/db.js';
 import { createUser } from '../server/auth.js';
-import { createSubmission, signAndAdvance, queueFor, saveFields, assertCanEdit } from '../server/workflow.js';
+import { createSubmission, signAndAdvance, queueFor, saveFields, assertCanEdit, completenessFor } from '../server/workflow.js';
 
 const PNG = 'data:image/png;base64,iVBORw0KGgo=';
 
@@ -189,4 +189,87 @@ test('saveFields happy path: the current stage owner still saves values successf
   const row = db.prepare('select value from submission_fields where submission_id=? and field_key=?')
     .get(sub.id, 'remarks');
   assert.equal(row.value, 'Reviewed by lead');
+});
+
+// --- Fix round 1: completenessFor (moved out of routes.js so it is
+// testable without booting HTTP) and error codes distinguishing permission
+// failures from other errors ---
+
+const TASKS = [
+  { row: 2, freq: '1M' },
+  { row: 3, freq: '3M' },
+  { row: 4, freq: '6M' },
+  { row: 5, freq: 'Y' }
+];
+
+test('completenessFor: every in-scope task filled reports zero missing', () => {
+  const { db, users, sub } = setup();
+  saveFields(db, sub.id, { task_2: 'a', task_3: 'b', task_4: 'c', task_5: 'd' }, users.tech);
+  assert.deepEqual(completenessFor(db, sub.id, TASKS, 'Y'), { inScope: 4, filled: 4, missing: [] });
+});
+
+test('completenessFor: nothing filled reports every in-scope key as missing', () => {
+  const { db, sub } = setup();
+  assert.deepEqual(completenessFor(db, sub.id, TASKS, 'Y'), {
+    inScope: 4, filled: 0, missing: ['task_2', 'task_3', 'task_4', 'task_5']
+  });
+});
+
+test('completenessFor: some filled reports exactly the unfilled in-scope keys', () => {
+  const { db, users, sub } = setup();
+  saveFields(db, sub.id, { task_3: 'b', task_5: 'd' }, users.tech);
+  assert.deepEqual(completenessFor(db, sub.id, TASKS, 'Y'), { inScope: 4, filled: 2, missing: ['task_2', 'task_4'] });
+});
+
+test('completenessFor: a whitespace-only value counts as NOT filled', () => {
+  const { db, users, sub } = setup();
+  saveFields(db, sub.id, { task_2: '   ', task_3: 'b', task_4: '\t\n', task_5: 'd' }, users.tech);
+  assert.deepEqual(completenessFor(db, sub.id, TASKS, 'Y'), { inScope: 4, filled: 2, missing: ['task_2', 'task_4'] });
+});
+
+test('completenessFor: a frequency with zero in-scope tasks reports an empty, complete result', () => {
+  const { db, sub } = setup();
+  // 'NONE' is not one of the recognized frequencies, so tasksInScope's
+  // covers() finds no index for it and brings nothing into scope.
+  assert.deepEqual(completenessFor(db, sub.id, TASKS, 'NONE'), { inScope: 0, filled: 0, missing: [] });
+});
+
+test('assertCanEdit marks a wrong-stage/wrong-role failure as err.code === FORBIDDEN', () => {
+  const { db, users, sub } = setup();
+  try {
+    assertCanEdit(db, sub.id, users.lead);
+    assert.fail('expected assertCanEdit to throw');
+  } catch (err) {
+    assert.equal(err.code, 'FORBIDDEN');
+  }
+});
+
+test('assertCanEdit marks a missing submission as err.code === NOT_FOUND', () => {
+  const { db, users } = setup();
+  try {
+    assertCanEdit(db, 999999, users.tech);
+    assert.fail('expected assertCanEdit to throw');
+  } catch (err) {
+    assert.equal(err.code, 'NOT_FOUND');
+  }
+});
+
+test('signAndAdvance marks a wrong-role failure as err.code === FORBIDDEN', () => {
+  const { db, users, sub } = setup();
+  try {
+    signAndAdvance(db, { submissionId: sub.id, user: users.eng, signaturePng: PNG });
+    assert.fail('expected signAndAdvance to throw');
+  } catch (err) {
+    assert.equal(err.code, 'FORBIDDEN');
+  }
+});
+
+test('signAndAdvance does NOT mark a missing-signature failure as FORBIDDEN', () => {
+  const { db, users, sub } = setup();
+  try {
+    signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: '' });
+    assert.fail('expected signAndAdvance to throw');
+  } catch (err) {
+    assert.notEqual(err.code, 'FORBIDDEN');
+  }
 });

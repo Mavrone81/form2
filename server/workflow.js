@@ -1,3 +1,5 @@
+import { tasksInScope } from './intervals.js';
+
 export const STAGES = [
   { state: 'draft', actor: 'technician', next: 'pending_lead' },
   { state: 'pending_lead', actor: 'team_leader', next: 'pending_engineer' },
@@ -6,6 +8,22 @@ export const STAGES = [
 
 const stageFor = (state) => STAGES.find((s) => s.state === state);
 
+// Route handlers must be able to tell "you may not do this" apart from
+// "your input was bad" without string-matching messages. FORBIDDEN marks the
+// former so every caller (PATCH, sign, anything future) maps it to the same
+// status code; NOT_FOUND marks a missing row.
+function forbidden(message) {
+  const err = new Error(message);
+  err.code = 'FORBIDDEN';
+  return err;
+}
+
+function notFound(message) {
+  const err = new Error(message);
+  err.code = 'NOT_FOUND';
+  return err;
+}
+
 // Shared by assertCanEdit and signAndAdvance so the two can never silently
 // diverge on who owns a record right now. Each caller supplies its own
 // wording (edit vs. sign read differently) but the underlying rule — approved
@@ -13,14 +31,14 @@ const stageFor = (state) => STAGES.find((s) => s.state === state);
 // technician stage additionally requires being the record's creator — lives
 // in exactly one place.
 function assertStageOwnership(sub, user, messages) {
-  if (sub.state === 'approved') throw new Error(messages.terminal);
+  if (sub.state === 'approved') throw forbidden(messages.terminal);
   const stage = stageFor(sub.state);
   if (!stage) {
     if (messages.unknownState) throw new Error(messages.unknownState(sub.state));
-    throw new Error(messages.role);
+    throw forbidden(messages.role);
   }
-  if (stage.actor !== user.role) throw new Error(messages.role);
-  if (stage.actor === 'technician' && sub.created_by !== user.id) throw new Error(messages.owner);
+  if (stage.actor !== user.role) throw forbidden(messages.role);
+  if (stage.actor === 'technician' && sub.created_by !== user.id) throw forbidden(messages.owner);
   return stage;
 }
 
@@ -58,7 +76,7 @@ export function saveFields(db, submissionId, values, user) {
 // with the engineer for approval.
 export function assertCanEdit(db, submissionId, user) {
   const sub = db.prepare('select * from submissions where id=?').get(submissionId);
-  if (!sub) throw new Error('Submission not found.');
+  if (!sub) throw notFound('Submission not found.');
   assertStageOwnership(sub, user, {
     terminal: 'This record is approved and cannot be changed.',
     role: 'Your role cannot edit this record at its current stage.',
@@ -73,7 +91,7 @@ export function signAndAdvance(db, { submissionId, user, signaturePng }) {
     // Re-read state inside the transaction so two concurrent actors cannot
     // both advance the same record.
     const sub = db.prepare('select * from submissions where id=?').get(submissionId);
-    if (!sub) throw new Error('Submission not found.');
+    if (!sub) throw notFound('Submission not found.');
 
     const stage = assertStageOwnership(sub, user, {
       terminal: 'This record is approved and cannot be changed.',
@@ -98,4 +116,21 @@ export function queueFor(db, user) {
     return db.prepare('select * from submissions where created_by=? order by updated_at desc').all(user.id);
   }
   return db.prepare('select * from submissions where state=? order by updated_at desc').all(stage.state);
+}
+
+// The cumulative interval rule (selecting Y also brings 3M/6M tasks into
+// scope) is advisory only — this never blocks anything, it just tells a
+// caller what's still outstanding. A task counts as filled when its
+// submission_fields value is non-empty after trimming; whitespace-only does
+// not count. A falsy frequency (no interval chosen yet) leaves every task in
+// scope, matching the un-filtered task list shown elsewhere.
+export function completenessFor(db, submissionId, tasks, frequency) {
+  const inScopeTasks = frequency ? tasksInScope(tasks, frequency) : tasks;
+  const values = db.prepare('select field_key, value from submission_fields where submission_id=?').all(submissionId);
+  const filledKeys = new Set(
+    values.filter((v) => String(v.value ?? '').trim() !== '').map((v) => v.field_key)
+  );
+  const inScopeKeys = inScopeTasks.map((t) => `task_${t.row}`);
+  const missing = inScopeKeys.filter((k) => !filledKeys.has(k));
+  return { inScope: inScopeKeys.length, filled: inScopeKeys.length - missing.length, missing };
 }
