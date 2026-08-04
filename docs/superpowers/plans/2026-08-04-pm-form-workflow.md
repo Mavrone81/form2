@@ -2951,6 +2951,142 @@ git commit -m "Visual design pass against the approved direction"
 
 ---
 
+### Task 21: Continuous integration
+
+GitHub Actions, so pushes and pull requests are checked automatically.
+
+Two facts about this project shape the design, and ignoring either produces CI that lies:
+
+1. **The form files are not in the repo.** They are commercially sensitive and git-ignored, as is the generated `test/fixtures.local.json`. So the fixture-dependent tests — the ones that parse all 12 real forms — will SKIP on CI. That is correct and by design, but a green tick must not be read as "everything was tested". CI has to report the skip count prominently.
+2. **The repo's central constraint is that form content never gets committed.** That deserves an automated gate, not just discipline. A human will eventually run `git add -A` and CI should catch it. (I did exactly that once during this build.)
+
+**Files:**
+- Create: `.github/workflows/ci.yml`
+- Create: `scripts/check-no-sensitive-files.sh`
+- Modify: `package.json` (add a `check:sensitive` script)
+- Modify: `README.md` (CI section explaining what CI does and does not cover)
+
+- [ ] **Step 1: Write the sensitive-file guard**
+
+`scripts/check-no-sensitive-files.sh` — fails if anything matching a form-content pattern is TRACKED by git. It checks the index, not the working tree, so local ignored files are fine.
+
+```bash
+#!/usr/bin/env bash
+# Fails if any form content is tracked by git. The source forms and completed
+# records are commercially sensitive and must never enter the repository.
+set -euo pipefail
+
+PATTERNS='\.(xlsx|xls|pdf)$|^Sample of Forms/|^PM Document 2026/|^test/fixtures\.local\.json$|\.sqlite$|\.db$|^data/'
+
+tracked=$(git ls-files | grep -E "$PATTERNS" || true)
+
+if [ -n "$tracked" ]; then
+  echo "Sensitive files are tracked by git:"
+  echo "$tracked" | sed 's/^/  /'
+  echo
+  echo "These must never be committed. Remove them with:"
+  echo "  git rm --cached <file>"
+  echo "and confirm .gitignore covers them."
+  exit 1
+fi
+
+echo "No sensitive files tracked."
+```
+
+Make it executable (`chmod +x`) and add to `package.json`:
+```json
+"check:sensitive": "bash scripts/check-no-sensitive-files.sh"
+```
+
+- [ ] **Step 2: Verify the guard actually catches something**
+
+A guard that has never failed is not known to work.
+
+```bash
+npm run check:sensitive              # expect: "No sensitive files tracked."
+touch decoy.xlsx && git add -f decoy.xlsx
+npm run check:sensitive              # expect: FAILS, naming decoy.xlsx
+git rm -q --cached decoy.xlsx && rm decoy.xlsx
+npm run check:sensitive              # expect: passes again
+```
+Record all three outputs in the report. Do not commit the decoy.
+
+- [ ] **Step 3: Write the workflow**
+
+`.github/workflows/ci.yml`:
+```yaml
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Guard against committed form content
+        run: npm run check:sensitive
+      - name: Run tests
+        run: npm test 2>&1 | tee test-output.txt
+      - name: Report skipped tests
+        # The source forms are sensitive and absent from CI, so the tests that
+        # parse them skip. A green run therefore covers less than a local run.
+        # Surface that rather than letting the tick imply full coverage.
+        if: always()
+        run: |
+          skipped=$(grep -E '^# skipped' test-output.txt | awk '{print $3}')
+          echo "### Test summary" >> $GITHUB_STEP_SUMMARY
+          grep -E '^# (tests|pass|fail|skipped)' test-output.txt >> $GITHUB_STEP_SUMMARY
+          if [ "${skipped:-0}" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**$skipped test(s) skipped** — the sample form files are not in this repository, so form-parsing tests cannot run here. Run \`npm test\` locally with the forms present for full coverage." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t pm-forms:ci .
+      - name: Container starts and answers
+        run: |
+          docker run -d --name pm -e SESSION_SECRET=$(openssl rand -hex 32) -p 3000:3000 pm-forms:ci
+          for i in $(seq 1 30); do
+            curl -fsS localhost:3000/api/me && break || sleep 1
+          done
+          curl -fsS localhost:3000/api/me
+          docker rm -f pm
+```
+
+The `docker` job depends on Task 16's `Dockerfile`. If Task 16 has not landed when you implement this, still write the job but note it in your report; do not delete it.
+
+- [ ] **Step 4: Validate the workflow file**
+
+There is no YAML linter dependency in this project and you may not add one. Instead verify the file parses using Node's built-in capabilities or a simple structural check, and confirm the job/step names and indentation are consistent. State in your report how you validated it.
+
+- [ ] **Step 5: Document honestly in the README**
+
+Add a CI section stating plainly: CI runs the full suite minus the form-parsing tests, which skip because the sample forms are sensitive and excluded from the repository; full coverage requires running locally with the forms present and `scripts/build-fixtures.js` run.
+
+- [ ] **Step 6: Run everything and commit**
+
+```bash
+npm run check:sensitive
+npm test
+git add .github/ scripts/check-no-sensitive-files.sh package.json README.md
+git commit -m "Add CI with a guard against committing form content"
+```
+
+---
+
 ## Verification checklist
 
 Before calling this done, confirm each by running it — not by reading the code:
