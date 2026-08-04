@@ -23,7 +23,9 @@ export function createUser(db, { username, password, fullName, role }) {
   const info = db.prepare(
     'insert into users (username, password_hash, full_name, role, active, created_at) values (?,?,?,?,1,?)'
   ).run(username, hashPassword(password), fullName, role, new Date().toISOString());
-  return db.prepare('select * from users where id = ?').get(info.lastInsertRowid);
+  return db.prepare(
+    'select id, username, full_name, role, active, created_at from users where id = ?'
+  ).get(info.lastInsertRowid);
 }
 
 export function authenticate(db, username, password) {
