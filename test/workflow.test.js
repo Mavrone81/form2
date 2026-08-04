@@ -86,9 +86,9 @@ test('an approved record cannot be edited by anyone', () => {
 });
 
 test('fields save and overwrite by key', () => {
-  const { db, sub } = setup();
-  saveFields(db, sub.id, { task_28: 'OK', remarks: 'none' });
-  saveFields(db, sub.id, { task_28: 'Replaced belt' });
+  const { db, users, sub } = setup();
+  saveFields(db, sub.id, { task_28: 'OK', remarks: 'none' }, users.tech);
+  saveFields(db, sub.id, { task_28: 'Replaced belt' }, users.tech);
   const rows = db.prepare('select field_key, value from submission_fields where submission_id=? order by field_key').all(sub.id);
   assert.deepEqual(rows, [
     { field_key: 'remarks', value: 'none' },
@@ -136,4 +136,57 @@ test('a technician cannot sign a draft created by a different technician', () =>
     /cannot|only/i
   );
   assert.equal(db.prepare('select state from submissions where id=?').get(sub.id).state, 'draft');
+});
+
+// --- Fix round 1: saveFields must enforce assertCanEdit itself ---
+
+test('saveFields on an approved submission throws, and stored values are unchanged', () => {
+  const { db, users, sub } = setup();
+  saveFields(db, sub.id, { task_28: 'OK' }, users.tech);
+  for (const u of [users.tech, users.lead, users.eng])
+    signAndAdvance(db, { submissionId: sub.id, user: u, signaturePng: PNG });
+
+  assert.throws(
+    () => saveFields(db, sub.id, { task_28: 'Tampered' }, users.eng),
+    /approved/i
+  );
+
+  const row = db.prepare('select value from submission_fields where submission_id=? and field_key=?')
+    .get(sub.id, 'task_28');
+  assert.equal(row.value, 'OK', 'the approved record must not have been mutated');
+});
+
+test('saveFields called by a user who is not the current stage owner throws', () => {
+  const { db, users, sub } = setup();
+  // Advance to pending_lead: the technician who created it no longer owns the stage.
+  signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+
+  assert.throws(
+    () => saveFields(db, sub.id, { task_28: 'Sneaky edit' }, users.tech),
+    /cannot/i
+  );
+
+  const row = db.prepare('select field_key from submission_fields where submission_id=? and field_key=?')
+    .get(sub.id, 'task_28');
+  assert.equal(row, undefined, 'no field row must have been written');
+});
+
+test('saveFields called with no user argument throws, rather than writing', () => {
+  const { db, sub } = setup();
+  assert.throws(() => saveFields(db, sub.id, { task_28: 'OK' }), /user/i);
+
+  const row = db.prepare('select field_key from submission_fields where submission_id=? and field_key=?')
+    .get(sub.id, 'task_28');
+  assert.equal(row, undefined, 'no field row must have been written without a user');
+});
+
+test('saveFields happy path: the current stage owner still saves values successfully', () => {
+  const { db, users, sub } = setup();
+  signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+  // Record is now pending_lead: the team leader is the current stage owner.
+  saveFields(db, sub.id, { remarks: 'Reviewed by lead' }, users.lead);
+
+  const row = db.prepare('select value from submission_fields where submission_id=? and field_key=?')
+    .get(sub.id, 'remarks');
+  assert.equal(row.value, 'Reviewed by lead');
 });

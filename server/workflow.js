@@ -6,6 +6,24 @@ export const STAGES = [
 
 const stageFor = (state) => STAGES.find((s) => s.state === state);
 
+// Shared by assertCanEdit and signAndAdvance so the two can never silently
+// diverge on who owns a record right now. Each caller supplies its own
+// wording (edit vs. sign read differently) but the underlying rule — approved
+// is terminal, only the current stage's actor role may act, and the
+// technician stage additionally requires being the record's creator — lives
+// in exactly one place.
+function assertStageOwnership(sub, user, messages) {
+  if (sub.state === 'approved') throw new Error(messages.terminal);
+  const stage = stageFor(sub.state);
+  if (!stage) {
+    if (messages.unknownState) throw new Error(messages.unknownState(sub.state));
+    throw new Error(messages.role);
+  }
+  if (stage.actor !== user.role) throw new Error(messages.role);
+  if (stage.actor === 'technician' && sub.created_by !== user.id) throw new Error(messages.owner);
+  return stage;
+}
+
 export function createSubmission(db, { formId, userId, machineId = '', frequency = '', snapshot = null }) {
   const now = new Date().toISOString();
   const fields = snapshot ??
@@ -17,7 +35,13 @@ export function createSubmission(db, { formId, userId, machineId = '', frequency
   return db.prepare('select * from submissions where id=?').get(info.lastInsertRowid);
 }
 
-export function saveFields(db, submissionId, values) {
+// The whole point of this module is that no future HTTP route can bypass the
+// sign-off rules, so saveFields enforces assertCanEdit itself rather than
+// trusting every caller to remember to check first. A caller that already
+// called assertCanEdit is unaffected — the check simply passes again.
+export function saveFields(db, submissionId, values, user) {
+  if (!user) throw new Error('A user is required to save fields.');
+  assertCanEdit(db, submissionId, user);
   const snapshot = JSON.parse(db.prepare('select form_snapshot from submissions where id=?').get(submissionId).form_snapshot);
   const labels = new Map(snapshot.map((f) => [f.field_key, f.label]));
   const stmt = db.prepare(`insert into submission_fields (submission_id, field_key, label, value)
@@ -35,12 +59,11 @@ export function saveFields(db, submissionId, values) {
 export function assertCanEdit(db, submissionId, user) {
   const sub = db.prepare('select * from submissions where id=?').get(submissionId);
   if (!sub) throw new Error('Submission not found.');
-  if (sub.state === 'approved') throw new Error('This record is approved and cannot be changed.');
-  const stage = stageFor(sub.state);
-  if (!stage || stage.actor !== user.role)
-    throw new Error('Your role cannot edit this record at its current stage.');
-  if (stage.actor === 'technician' && sub.created_by !== user.id)
-    throw new Error('Your role cannot edit another technician\'s record.');
+  assertStageOwnership(sub, user, {
+    terminal: 'This record is approved and cannot be changed.',
+    role: 'Your role cannot edit this record at its current stage.',
+    owner: 'Your role cannot edit another technician\'s record.'
+  });
 }
 
 export function signAndAdvance(db, { submissionId, user, signaturePng }) {
@@ -51,13 +74,13 @@ export function signAndAdvance(db, { submissionId, user, signaturePng }) {
     // both advance the same record.
     const sub = db.prepare('select * from submissions where id=?').get(submissionId);
     if (!sub) throw new Error('Submission not found.');
-    if (sub.state === 'approved') throw new Error('This record is approved and cannot be changed.');
 
-    const stage = stageFor(sub.state);
-    if (!stage) throw new Error(`Unknown state: ${sub.state}`);
-    if (stage.actor !== user.role) throw new Error('Your role cannot sign this record at its current stage.');
-    if (stage.actor === 'technician' && sub.created_by !== user.id)
-      throw new Error('Only the technician who created this record can submit it.');
+    const stage = assertStageOwnership(sub, user, {
+      terminal: 'This record is approved and cannot be changed.',
+      role: 'Your role cannot sign this record at its current stage.',
+      owner: 'Only the technician who created this record can submit it.',
+      unknownState: (state) => `Unknown state: ${state}`
+    });
 
     const now = new Date().toISOString();
     db.prepare(`insert into signatures (submission_id, stage, user_id, full_name, image_png, signed_at)
