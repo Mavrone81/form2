@@ -91,3 +91,29 @@ test('a malformed stored hash fails verification cleanly instead of throwing', (
     assert.equal(verifyPassword('anything', 'garbage'), false);
   });
 });
+
+test('verifyPassword returns false, never throws, for other malformed stored shapes', () => {
+  const malformed = [
+    '',
+    'scrypt$salt$hash$extra$segments',
+    'scrypt$deadbeef$nothexatall!!',
+    null,
+    12345,
+  ];
+  for (const stored of malformed) {
+    assert.doesNotThrow(() => {
+      assert.equal(verifyPassword('anything', stored), false, `expected false for ${JSON.stringify(stored)}`);
+    }, `expected no throw for ${JSON.stringify(stored)}`);
+  }
+});
+
+test('requireRole denies with 403 when the session user has no role property', () => {
+  const req = { session: { user: {} } };
+  let code = 200;
+  const res = { status(c) { code = c; return this; }, json() { return this; } };
+  let nexted = false;
+  requireRole('admin')(req, res, () => { nexted = true; });
+  assert.equal(code, 403);
+  assert.equal(nexted, false);
+});
+

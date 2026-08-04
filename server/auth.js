@@ -28,9 +28,20 @@ export function createUser(db, { username, password, fullName, role }) {
   ).get(info.lastInsertRowid);
 }
 
+// A fixed dummy hash, computed once at load, so that looking up a
+// nonexistent or inactive username still costs one scrypt call — the
+// same amount of work a real lookup spends verifying the password.
+// Without this, "no such user" returns almost instantly while a real
+// user's wrong password takes tens of milliseconds, and that timing
+// gap lets an attacker enumerate valid usernames.
+const DUMMY = hashPassword(randomBytes(32).toString('hex'));
+
 export function authenticate(db, username, password) {
   const user = db.prepare('select * from users where username = ? and active = 1').get(username);
-  if (!user) return null;
+  if (!user) {
+    verifyPassword(password, DUMMY);
+    return null;
+  }
   if (!verifyPassword(password, user.password_hash)) return null;
   const { password_hash, ...safe } = user;
   return safe;
