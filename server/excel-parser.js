@@ -47,7 +47,8 @@ export async function parseWorkbook(path) {
   let header = null;
   for (let r = 1; r <= ws.rowCount && !header; r++) {
     const row = ws.getRow(r);
-    let no = null, freq = null, instr = null, status = null;
+    let no = null, freq = null, instr = null;
+    const statusMatches = [];
     for (let c = 1; c <= (row.cellCount || 0); c++) {
       const v = norm(txt(row.getCell(c)));
       // Multi-column headers (Instruction, Status) are merged across a
@@ -59,9 +60,23 @@ export async function parseWorkbook(path) {
       if (v === 'no' && no == null) no = c;
       else if (v.startsWith('freq') && freq == null) freq = c;
       else if (v.startsWith('instruction') && instr == null) instr = c;
-      else if (v.startsWith('status') && status == null) status = c;
+      // Collect every fuzzy "status..." match rather than latching onto the
+      // first: a stray earlier cell (e.g. a decoy that happens to start
+      // with "status") must not shadow the real Status column that follows
+      // Instruction — see the ascending-order pick below.
+      else if (v.startsWith('status')) statusMatches.push(c);
     }
-    if (no != null && freq != null && instr != null) header = { r, no, freq, instr, status };
+    // Structural invariant for this template: columns always appear in
+    // ascending order No < Freq < Instruction < Status. A fuzzy keyword
+    // match out of that order (e.g. a decoy cell whose text happens to
+    // start with a keyword) must not be accepted — require ascending order
+    // to qualify as the header row at all, and pick only a status column
+    // that is strictly to the right of Instruction, falling back to "no
+    // status column" (null) rather than accepting a bogus earlier match.
+    if (no != null && freq != null && instr != null && no < freq && freq < instr) {
+      const status = statusMatches.find((c) => c > instr) ?? null;
+      header = { r, no, freq, instr, status };
+    }
   }
   if (!header) throw new Error('no task table found');
 
