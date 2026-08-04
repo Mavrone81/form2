@@ -1,5 +1,5 @@
 import { readdirSync, statSync, readFileSync } from 'node:fs';
-import { join, extname, basename } from 'node:path';
+import { join, extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { parseWorkbook } from './excel-parser.js';
 
@@ -80,12 +80,25 @@ export async function scanFolder(db, dir) {
 
     if (def) {
       const { id } = db.prepare('select id from form_catalog where file_path = ?').get(path);
+      // Admin-authored fields must never be silently overwritten by a rescan,
+      // even if a generated field_key (machine_id, task_3, sig_engineer, ...)
+      // happens to collide with one. The admin's row wins: we skip generating
+      // any parsed field whose key is already claimed by an admin row, so the
+      // plain insert below can never hit the (form_id, field_key) unique index
+      // on an admin-owned key.
+      const adminKeys = new Set(
+        db.prepare("select field_key from form_fields where form_id = ? and source = 'admin'")
+          .all(id)
+          .map((r) => r.field_key)
+      );
       db.prepare('delete from form_fields where form_id = ? and source = ?').run(id, 'parsed');
-      const ins = db.prepare(`insert or replace into form_fields
+      const ins = db.prepare(`insert into form_fields
         (form_id, field_key, label, section, kind, sort_order, source)
         values (?,?,?,?,?,?,?)`);
-      for (const f of fieldsFromDefinition(def))
+      for (const f of fieldsFromDefinition(def)) {
+        if (adminKeys.has(f.field_key)) continue;
         ins.run(id, f.field_key, f.label, f.section, f.kind, f.sort_order, f.source);
+      }
     }
   }
 
