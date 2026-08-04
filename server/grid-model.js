@@ -3,7 +3,7 @@ import ExcelJS from 'exceljs';
 const DEFAULT_COL_WIDTH = 8.43;
 const PX_PER_CHAR = 7.5;
 
-export async function buildGrid(path) {
+export async function buildGrid(path, definition = null) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(path);
   const ws = wb.worksheets[0];
@@ -30,6 +30,11 @@ export async function buildGrid(path) {
         if (!(r === r1 && c === c1)) covered.add(`${r}:${c}`);
   }
 
+  // Rows that carry an actual maintenance task (per the parsed definition),
+  // so the left pane can dim rows the current interval does not cover.
+  // definition is optional so existing single-argument callers keep working.
+  const taskRows = new Set((definition?.tasks ?? []).map((t) => t.row));
+
   const side = (b) => (b?.style ? true : false);
   const rows = [];
   for (let r = 1; r <= ws.rowCount; r++) {
@@ -51,7 +56,7 @@ export async function buildGrid(path) {
         borders: { t: side(b.top), r: side(b.right), b: side(b.bottom), l: side(b.left) }
       });
     }
-    rows.push({ index: r, height: Math.round(row.height ?? 15), cells });
+    rows.push({ index: r, height: Math.round(row.height ?? 15), isTask: taskRows.has(r), cells });
   }
   return { columns, rows };
 }

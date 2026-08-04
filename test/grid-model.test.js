@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { buildGrid } from '../server/grid-model.js';
+import { parseWorkbook } from '../server/excel-parser.js';
 import { loadFixtures, SKIP } from './helpers/fixtures.js';
 
 const fx = loadFixtures();
@@ -45,4 +46,22 @@ test('no coordinate in the grid is claimed twice, including cells covered by a s
     }
   }
   assert.deepEqual(duplicates, [], 'expected no coordinate to be claimed by more than one cell/span');
+});
+
+test('buildGrid(path) called with a single argument still works, with every row isTask === false', { skip: fx ? false : SKIP }, async () => {
+  const grid = await buildGrid(join(fx.formsDir, fx.forms[0].file));
+  assert.ok(grid.rows.length > 0);
+  assert.ok(grid.rows.every((r) => r.isTask === false), 'expected isTask === false on every row when no definition is supplied');
+});
+
+test('buildGrid(path, definition) marks exactly the task rows from definition.tasks[].row as isTask === true', { skip: fx ? false : SKIP }, async () => {
+  const path = join(fx.formsDir, fx.forms[0].file);
+  const def = await parseWorkbook(path);
+  const grid = await buildGrid(path, def);
+
+  const expectedTaskRows = new Set(def.tasks.map((t) => t.row));
+  assert.ok(expectedTaskRows.size > 0, 'expected the fixture form to have at least one task row');
+
+  const actualTaskRows = new Set(grid.rows.filter((r) => r.isTask).map((r) => r.index));
+  assert.deepEqual(actualTaskRows, expectedTaskRows, 'expected isTask to be true on exactly the rows listed in definition.tasks[].row, and no others');
 });

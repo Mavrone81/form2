@@ -58,7 +58,8 @@ export function makeRoutes(db) {
     if (!form || form.file_type !== 'xlsx') return res.status(404).json({ error: 'No grid for this form.' });
     let grid;
     try {
-      grid = await buildGrid(form.file_path);
+      const def = await parseWorkbook(form.file_path);
+      grid = await buildGrid(form.file_path, def);
     } catch (err) {
       return unreadableForm(res, form.id, err);
     }
