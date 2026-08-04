@@ -2801,6 +2801,71 @@ A "Preview PDF" button in the right pane, shown only when the signed-in user's s
 
 ---
 
+### Task 19: Visual design pass
+
+Direction **A — Document control** was reviewed and approved by the user on 2026-08-04, after the contrast defect in the mockup was fixed. Monochrome, grid-forward, codes set as codes; one accent carries record state.
+
+Tasks 11–15 build the UI with the right tokens and structure, but nothing yet checks whether the running app actually *looks* like approved Direction A. This task closes that gap against the real app with real data.
+
+Run after Task 15, when the app is clickable end to end. This is the only task that requires a real browser.
+
+**Files:**
+- Modify: `web/css/app.css`, and the `web/js/*` render functions where markup changes are needed
+- Reference (read-only): `docs/design/directions.html` — Direction A, git-ignored because it renders real form content
+
+**Interfaces:** no API changes. Presentation only. If a change would alter behaviour, it belongs in another task.
+
+- [ ] **Step 1: Capture the current state**
+
+Start the app, sign in as each role, and screenshot every screen with a real form loaded — pick one with a long task table (18 rows) and one short (4 rows), since density is where layouts break:
+
+1. Login
+2. Form picker
+3. Technician fill view — left pane form, right pane fields
+4. The same view with an interval selected, showing out-of-scope rows tinted
+5. Team leader review — technician's entries read-only, their signature visible
+6. Engineer view of an approved record — state chip green, everything locked
+7. Admin: folder settings, user list, PDF field mapper
+
+- [ ] **Step 2: Compare against the mockup**
+
+Open `docs/design/directions.html` (Direction A) beside the screenshots. For each screen, list concrete differences under: type scale and weight, spacing rhythm, table density and row height, the control strip, the state chip, borders and rules, alignment of the two panes.
+
+Write the list into the report before changing anything — a written list prevents an unfocused tweak-until-it-feels-right pass.
+
+- [ ] **Step 3: Close the gaps**
+
+Fix the listed differences. Constraints that still bind:
+- Monochrome plus exactly one accent carrying record state. No new hues.
+- Every control declares its own `color`; light panels declare `color-scheme: light`.
+- Instruction and frequency text is never faded — out-of-scope rows are de-emphasised by background tint only.
+- Codes (document numbers, revisions, `1M`/`3M`/`6M`/`Y`) stay monospace.
+- Reuse tokens; add a token rather than a bare hex.
+- The css-contract tests must still pass, unweakened.
+
+- [ ] **Step 4: Verify the signature pad for real**
+
+Task 13 was implemented and reviewed without a browser, and it is where the worst defect in this build lived. In the real browser:
+- Draw a signature with the mouse. Confirm strokes are smooth and continuous.
+- Resize the window mid-signature, and resize rapidly several times. **The signature must survive.** This is the regression check for the fixed race.
+- Click Clear; confirm the pad empties and Submit then reports "Sign before submitting."
+- Sign, submit, and confirm the stored signature renders correctly for the next role.
+
+- [ ] **Step 5: Re-screenshot and present**
+
+Capture the same screens again and present before/after to the user. Note anything deliberately left alone and why.
+
+- [ ] **Step 6: Run the suite and commit**
+
+Run: `npm test` — all tests pass, css-contract tests unweakened.
+
+```bash
+git add web/
+git commit -m "Visual design pass against the approved direction"
+```
+
+---
+
 ## Verification checklist
 
 Before calling this done, confirm each by running it — not by reading the code:
