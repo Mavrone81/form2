@@ -68,6 +68,15 @@ server {
 }
 ```
 
+`X-Forwarded-Proto` is not decoration: the app runs with `trust proxy` set, and marks the
+session cookie `Secure` whenever `NODE_ENV=production` (which the image sets). Drop that
+header and the cookie is still issued, but the browser will send it back over plain HTTP
+too — so keep it, and keep the `:80 -> :443` redirect certbot installs.
+
+Sessions expire eight hours after sign-in — one shift. A shop-floor tablet left signed in
+stops being signed in by the next day, and every screen carries a **Sign out** control for
+ending a session deliberately. Both matter because a record names whoever signed it.
+
 Then:
 
 ```bash

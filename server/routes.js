@@ -5,10 +5,30 @@ import { listForms, scanFolder } from './scanner.js';
 import { buildGrid } from './grid-model.js';
 import { parseWorkbook } from './excel-parser.js';
 import { tasksInScope, scopeSummary } from './intervals.js';
-import { createSubmission, saveFields, signAndAdvance, queueFor, assertCanEdit, completenessFor } from './workflow.js';
+import { createSubmission, saveFields, signAndAdvance, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
 import { renderRecordPdf } from './pdf-record.js';
 
 const signedIn = requireRole(...ROLES);
+
+// Signatures must be read back in the workflow's own order — technician,
+// then team leader, then engineer — because drawSignatures lays block i at
+// column i, so this ordering IS the printed order on the archival record.
+// With no ORDER BY, SQLite served them from the (submission_id, stage) unique
+// index, i.e. alphabetically: engineer, team_leader, technician — printing
+// every record's sign-off inverted. Built from STAGES so it can never drift
+// from the workflow it claims to mirror; the values are module constants,
+// never request input.
+const STAGE_ORDER_SQL = `case stage ${STAGES.map((s, i) => `when '${s.actor}' then ${i}`).join(' ')} else ${STAGES.length} end`;
+const SIGNATURES_SQL =
+  `select stage, full_name, image_png, signed_at from signatures where submission_id=? order by ${STAGE_ORDER_SQL}`;
+
+// Signature ink is replayable: an image lifted from one record could be
+// pasted onto another. Attribution (who signed, when) stays legible to every
+// signed-in reader, but the image itself is returned only to the stage that
+// drew it and to an admin — mirroring the PDF route's own rule rather than
+// leaving a second, laxer path to the same evidence.
+const visibleSignatures = (rows, user) => rows.map(({ image_png, ...rest }) =>
+  (user.role === 'admin' || rest.stage === user.role) ? { ...rest, image_png } : rest);
 
 // Express 4 does not catch a rejected promise thrown by an async handler —
 // it becomes an unhandled rejection, and Node 22's default
@@ -128,17 +148,51 @@ export function makeRoutes(db) {
       submission: sub,
       snapshot: JSON.parse(sub.form_snapshot),
       values: db.prepare('select field_key, value from submission_fields where submission_id=?').all(sub.id),
-      signatures: db.prepare('select stage, full_name, image_png, signed_at from signatures where submission_id=?').all(sub.id)
+      signatures: visibleSignatures(db.prepare(SIGNATURES_SQL).all(sub.id), req.session.user)
     });
   });
 
-  r.patch('/submissions/:id', signedIn, (req, res) => {
+  // Accepts the record's field values AND its maintenance interval, because
+  // the interval is part of the record (see setFrequency in workflow.js), not
+  // a client-side view setting. Permission is unchanged: assertCanEdit still
+  // gates everything, and setFrequency additionally refuses once the record
+  // has left the technician's draft stage.
+  //
+  // Awaits parseWorkbook (to learn which intervals this form actually
+  // offers), so it MUST be asyncRoute-wrapped — see the contract at the top
+  // of this file.
+  r.patch('/submissions/:id', signedIn, asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
+    const user = req.session.user;
+    const body = req.body ?? {};
+
+    // Permission first, always — nothing below may reveal or change anything
+    // about a record the caller does not currently own.
+    try { assertCanEdit(db, id, user); }
+    catch (err) { return res.status(statusFor(err, 403)).json({ error: err.message }); }
+
+    // A record may only be scoped to an interval the controlled document
+    // itself defines, so the offered intervals come from the form, not from a
+    // hardcoded list.
+    if (body.frequency !== undefined) {
+      const { form_id: formId } = db.prepare('select form_id from submissions where id=?').get(id);
+      const form = db.prepare('select * from form_catalog where id=?').get(formId);
+      let frequencies = [];
+      if (form?.file_type === 'xlsx') {
+        try { ({ frequencies } = await parseWorkbook(form.file_path)); }
+        catch (err) { return unreadableForm(res, formId, err); }
+      }
+      if (!frequencies.includes(String(body.frequency))) {
+        return res.status(400).json({ error: 'That maintenance interval is not one this form offers.' });
+      }
+    }
+
     try {
-      assertCanEdit(db, Number(req.params.id), req.session.user);
-      saveFields(db, Number(req.params.id), req.body?.values ?? {}, req.session.user);
+      saveFields(db, id, body.values ?? {}, user);
+      if (body.frequency !== undefined) setFrequency(db, id, String(body.frequency), user);
       res.json({ ok: true });
     } catch (err) { res.status(statusFor(err, 403)).json({ error: err.message }); }
-  });
+  }));
 
   r.post('/submissions/:id/sign', signedIn, (req, res) => {
     try {
@@ -171,24 +225,47 @@ export function makeRoutes(db) {
       || ((user.role === 'team_leader' || user.role === 'engineer') && signedStages.includes(user.role));
     if (!allowed) return res.status(403).json({ error: 'Available once you have signed this record.' });
 
-    const form = db.prepare('select * from form_catalog where id=?').get(sub.form_id);
-    if (!form) return res.status(404).json({ error: 'Record not found.' });
+    // A signed record is evidence, and evidence must stay retrievable and
+    // unchanged. Its document identity (doc number, revision) comes from the
+    // columns stamped on the submission when it was created — never from the
+    // catalog row, which tracks a live file that may since have been revised,
+    // rescanned or deleted. Older records created before those columns
+    // existed have nothing stored, so they fall back to the catalog.
+    const form = db.prepare('select * from form_catalog where id=?').get(sub.form_id) ?? null;
+    const identity = {
+      title: form?.title || form?.file_name || '',
+      doc_number: sub.doc_number || form?.doc_number || '',
+      revision: sub.revision || form?.revision || ''
+    };
 
+    // The grid (the form's own printed instructions) can only come from the
+    // live file — it is not snapshotted. When that file cannot be read, the
+    // record is still produced from its stored snapshot rather than failing:
+    // an approved record must never become unobtainable. When the file IS
+    // readable but is no longer the one this record was signed against, the
+    // record still renders, and says so on its face.
     let grid = null;
-    if (form.file_type === 'xlsx') {
+    let notice = '';
+    if (form?.file_type === 'xlsx') {
       try {
         const def = await parseWorkbook(form.file_path);
         grid = await buildGrid(form.file_path, def);
       } catch (err) {
-        return unreadableForm(res, form.id, err);
+        console.error(`Record ${sub.id}: form ${form.id} could not be read; rendering from the stored snapshot instead:`, err);
+        notice = 'SOURCE FORM COULD NOT BE READ — RENDERED FROM THE STORED RECORD';
       }
+    }
+    if (!notice && sub.content_hash && form?.content_hash && sub.content_hash !== form.content_hash) {
+      console.warn(`Record ${sub.id}: form ${form.id} has changed on disk since this record was signed ` +
+        `(recorded ${sub.content_hash.slice(0, 12)}, current ${form.content_hash.slice(0, 12)}).`);
+      notice = 'SOURCE FORM HAS BEEN REVISED SINCE THIS RECORD WAS SIGNED';
     }
 
     const snapshot = JSON.parse(sub.form_snapshot);
     const values = db.prepare('select field_key, value from submission_fields where submission_id=?').all(sub.id);
-    const signatures = db.prepare('select stage, full_name, image_png, signed_at from signatures where submission_id=?').all(sub.id);
+    const signatures = db.prepare(SIGNATURES_SQL).all(sub.id);
 
-    const buffer = await renderRecordPdf({ form, submission: sub, snapshot, values, signatures, grid });
+    const buffer = await renderRecordPdf({ form, submission: sub, snapshot, values, signatures, grid, identity, notice });
 
     // A machine id typed into a spreadsheet cell is untrusted input reaching
     // an HTTP response header — strip everything but alphanumerics, dash,

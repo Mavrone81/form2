@@ -75,7 +75,11 @@ function emptyNotice(text) {
 async function showPicker() {
   teardownFieldPanel();
   formId = null; submission = null; frequency = '';
-  $('#control-strip').replaceChildren();
+  // Who is signed in, and the way out — the list screen needs both just as
+  // much as an open record does.
+  $('#control-strip').replaceChildren(
+    chip(`${user.full_name} · ${user.role.replace('_', ' ')}`), signOutButton()
+  );
   $('#pane-left').replaceChildren();
   const right = $('#pane-right');
   right.replaceChildren();
@@ -128,7 +132,12 @@ function queueSection(title, queue, formsById, emptyText) {
 
     const docEl = document.createElement('span');
     docEl.className = 'queue-doc';
-    docEl.textContent = `${f?.doc_number || '—'} · Rev ${f?.revision || '—'}`;
+    // The record's OWN document number and revision — the ones stamped on it
+    // when it was created — so a later revision of the source form cannot
+    // relabel a record that was worked against the old one. The catalog row
+    // is only a fallback for records created before those were recorded.
+    docEl.textContent =
+      `${s.doc_number || f?.doc_number || '—'} · Rev ${s.revision || f?.revision || '—'}`;
 
     const machineEl = document.createElement('span');
     machineEl.className = 'queue-machine';
@@ -176,9 +185,15 @@ async function paint() {
   const grid = form.file_type === 'xlsx' ? await api.grid(form.id) : null;
   const canAct = isCurrentActor(detail.submission);
 
+  // Same rule as the queue rows: the record states the document identity it
+  // was created against, not whatever the catalog says today, so the screen
+  // and the archived PDF can never disagree about which revision was worked.
+  const sub = detail.submission;
   $('#control-strip').replaceChildren(
-    chip(form.doc_number || form.file_name), chip(`Rev ${form.revision || '—'}`),
-    chip(`${user.full_name} · ${user.role.replace('_', ' ')}`), stateChip(detail.submission.state)
+    chip(sub.doc_number || form.doc_number || form.file_name),
+    chip(`Rev ${sub.revision || form.revision || '—'}`),
+    chip(`${user.full_name} · ${user.role.replace('_', ' ')}`), stateChip(detail.submission.state),
+    signOutButton()
   );
 
   // The empty-scope call site: inScopeRows is `null` ONLY when there is
@@ -220,7 +235,27 @@ async function paint() {
         saveError.textContent = err.message;
       }
     },
-    onFrequencyChange: async (f) => { frequency = f; await paint(); }
+    // The chosen interval is persisted, not just repainted: the stored value
+    // is what the team leader is later shown, what the completeness warning
+    // counts against, and what the archived PDF header prints. It is only
+    // sent while the record is the technician's own draft — the server
+    // refuses it afterwards, and a reviewer's local scope-preview must not
+    // fire a request that would 403.
+    onFrequencyChange: async (f) => {
+      if (detail.submission.state === 'draft' && canAct) {
+        try {
+          await api.setFrequency(submission.id, f);
+          submission = { ...submission, frequency: f };
+        } catch (err) {
+          // Surfaced verbatim, and the selection is NOT adopted locally —
+          // the panel must never show a scope the record does not carry.
+          saveError.textContent = err.message;
+          return;
+        }
+      }
+      frequency = f;
+      await paint();
+    }
   });
 
   $('#pane-right').append(saveError);
@@ -321,6 +356,7 @@ function addPdfBar(sub, signatures) {
 }
 
 const chip = (t) => { const d = document.createElement('div'); d.textContent = t; return d; };
+
 const stateChip = (s) => {
   const d = document.createElement('div');
   d.className = 'state';
@@ -328,5 +364,33 @@ const stateChip = (s) => {
   d.textContent = s.replace('_', ' ');
   return d;
 };
+
+// A shop-floor tablet with no way out stays signed in as whoever used it
+// first, and the next person's signature is then attributed to them — the one
+// thing a quality record must never do. The control lives in the control
+// strip, present on every screen this app shows once signed in.
+function signOutButton() {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'signout';
+  b.textContent = 'Sign out';
+  b.addEventListener('click', signOut);
+  return b;
+}
+
+async function signOut() {
+  // The session is being abandoned either way: even if the request fails,
+  // this browser must not keep showing the previous user's records.
+  try { await api.logout(); } catch { /* fall through to clearing the UI */ }
+  teardownFieldPanel();
+  user = null; formId = null; submission = null; frequency = '';
+  $('#control-strip').replaceChildren();
+  $('#pane-left').replaceChildren();
+  $('#pane-right').replaceChildren();
+  $('#app').hidden = true;
+  $('#login-error').textContent = '';
+  $('#login').reset();
+  $('#login').hidden = false;
+}
 
 boot();

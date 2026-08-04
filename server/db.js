@@ -80,11 +80,36 @@ create index if not exists idx_sub_state on submissions(state);
 create index if not exists idx_sub_creator on submissions(created_by);
 `;
 
+// `create table if not exists` cannot add a column to a table that already
+// exists, so every column added after the first release lands here instead.
+// Each entry is applied only when `pragma table_info` says the column is
+// missing, which keeps openDb idempotent — it runs on every boot and on every
+// in-memory test database, where the columns are already present from SCHEMA
+// or from a previous call.
+const MIGRATIONS = [
+  // The controlled document's identity AT THE MOMENT OF SIGNING. A record is
+  // evidence: revise the source form to Rev F afterwards and this record must
+  // still print the Rev E it was worked and signed against. content_hash is
+  // kept so a later render can tell whether the file on disk is still the one
+  // the record was made from, and say so on the document if it is not.
+  { table: 'submissions', column: 'doc_number', ddl: "alter table submissions add column doc_number text not null default ''" },
+  { table: 'submissions', column: 'revision', ddl: "alter table submissions add column revision text not null default ''" },
+  { table: 'submissions', column: 'content_hash', ddl: "alter table submissions add column content_hash text not null default ''" }
+];
+
+function applyMigrations(db) {
+  for (const { table, column, ddl } of MIGRATIONS) {
+    const columns = db.prepare(`pragma table_info(${table})`).all().map((c) => c.name);
+    if (!columns.includes(column)) db.exec(ddl);
+  }
+}
+
 export function openDb(path = 'data/pm.sqlite') {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.pragma('foreign_keys = ON');
   db.pragma('journal_mode = WAL');
   db.exec(SCHEMA);
+  applyMigrations(db);
   return db;
 }

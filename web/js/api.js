@@ -34,6 +34,12 @@ export const api = {
   queue: () => call('GET', '/api/submissions'),
   submission: (id) => call('GET', `/api/submissions/${id}`),
   save: (id, values) => call('PATCH', `/api/submissions/${id}`, { values }),
+  // The maintenance interval is part of the record, not a view setting: it
+  // decides which tasks were in scope, so the reviewer, the completeness
+  // warning and the archived PDF must all read the same stored value. Same
+  // PATCH, same permission path (the server refuses it once the record has
+  // left the technician's stage).
+  setFrequency: (id, frequency) => call('PATCH', `/api/submissions/${id}`, { frequency }),
   sign: (id, signaturePng) => call('POST', `/api/submissions/${id}/sign`, { signaturePng }),
 
   // ---- admin (Task 15) ----

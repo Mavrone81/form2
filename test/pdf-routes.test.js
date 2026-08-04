@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ExcelJS from 'exceljs';
@@ -184,6 +185,122 @@ test('an unknown submission returns 404, not a stack trace', async () => {
 
     server.close();
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Final review fixes ---
+
+const hasPdftotext = (() => {
+  try { execFileSync('pdftotext', ['-v'], { stdio: 'ignore' }); return true; } catch { return false; }
+})();
+
+// Renders the PDF's visible text in layout order, so a header line and the
+// left-to-right order of the three sign-off blocks can both be asserted.
+function visibleText(buffer) {
+  const dir = mkdtempSync(join(tmpdir(), 'pmforms-text-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    writeFileSync(file, buffer);
+    return execFileSync('pdftotext', ['-layout', file, '-'], { encoding: 'utf8' });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+async function approveRecord(call, form, machineId = 'ED04') {
+  await login(call, 'tech', 'tech');
+  const sub = (await call('POST', '/api/submissions', { formId: form.id, machineId, frequency: 'Y' })).body;
+  await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+  await login(call, 'lead', 'lead');
+  await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+  await login(call, 'eng', 'eng');
+  const approved = await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+  assert.equal(approved.body.state, 'approved');
+  return sub;
+}
+
+// Finding 3: an approved record is immutable evidence. Revising the source
+// document must never retitle a record that was signed against the old one.
+test('an approved record prints the revision it was signed against, not the catalog\'s current one', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pmforms-pdf-'));
+  let close;
+  try {
+    await writeSyntheticWorkbook(join(dir, 'form.xlsx'));
+    const { db, server, call, form } = await boot(dir);
+    close = () => server.close();
+    db.prepare("update form_catalog set doc_number='PM-DOCA', revision='E' where id=?").run(form.id);
+
+    const sub = await approveRecord(call, form);
+
+    // The controlled document is revised and rescanned after the record was
+    // signed. The record's own header must not follow it.
+    db.prepare("update form_catalog set doc_number='PM-DOCA', revision='F', content_hash='changed' where id=?")
+      .run(form.id);
+
+    const res = await call('GET', `/api/submissions/${sub.id}/pdf`);
+    assert.equal(res.status, 200);
+    const bytes = res.body.toString('latin1');
+    assert.ok(bytes.includes('PM-DOCA rev E'), 'the record\'s document metadata must carry the revision it was signed against');
+    assert.ok(!bytes.includes('PM-DOCA rev F'), 'the current catalog revision must not appear on an approved record');
+
+    if (hasPdftotext) {
+      const text = visibleText(res.body);
+      assert.match(text, /REV\s+E\b/, `the printed header must show REV E, got:\n${text.slice(0, 600)}`);
+      assert.doesNotMatch(text, /REV\s+F\b/, 'the printed header must not show the current catalog revision');
+      // Drift must be visible on the document itself, not just in a log.
+      assert.match(text, /revised since/i, 'a revised source form must be declared on the record');
+    }
+  } finally {
+    close?.();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an approved record is still retrievable after its source file is deleted', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pmforms-pdf-'));
+  let close;
+  try {
+    const file = join(dir, 'form.xlsx');
+    await writeSyntheticWorkbook(file);
+    const { db, server, call, form } = await boot(dir);
+    close = () => server.close();
+    db.prepare("update form_catalog set doc_number='PM-DOCB', revision='C' where id=?").run(form.id);
+
+    const sub = await approveRecord(call, form);
+    rmSync(file, { force: true });
+
+    const res = await call('GET', `/api/submissions/${sub.id}/pdf`);
+    assert.equal(res.status, 200, 'a signed record must remain retrievable even with the source form gone');
+    assert.equal(res.body.subarray(0, 4).toString('latin1'), '%PDF');
+    assert.ok(res.body.toString('latin1').includes('PM-DOCB rev C'));
+  } finally {
+    close?.();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Finding 5: the printed sign-off blocks read left to right in the order the
+// record was actually signed — technician, then team leader, then engineer.
+test('sign-off blocks print in workflow order, technician first', { skip: hasPdftotext ? false : 'pdftotext not installed' }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pmforms-pdf-'));
+  let close;
+  try {
+    await writeSyntheticWorkbook(join(dir, 'form.xlsx'));
+    const { server, call, form } = await boot(dir);
+    close = () => server.close();
+    const sub = await approveRecord(call, form);
+
+    const res = await call('GET', `/api/submissions/${sub.id}/pdf`);
+    assert.equal(res.status, 200);
+    const text = visibleText(res.body);
+    const at = (needle) => text.indexOf(needle);
+    const technician = at('Maintenance performed by');
+    const lead = at('Verified by (Team Leader)');
+    const engineer = at('Verified by (Engineer)');
+    assert.ok(technician >= 0 && lead >= 0 && engineer >= 0, `all three blocks must be present, got:\n${text}`);
+    assert.ok(technician < lead && lead < engineer,
+      `blocks must read technician -> team leader -> engineer, got offsets ${technician}/${lead}/${engineer} in:\n${text}`);
+  } finally {
+    close?.();
     rmSync(dir, { recursive: true, force: true });
   }
 });

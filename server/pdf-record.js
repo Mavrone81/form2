@@ -27,14 +27,24 @@ const GRID_ROW_SCALE = 0.62; // Excel row heights read tall next to a Helvetica-
  * licence-tracked sRGB profile — not PDFKit's bundled one — is what actually
  * ships as the record's archival OutputIntent.
  */
-export async function renderRecordPdf({ form, submission, snapshot, values, signatures, grid }) {
+export async function renderRecordPdf({ form, submission, snapshot, values, signatures, grid, identity = null, notice = '' }) {
+  // `identity` is the controlled document as it stood WHEN THIS RECORD WAS
+  // SIGNED (stamped on the submission at creation — see server/workflow.js).
+  // The live catalog row is only a fallback for records created before those
+  // columns existed: a record must never be retitled by a later revision of
+  // its source form.
+  const id = {
+    title: identity?.title || form?.title || form?.file_name || '',
+    doc_number: identity?.doc_number ?? form?.doc_number ?? '',
+    revision: identity?.revision ?? form?.revision ?? ''
+  };
   const doc = new PDFDocument({
     pdfVersion: '1.7', subset: 'PDF/A-2', tagged: true, lang: 'en-GB',
     size: 'A4', margin: PAGE_MARGIN, bufferPages: true,
     info: {
-      Title: `${form.title || form.file_name} — ${submission.machine_id}`,
+      Title: `${id.title} — ${submission.machine_id}`,
       Author: 'Preventive maintenance records',
-      Subject: `${form.doc_number} rev ${form.revision}`,
+      Subject: `${id.doc_number} rev ${id.revision}`,
       CreationDate: new Date(submission.created_at)
     }
   });
@@ -46,7 +56,7 @@ export async function renderRecordPdf({ form, submission, snapshot, values, sign
   forcePdfA2u(doc);
   attachOutputIntent(doc, readFileSync(ICC));
 
-  const ctx = { form, submission };
+  const ctx = { identity: id, submission, notice };
   drawHeader(doc, ctx);
   doc.y = PAGE_MARGIN + HEADER_HEIGHT;
   doc.on('pageAdded', () => {
@@ -54,7 +64,7 @@ export async function renderRecordPdf({ form, submission, snapshot, values, sign
     doc.y = PAGE_MARGIN + HEADER_HEIGHT;
   });
 
-  drawGrid(doc, grid, form);
+  drawGrid(doc, grid, { doc_number: id.doc_number, file_name: id.title });
   drawValues(doc, snapshot, values);
   drawSignatures(doc, signatures);
 
@@ -107,20 +117,30 @@ function attachOutputIntent(doc, iccBuffer) {
 
 // --- Drawing --------------------------------------------------------------
 
-function drawHeader(doc, { form, submission }) {
+function drawHeader(doc, { identity, submission, notice }) {
   const top = PAGE_MARGIN;
   const width = doc.page.width - PAGE_MARGIN * 2;
 
   doc.font('bold').fontSize(12).fillColor('#000')
-    .text(form.title || form.file_name, PAGE_MARGIN, top, { width: width * 0.6, height: 14, ellipsis: true });
+    .text(identity.title, PAGE_MARGIN, top, { width: width * 0.6, height: 14, ellipsis: true });
   doc.font('body').fontSize(8).fillColor('#333')
     .text(`Machine ${submission.machine_id} — ${submission.frequency} interval`, PAGE_MARGIN, top + 15, { width: width * 0.6 });
+
+  // The source form is no longer byte-identical to the one this record was
+  // signed against (or could not be read at all). The record still renders —
+  // it must remain retrievable — but it says so on its own face, on every
+  // page, in full-strength ink. A reader must never be able to mistake this
+  // document for one whose printed instructions still match its source.
+  if (notice) {
+    doc.font('bold').fontSize(6.5).fillColor('#000')
+      .text(notice, PAGE_MARGIN, top + 27, { width: width * 0.6, height: 9, ellipsis: true });
+  }
 
   const codeWidth = width * 0.36;
   const codeX = PAGE_MARGIN + width * 0.64;
   doc.font('mono').fontSize(8).fillColor('#000')
-    .text(`DOC ${form.doc_number || '-'}`, codeX, top, { width: codeWidth, align: 'right' })
-    .text(`REV ${form.revision || '-'}`, codeX, top + 11, { width: codeWidth, align: 'right' })
+    .text(`DOC ${identity.doc_number || '-'}`, codeX, top, { width: codeWidth, align: 'right' })
+    .text(`REV ${identity.revision || '-'}`, codeX, top + 11, { width: codeWidth, align: 'right' })
     .text(pageLabel(doc), codeX, top + 22, { width: codeWidth, align: 'right' });
 
   doc.moveTo(PAGE_MARGIN, top + HEADER_HEIGHT - 6).lineTo(PAGE_MARGIN + width, top + HEADER_HEIGHT - 6)

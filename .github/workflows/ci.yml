@@ -18,7 +18,15 @@ jobs:
       - name: Guard against committed form content
         run: npm run check:sensitive
       - name: Run tests
-        run: npm test 2>&1 | tee test-output.txt
+        # GitHub's default shell is `bash -e`, NOT `-o pipefail`: without the
+        # two lines below, this step exits with `tee`'s status (always 0) and
+        # a failing suite goes green — the whole test gate silently unenforced.
+        # Verified by running both shapes locally against a deliberately
+        # failing test: without pipefail the pipeline exits 0, with it 1.
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test-output.txt
       - name: Report skipped tests
         # The source forms are sensitive and absent from CI, so the tests that
         # parse them skip. A green run therefore covers less than a local run.

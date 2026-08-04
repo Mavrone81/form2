@@ -7,14 +7,35 @@ import { makeRoutes } from './routes.js';
 import { resolveConfig } from './config.js';
 import { scanFolder } from './scanner.js';
 
-export function createApp({ db, sessionSecret }) {
+// One shift. A signed record must name the person who actually signed it, so
+// a shop-floor tablet must not stay signed in as the first user of the day
+// indefinitely — the next person to pick it up would sign under that
+// identity. Eight hours covers a full shift without interrupting one, and a
+// session that outlives the shift that started it has no legitimate use.
+const SESSION_MAX_AGE_MS = 8 * 60 * 60 * 1000;
+
+export function createApp({ db, sessionSecret, secureCookies }) {
   const app = express();
+
+  // The documented deployment (README, compose.yaml) puts nginx in front,
+  // terminating TLS and forwarding X-Forwarded-Proto. Without this, Express
+  // ignores that header and every request looks like plain HTTP to the
+  // session layer.
+  app.set('trust proxy', 1);
+
+  // Secure cookies where the connection really is TLS, off where it is not:
+  // in local development and in the in-process tests the server speaks plain
+  // HTTP, and a Secure cookie would simply never be stored — signing in would
+  // appear to succeed and then silently fail. Callers may force it (used by
+  // the test that proves the production shape emits it).
+  const secure = secureCookies ?? process.env.NODE_ENV === 'production';
+
   app.use(express.json({ limit: '4mb' })); // signature PNGs
   app.use(session({
     secret: sessionSecret ?? resolveConfig({}).sessionSecret,
     resave: false,
     saveUninitialized: false,
-    cookie: { httpOnly: true, sameSite: 'lax' }
+    cookie: { httpOnly: true, sameSite: 'lax', maxAge: SESSION_MAX_AGE_MS, secure }
   }));
   app.use('/api', makeRoutes(db));
   app.use(express.static(fileURLToPath(new URL('../web', import.meta.url))));

@@ -63,11 +63,36 @@ function noticeEl() {
   return p;
 }
 
+// Same control, same class and same behaviour as app.js's — a shared browser
+// must never leave the previous user signed in, and the admin console can
+// change users and form mappings, so it least of all.
+function signOutButton() {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'signout';
+  b.textContent = 'Sign out';
+  b.addEventListener('click', signOut);
+  return b;
+}
+
+async function signOut() {
+  try { await api.logout(); } catch { /* the UI is cleared either way */ }
+  user = null;
+  $('#control-strip').replaceChildren();
+  $('#admin-nav').replaceChildren();
+  $('#admin-main').replaceChildren();
+  $('#app').hidden = true;
+  $('#login-error').textContent = '';
+  $('#login').reset();
+  $('#login').hidden = false;
+}
+
 // ---------- top-level paint ----------
 async function paint() {
   $('#control-strip').replaceChildren(
     chip('Admin'),
-    chip(`${user.full_name} · ${user.role.replace('_', ' ')}`)
+    chip(`${user.full_name} · ${user.role.replace('_', ' ')}`),
+    signOutButton()
   );
 
   if (user.role !== 'admin') {

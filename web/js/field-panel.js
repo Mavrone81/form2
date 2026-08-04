@@ -92,14 +92,23 @@ export function renderFields(container, { snapshot, values, signatures, frequenc
         if (done) {
           // Locked stage: plain text plus the stored signature image,
           // signer name and server timestamp — never a disabled input.
-          const img = document.createElement('img');
-          img.src = done.image_png;
-          img.alt = `Signature of ${done.full_name}`;
-          img.className = 'sig-done';
+          //
+          // The image is only present when the server is willing to show this
+          // reader that stage's ink (its own signer, or an admin — see
+          // server/routes.js). Attribution is always returned, so a withheld
+          // image loses the ink and nothing else: who signed and when stay
+          // fully legible, rather than rendering a broken image element.
+          if (done.image_png) {
+            const img = document.createElement('img');
+            img.src = done.image_png;
+            img.alt = `Signature of ${done.full_name}`;
+            img.className = 'sig-done';
+            wrap.append(img);
+          }
           const meta = document.createElement('p');
           meta.className = 'sig-meta';
           meta.textContent = `${done.full_name} · ${new Date(done.signed_at).toLocaleString()}`;
-          wrap.append(img, meta);
+          wrap.append(meta);
         } else if (stage === currentUser.role && canSign) {
           const pad = document.createElement('div');
           wrap.append(pad);

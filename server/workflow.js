@@ -46,10 +46,18 @@ export function createSubmission(db, { formId, userId, machineId = '', frequency
   const now = new Date().toISOString();
   const fields = snapshot ??
     db.prepare('select field_key, label, section, kind, sort_order from form_fields where form_id=? order by sort_order').all(formId);
+  // The controlled document's identity is captured HERE, once, alongside the
+  // field snapshot. The catalog row is a live mirror of a file that can be
+  // revised, rescanned or deleted at any time; a record signed against Rev E
+  // must keep saying Rev E forever, so the archival PDF reads these columns
+  // and never the catalog (server/routes.js, the /pdf route).
+  const form = db.prepare('select doc_number, revision, content_hash from form_catalog where id=?').get(formId);
   const info = db.prepare(`insert into submissions
-    (form_id, form_snapshot, machine_id, frequency, state, created_by, created_at, updated_at)
-    values (?,?,?,?, 'draft', ?,?,?)`)
-    .run(formId, JSON.stringify(fields), machineId, frequency, userId, now, now);
+    (form_id, form_snapshot, machine_id, frequency, state, created_by, created_at, updated_at,
+     doc_number, revision, content_hash)
+    values (?,?,?,?, 'draft', ?,?,?, ?,?,?)`)
+    .run(formId, JSON.stringify(fields), machineId, frequency, userId, now, now,
+      form?.doc_number ?? '', form?.revision ?? '', form?.content_hash ?? '');
   return db.prepare('select * from submissions where id=?').get(info.lastInsertRowid);
 }
 
@@ -67,8 +75,35 @@ export function saveFields(db, submissionId, values, user) {
     on conflict(submission_id, field_key) do update set value=excluded.value`);
   const tx = db.transaction((entries) => {
     for (const [key, value] of entries) stmt.run(submissionId, key, labels.get(key) ?? key, String(value ?? ''));
+    // The technician types the machine id into the machine_id FIELD — there
+    // is no separate control for it. Mirroring it onto the record itself in
+    // the same transaction is what makes a queue row, a PDF header and an
+    // archive filename able to name the machine at all. Done here rather than
+    // in the route so no future caller of saveFields can drift from it.
+    if (Object.prototype.hasOwnProperty.call(values, 'machine_id')) {
+      db.prepare('update submissions set machine_id=?, updated_at=? where id=?')
+        .run(String(values.machine_id ?? ''), new Date().toISOString(), submissionId);
+    }
   });
   tx(Object.entries(values));
+}
+
+// The maintenance interval decides which tasks are in scope — which work the
+// technician actually did. It is part of the record, not a view setting: the
+// reviewer must be shown the same scope, and the archived PDF must print it.
+// Changing it is therefore an edit of the record, subject to the same stage
+// ownership as any other, plus one extra rule: the interval belongs to the
+// technician's own draft stage and is frozen the moment the record leaves it.
+// A team leader owns the pending_lead stage for editing purposes, but must
+// never be able to re-scope work that has already been performed and signed.
+export function setFrequency(db, submissionId, frequency, user) {
+  assertCanEdit(db, submissionId, user);
+  const sub = db.prepare('select state from submissions where id=?').get(submissionId);
+  if (sub.state !== 'draft') {
+    throw forbidden('The maintenance interval can no longer be changed — this record has been signed.');
+  }
+  db.prepare('update submissions set frequency=?, updated_at=? where id=?')
+    .run(String(frequency), new Date().toISOString(), submissionId);
 }
 
 // A record may only be edited by whoever owns its current stage. Without this,

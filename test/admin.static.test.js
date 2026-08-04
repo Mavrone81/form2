@@ -132,3 +132,33 @@ test('static: admin.js extends the shared api.js client rather than calling fetc
   assert.doesNotMatch(adminSrc, /\bfetch\(/, 'admin.js must not call fetch() directly — use api.js');
   assert.match(adminSrc, /from '\.\/api\.js'/, 'expected admin.js to import the shared api client');
 });
+
+// --- Final review fixes ---
+
+// Finding 2: a shop-floor tablet that cannot be signed out signs the next
+// person's record under the first person's identity. Both pages must offer a
+// visible control, and it must actually call the logout endpoint.
+test('static: both signed-in pages offer a sign-out control wired to api.logout()', () => {
+  const html = new Map(['index.html', 'admin.html'].map(
+    (f) => [f, readFileSync(fileURLToPath(new URL(`../web/${f}`, import.meta.url)), 'utf8')]
+  ));
+  for (const [name, src] of html) {
+    assert.match(src, /id="control-strip"/, `${name} must have the control strip that carries the control`);
+  }
+  for (const name of ['app.js', 'admin.js']) {
+    const src = sources.get(name);
+    assert.match(src, /api\.logout\(\)/, `${name} must call api.logout()`);
+    assert.match(src, /[Ss]ign out/, `${name} must render a visible "Sign out" control`);
+    assert.match(src, /control-strip/, `${name} must place the control in the control strip`);
+  }
+});
+
+test('static: the sign-out control declares its own colour on a dark background', () => {
+  // The document-control direction: monochrome, and every control states its
+  // own colour rather than inheriting one (see test/css-contract.test.js).
+  const css = readFileSync(fileURLToPath(new URL('../web/css/app.css', import.meta.url)), 'utf8');
+  const rule = /#control-strip\s+\.signout\s*\{([^}]*)\}/.exec(css);
+  assert.ok(rule, 'expected a #control-strip .signout rule in app.css');
+  assert.match(rule[1], /(^|[;\s])color\s*:/, 'the sign-out control must declare its own colour');
+  assert.match(rule[1], /background(-color)?\s*:/, 'the sign-out control must declare its own background');
+});

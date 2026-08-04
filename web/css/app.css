@@ -71,6 +71,23 @@ a{color:var(--ink)}
 #control-strip .grow{margin-left:auto;text-align:right;color:var(--mute-on-dark);border-right:0}
 #control-strip .state{margin-left:auto;background:var(--stamp);border-right:0}
 #control-strip .state[data-state="approved"]{background:var(--ok)}
+/* Sign out: the last cell of the running header, styled as one of the strip's
+   own cells rather than as a button — same monospace code type, same padding,
+   same divider. Colour and background are both restated here (never inherited
+   from the strip) so this control cannot become invisible if the strip's own
+   rule changes; the strip's near-black is the only background it ever has, so
+   #fff is the only correct foreground. */
+#control-strip .signout{margin-left:auto;border:0;border-left:1px solid var(--line-dark);
+  background:var(--ink);color:#fff;font:inherit;letter-spacing:inherit;text-transform:inherit;
+  padding:11px 16px;min-height:44px;cursor:pointer}
+/* A state chip already claims `margin-left:auto`; when both are present the
+   chip does the pushing and Sign out simply follows it. */
+#control-strip .state~.signout{margin-left:0}
+/* Monochrome throughout — the single accent belongs to the record's state,
+   never to a navigation control, so hover/focus is signalled by the rule and
+   the underline rather than by colour. */
+#control-strip .signout:hover,#control-strip .signout:focus-visible{text-decoration:underline}
+#control-strip .signout:focus-visible{outline:2px solid #fff;outline-offset:-3px}
 
 /* ---------- Two-pane split: the form on the left, fill-in on the right ---------- */
 /* Mobile-first: a single column by default (the form, then the fill-in panel,
