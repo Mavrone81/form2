@@ -54,7 +54,7 @@ export async function renderRecordPdf({ form, submission, snapshot, values, sign
     doc.y = PAGE_MARGIN + HEADER_HEIGHT;
   });
 
-  drawGrid(doc, grid);
+  drawGrid(doc, grid, form);
   drawValues(doc, snapshot, values);
   drawSignatures(doc, signatures);
 
@@ -152,7 +152,16 @@ function stampPageNumbers(doc, ctx) {
   }
 }
 
-function drawGrid(doc, grid) {
+// The record is archival evidence that a maintenance step was performed —
+// a task instruction (including a safety instruction) must never be cut off
+// with no trace. drawGrid measures each cell's actual required text height
+// first and grows the row to fit it (Finding 1), and reserves that FULL
+// footprint — including a spanning cell's multi-row height — before drawing
+// anything, so a page break happens before a tall cell is painted rather
+// than mid-cell (Finding 2). Only a cell whose own text could not fit even
+// on a full, freshly-started page falls back to a visible ellipsis, and
+// that fallback is logged rather than left silent.
+function drawGrid(doc, grid, form) {
   if (!grid || !grid.columns?.length || !grid.rows?.length) return;
 
   const contentWidth = doc.page.width - PAGE_MARGIN * 2;
@@ -166,35 +175,98 @@ function drawGrid(doc, grid) {
   }
   const colOrder = grid.columns.map((c) => c.index);
 
+  // The most vertical space a row could ever be given: an entirely fresh
+  // page, below the repeated header, down to the bottom margin.
+  const maxPageBudget = doc.page.height - PAGE_MARGIN - (PAGE_MARGIN + HEADER_HEIGHT);
+
+  const cellGeometry = (cell) => {
+    const startPos = colX.get(cell.col);
+    if (!startPos) return null;
+    const span = cell.span ?? { rows: 1, cols: 1 };
+    const endColIndex = colOrder[colOrder.indexOf(cell.col) + (span.cols - 1)] ?? cell.col;
+    const endPos = colX.get(endColIndex) ?? startPos;
+    return { x: startPos.x, width: endPos.x + endPos.width - startPos.x, span };
+  };
+
   for (const row of grid.rows) {
-    const height = Math.max(10, Math.round(row.height * GRID_ROW_SCALE));
-    ensureSpace(doc, height);
-    const rowTop = doc.y;
+    const baseHeight = Math.max(10, Math.round(row.height * GRID_ROW_SCALE));
 
+    // Pass 1: measure. For a cell spanning multiple rows, its need is
+    // divided across the rows it covers, so growing THIS row's height by
+    // that share means `rowHeight * span.rows` ends up covering the cell's
+    // real requirement once drawn.
+    let rowHeight = baseHeight;
+    let maxSpanRows = 1;
+    const measured = new Map();
     for (const cell of row.cells) {
-      const startPos = colX.get(cell.col);
-      if (!startPos) continue;
-      const span = cell.span ?? { rows: 1, cols: 1 };
-      const endColIndex = colOrder[colOrder.indexOf(cell.col) + (span.cols - 1)] ?? cell.col;
-      const endPos = colX.get(endColIndex) ?? startPos;
-      const cellWidth = endPos.x + endPos.width - startPos.x;
-      const cellHeight = height * (span.rows || 1);
-
-      drawCellBorders(doc, cell.borders, startPos.x, rowTop, cellWidth, cellHeight);
-
-      if (cell.text) {
-        doc.font(cell.bold ? 'bold' : 'body').fontSize(7).fillColor('#000')
-          .text(cell.text, startPos.x + 2, rowTop + 2, {
-            width: Math.max(1, cellWidth - 4),
-            height: Math.max(1, cellHeight - 4),
-            align: cell.align || 'left'
-          });
-      }
+      const geo = cellGeometry(cell);
+      if (!geo) continue;
+      maxSpanRows = Math.max(maxSpanRows, geo.span.rows || 1);
+      if (!cell.text) continue;
+      doc.font(cell.bold ? 'bold' : 'body').fontSize(7);
+      const cellWidth = Math.max(1, geo.width - 4);
+      const neededHeight = doc.heightOfString(cell.text, { width: cellWidth, align: cell.align || 'left' }) + 4;
+      measured.set(cell, { neededHeight, cellWidth });
+      rowHeight = Math.max(rowHeight, Math.ceil(neededHeight / (geo.span.rows || 1)));
     }
 
-    doc.y = rowTop + height;
+    // A cell's own text cannot outgrow a full fresh page. Cap the per-row
+    // share so the total footprint (rowHeight * maxSpanRows) never exceeds
+    // one page's budget — otherwise ensureSpace could never be satisfied.
+    const perRowCap = Math.max(1, Math.floor(maxPageBudget / maxSpanRows));
+    const capped = rowHeight > perRowCap;
+    if (capped) rowHeight = perRowCap;
+
+    const rowBlockHeight = rowHeight * maxSpanRows;
+    ensureSpace(doc, rowBlockHeight);
+    const rowTop = doc.y;
+
+    // Pass 2: draw, now that the row's final height (and the space for it)
+    // is settled.
+    for (const cell of row.cells) {
+      const geo = cellGeometry(cell);
+      if (!geo) continue;
+      const cellHeight = rowHeight * (geo.span.rows || 1);
+
+      drawCellBorders(doc, cell.borders, geo.x, rowTop, geo.width, cellHeight);
+
+      if (!cell.text) continue;
+      const m = measured.get(cell);
+      const availableHeight = cellHeight - 4;
+      const overflows = capped && m && m.neededHeight > availableHeight + 0.5;
+      if (overflows) {
+        warnTruncation(form, row.index, cell.col);
+      }
+
+      const textOptions = {
+        width: Math.max(1, geo.width - 4),
+        align: cell.align || 'left'
+      };
+      // Only ever impose an explicit height (and thus risk PDFKit's silent
+      // drop-the-remainder behaviour) on the rare, already-logged path where
+      // a full fresh page genuinely would not have been enough — otherwise
+      // let the text flow to the height it was just measured to need.
+      if (overflows) {
+        textOptions.height = Math.max(1, availableHeight);
+        textOptions.ellipsis = true;
+      }
+
+      doc.font(cell.bold ? 'bold' : 'body').fontSize(7).fillColor('#000')
+        .text(cell.text, geo.x + 2, rowTop + 2, textOptions);
+    }
+
+    doc.y = rowTop + rowHeight;
   }
   doc.moveDown(0.5);
+}
+
+function warnTruncation(form, rowIndex, col) {
+  const label = form?.doc_number || form?.file_name || 'unknown form';
+  // eslint-disable-next-line no-console -- deliberate operator-facing warning, not debug noise
+  console.warn(
+    `[pdf-record] "${label}": grid row ${rowIndex}, column ${col} did not fit even a full ` +
+    'fresh page and was truncated with a visible ellipsis in the archival PDF.'
+  );
 }
 
 function drawCellBorders(doc, borders, x, y, w, h) {
