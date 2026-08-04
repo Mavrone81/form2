@@ -34,5 +34,26 @@ export const api = {
   queue: () => call('GET', '/api/submissions'),
   submission: (id) => call('GET', `/api/submissions/${id}`),
   save: (id, values) => call('PATCH', `/api/submissions/${id}`, { values }),
-  sign: (id, signaturePng) => call('POST', `/api/submissions/${id}/sign`, { signaturePng })
+  sign: (id, signaturePng) => call('POST', `/api/submissions/${id}/sign`, { signaturePng }),
+
+  // ---- admin (Task 15) ----
+  adminSettings: () => call('GET', '/api/admin/settings'),
+  updateFormsFolder: (formsFolder) => call('PUT', '/api/admin/settings', { formsFolder }),
+  rescan: () => call('POST', '/api/admin/rescan'),
+  // GET /api/admin/users only ever selects id/username/full_name/role/active
+  // (server/routes.js) — there is no sensitive credential column to strip
+  // here, unlike createUser's raw insert result.
+  users: () => call('GET', '/api/admin/users'),
+  createUser: (username, password, fullName, role) =>
+    call('POST', '/api/admin/users', { username, password, fullName, role }),
+  updateUser: (id, patch) => call('PATCH', `/api/admin/users/${id}`, patch),
+  // Reuses the existing /forms/:id/fields read path (built for the
+  // technician's field panel) to seed the mapper with whatever admin-authored
+  // fields already exist for this form, if any.
+  formFields: (id) => call('GET', `/api/forms/${id}/fields?frequency=`),
+  saveFormFields: (formId, fields) => call('PUT', `/api/admin/forms/${formId}/fields`, { fields }),
+  // Not a JSON endpoint — the raw file is loaded directly as an <iframe src>,
+  // so this is just a URL builder, not a fetch() wrapper like the rest of
+  // this module.
+  formFileUrl: (id) => `/api/forms/${id}/file`
 };

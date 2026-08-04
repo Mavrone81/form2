@@ -195,6 +195,53 @@ a{color:var(--ink)}
 .chain div.done{color:var(--ok)}
 .chain b{display:block;font-size:10px;margin-top:3px}
 
+/* ---------- Admin screens (Task 15) ---------- */
+
+/* Generic monospace "code" utility: usernames, document numbers/revisions
+   and field keys are codes, same mono face used everywhere else in the
+   app, without a one-off class per admin table column. */
+.code{font-family:var(--mono)}
+
+/* Generic state chip, generalised from the identical #control-strip .state
+   / .queue-row .state rule so admin.js can label a form's catalog state
+   (ready / needs_setup / inactive) or a user's active flag with the same
+   red/unapproved · green/approved chip language, never a new colour.
+   `ready` and `active` share the green accent with `approved`; `needs_setup`
+   keeps the default red — it is exactly the same "needs attention" state as
+   an unapproved record. `inactive` is neither good nor bad: a plain,
+   readable neutral badge, never a faded one. */
+.state{display:inline-block;font:500 9.5px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+  color:#fff;background:var(--stamp);padding:5px 9px;white-space:nowrap}
+.state[data-state="approved"],.state[data-state="ready"],.state[data-state="active"]{background:var(--ok)}
+.state[data-state="inactive"]{background:var(--soft);color:var(--ink);border:1px solid var(--rule)}
+
+/* Inactive users / deactivated forms: tint the row background, never fade
+   the text — the same rule already applied to out-of-scope task rows
+   (.row-out): de-emphasise by background tint, keep full reading contrast
+   on every value. */
+.row-tint td{background:var(--tint);color:var(--tint-ink)}
+
+/* Editable cell inside an admin listing table (e.g. a field-mapper row's
+   label/section/kind, or a user row's full name/role): the same quiet
+   "this is fillable" treatment as .sheet td.status-cell, generalised to
+   accept a <select> as well as an <input> since these tables also need
+   dropdowns, not just free text. */
+.sheet td.edit-cell{padding:0}
+.sheet td.edit-cell input,.sheet td.edit-cell select{width:100%;border:0;background:var(--soft);color:var(--ink);
+  padding:6px 9px;font:inherit;font-size:12px}
+.sheet td.edit-cell input:focus-visible,.sheet td.edit-cell select:focus-visible{outline:2px solid var(--ink);
+  outline-offset:-2px;background:var(--paper);color:var(--ink)}
+
+/* Compact action buttons inside a table cell (reorder / remove a field row) —
+   distinct from .act button (a single full-width primary action), since
+   several of these sit side by side in one narrow cell. */
+.sheet td.actions{width:1%;white-space:nowrap}
+.sheet td.actions button{border:1px solid var(--rule);background:var(--paper);color:var(--ink);
+  font:600 11px/1 var(--mono);padding:6px 8px;margin-right:4px;cursor:pointer}
+.sheet td.actions button:last-child{margin-right:0}
+.sheet td.actions button:hover{border-color:var(--ink)}
+.sheet td.actions button:disabled{color:var(--mute);cursor:not-allowed}
+
 /* ---------- Responsive: single column under 900px ---------- */
 @media (max-width:900px){
   .split{grid-template-columns:1fr}

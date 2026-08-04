@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin — Preventive maintenance records</title>
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <form id="login" hidden>
+    <h1>Admin</h1>
+    <label for="u">Username</label><input id="u" name="username" autocomplete="username" required>
+    <label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+    <p id="login-error" role="alert"></p>
+  </form>
+
+  <div id="app" hidden>
+    <div id="control-strip"></div>
+    <nav id="admin-nav" aria-label="Admin sections"></nav>
+    <main id="admin-main"></main>
+  </div>
+
+  <script type="module" src="/js/admin.js"></script>
+</body>
+</html>
