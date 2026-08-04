@@ -38,6 +38,14 @@ a{color:var(--ink)}
   background:var(--paper);border:1px solid var(--rule);
   display:flex;flex-direction:column;
 }
+/* app.js toggles this panel via the `hidden` attribute after a successful
+   login. The unconditional `display:flex` above has higher specificity
+   (#login) than the UA stylesheet's `[hidden]{display:none}` (a bare
+   attribute selector), so without this rule the login panel never actually
+   disappears — it stays on screen, stacked above the app, even once signed
+   in. `#login[hidden]` combines the same ID with an attribute selector, so
+   it outranks the plain `#login` rule and wins regardless of source order. */
+#login[hidden]{display:none}
 #login h1{font-size:16px;font-weight:600;margin:0 0 18px;letter-spacing:-.01em}
 #login label{display:block;font-size:11.5px;color:var(--mute);margin:12px 0 4px}
 #login input{width:100%;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
@@ -121,6 +129,26 @@ a{color:var(--ink)}
 .segs button[aria-pressed="true"]{background:var(--ink);color:#fff}
 .segs button:disabled{color:var(--mute);cursor:not-allowed}
 
+/* Read-only value for a locked stage: plain text, never a disabled input —
+   a disabled input's value is hard to read. */
+.fld-readonly{margin:0;padding:8px 10px;border:1px solid var(--rule);background:var(--soft);
+  color:var(--ink);font-size:13px;min-height:1.4em}
+
+/* Advisory, non-blocking notices (e.g. the "N of M tasks have no status"
+   completeness warning, or a save failure). Quiet by design: a tinted box,
+   not the red stamp accent, since this must never read as a hard error that
+   blocks the technician. */
+.notice{margin:0;padding:9px 11px;border:1px solid var(--rule);background:var(--tint);
+  color:var(--tint-ink);font-size:12px}
+.notice:empty{display:none}
+
+/* Form / queue picker: full-width buttons choosing a form to start, or an
+   existing record to resume from the queue. */
+.form-pick{display:block;width:100%;text-align:left;border:1px solid var(--rule);background:var(--paper);
+  color:var(--ink);padding:11px 13px;margin-bottom:8px;font:inherit;font-size:12.5px;cursor:pointer}
+.form-pick:last-child{margin-bottom:0}
+.form-pick:hover{border-color:var(--ink)}
+
 /* ---------- Signature block ---------- */
 .sig{border:1px solid var(--rule);background:var(--paper)}
 .sig canvas{display:block;width:100%;height:112px;touch-action:none;cursor:crosshair}
@@ -128,6 +156,11 @@ a{color:var(--ink)}
   padding:6px 10px;font:500 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--mute)}
 .sig .bar button{border:0;background:none;font:inherit;color:var(--stamp);cursor:pointer;
   text-transform:uppercase;letter-spacing:.08em}
+
+/* A completed signature, rendered as a plain image plus signer/timestamp
+   text — never a disabled input pretending to hold a drawing. */
+.sig-done{display:block;max-width:100%;height:auto;border:1px solid var(--rule);background:var(--paper)}
+.sig-meta{margin:6px 0 0;font-size:11.5px;color:var(--mute)}
 
 /* ---------- Sign-and-submit action ---------- */
 .act{padding:18px 22px}
