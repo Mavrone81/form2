@@ -246,10 +246,63 @@ export function makeRoutes(db) {
     const formId = Number(req.params.id);
     const fields = req.body?.fields ?? [];
     const tx = db.transaction(() => {
-      db.prepare('delete from form_fields where form_id=? and source=?').run(formId, 'admin');
-      const ins = db.prepare(`insert or replace into form_fields
-        (form_id, field_key, label, section, kind, sort_order, source) values (?,?,?,?,?,?,'admin')`);
-      fields.forEach((f, i) => ins.run(formId, f.field_key, f.label, f.section ?? '', f.kind ?? 'text', i));
+      // The mapper client sends the WHOLE field list back on every save,
+      // including parsed rows it only displayed and never touched. A field
+      // must become source='admin' only when an admin actually authored or
+      // changed it — otherwise every save silently adopts every parsed
+      // field, and scanner.js's (correct, deliberate) admin-skip logic then
+      // refuses to ever regenerate them again, freezing the form's task
+      // list even after the underlying document is revised and rescanned.
+      const existingByKey = new Map(
+        db.prepare('select field_key, label, section, kind, source from form_fields where form_id=?')
+          .all(formId)
+          .map((row) => [row.field_key, row])
+      );
+
+      // Only drop admin-owned rows the admin actually removed from this
+      // payload. Parsed rows are never deleted here — they are either
+      // reinserted (unchanged or overridden) below, or, if genuinely absent
+      // from the payload, simply left alone. This is deliberately narrower
+      // than "delete admin rows, then re-insert everything as admin": that
+      // shape is what let an unedited parsed field get silently reinserted
+      // over its own row with a hardcoded source='admin' the first time an
+      // admin merely opened and saved a form.
+      const incomingKeys = new Set(fields.map((f) => f.field_key));
+      const del = db.prepare('delete from form_fields where form_id=? and field_key=? and source=?');
+      for (const row of existingByKey.values()) {
+        if (row.source === 'admin' && !incomingKeys.has(row.field_key)) del.run(formId, row.field_key, 'admin');
+      }
+
+      // Upsert by (form_id, field_key) rather than "insert or replace":
+      // that unique index means a plain replace can clobber a row across
+      // sources by rowid, which is exactly the data-loss shape the
+      // delete-then-insert split was originally introduced to avoid.
+      const ins = db.prepare(`insert into form_fields
+        (form_id, field_key, label, section, kind, sort_order, source) values (?,?,?,?,?,?,?)
+        on conflict(form_id, field_key) do update set
+          label=excluded.label, section=excluded.section, kind=excluded.kind,
+          sort_order=excluded.sort_order, source=excluded.source`);
+
+      fields.forEach((f, i) => {
+        const label = f.label;
+        const section = f.section ?? '';
+        const kind = f.kind ?? 'text';
+        const prior = existingByKey.get(f.field_key);
+        let source;
+        if (!prior) {
+          source = 'admin'; // new field: admin-authored
+        } else if (prior.source === 'admin') {
+          source = 'admin'; // already admin-owned: stays admin-owned
+        } else {
+          // prior.source === 'parsed': only an actual content change (not
+          // sort_order — reordering must never freeze a field) makes this
+          // an admin override.
+          const unchanged = prior.label === label && prior.section === section && prior.kind === kind;
+          source = unchanged ? 'parsed' : 'admin';
+        }
+        ins.run(formId, f.field_key, label, section, kind, i, source);
+      });
+
       if (fields.length) db.prepare("update form_catalog set state='ready' where id=?").run(formId);
     });
     tx();
