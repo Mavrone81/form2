@@ -2,7 +2,7 @@ services:
   app:
     build: .
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-30000}:3000"
     environment:
       PORT: 3000
       DB_PATH: /data/pm.sqlite

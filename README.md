@@ -60,7 +60,7 @@ Check health and sign-out state:
 
 ```bash
 docker compose ps                 # expect "healthy"
-curl -fsS localhost:3000/api/me   # -> null (signed out)
+curl -fsS localhost:30000/api/me   # -> null (signed out)
 ```
 
 Stop with `docker compose down` (add `-v` to also drop the database volume).

@@ -4,7 +4,7 @@ import { resolveConfig } from '../server/config.js';
 
 test('defaults suit local development', () => {
   const c = resolveConfig({});
-  assert.equal(c.port, 3000);
+  assert.equal(c.port, 30000);
   assert.equal(c.dbPath, 'data/pm.sqlite');
   assert.equal(c.formsDir, '');
   assert.ok(c.sessionSecret.length >= 32, 'a secret is generated when unset');

@@ -7,7 +7,7 @@ export function resolveConfig(env = process.env) {
   if (secret && secret.length < MIN_SECRET)
     throw new Error(`SESSION_SECRET must be at least ${MIN_SECRET} characters.`);
   return {
-    port: Number(env.PORT ?? 3000),
+    port: Number(env.PORT ?? 30000),
     dbPath: env.DB_PATH ?? 'data/pm.sqlite',
     formsDir: env.FORMS_DIR ?? '',
     // Unset means a fresh secret each boot: sessions do not survive a restart,
