@@ -32,3 +32,6 @@ test/fixtures.local.json
 
 # Completed/signed PM records (the expected output format). Sensitive.
 PM Document 2026/
+
+# Host-specific compose override; only the .example is committed
+compose.override.yaml
