@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log*
+.git
+.gitignore
+.superpowers
+data
+docs
+test
+scripts
+*.xlsx
+*.xls
+*.pdf
+Sample of Forms
+PM Document 2026
+.env
+.DS_Store

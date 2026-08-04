@@ -22,6 +22,49 @@ form files are present locally and `scripts/build-fixtures.js` has been run
 to generate `test/fixtures.local.json`. See the CI section below for what
 that means for automated runs.
 
+## Deployment (Docker Compose)
+
+```bash
+cp .env.example .env
+# edit .env:
+#   FORMS_HOST_DIR=/absolute/path/to/your/forms   (mounted read-only)
+#   SESSION_SECRET=$(openssl rand -hex 32)        (required, >= 32 chars)
+docker compose build
+docker compose up -d
+```
+
+`compose.yaml` refuses to start without `SESSION_SECRET` and `FORMS_HOST_DIR`
+set in `.env` — Compose fails fast with a clear message rather than the
+container silently misbehaving. `server/config.js` enforces the same rule
+inside the app: a `SESSION_SECRET` shorter than 32 characters throws at boot,
+because a weak or absent secret lets sessions be forged or lets a restart
+silently invalidate everyone's login.
+
+Two volumes back the container:
+
+- `${FORMS_HOST_DIR}:/forms:ro` — the forms folder, mounted **read-only**.
+  The app must never modify a source form; the `:ro` flag makes that
+  structural rather than a convention the code is trusted to honour.
+- `pm-data:/data` — a named volume holding the SQLite database, so it
+  survives container restarts and rebuilds.
+
+On first boot, if `FORMS_DIR` is set and no forms folder has been configured
+yet, the server points itself at `/forms` and runs an initial scan
+automatically — a fresh container comes up already catalogued. Once an
+admin sets (or changes) the folder from the UI, that choice is the source of
+truth and boot no longer overrides it. If the initial scan fails (e.g. the
+mount is empty or misconfigured), the server still starts — an admin needs
+the app running to fix the path from the settings page.
+
+Check health and sign-out state:
+
+```bash
+docker compose ps                 # expect "healthy"
+curl -fsS localhost:3000/api/me   # -> null (signed out)
+```
+
+Stop with `docker compose down` (add `-v` to also drop the database volume).
+
 ## CI
 
 GitHub Actions runs on every push and pull request (`.github/workflows/ci.yml`):

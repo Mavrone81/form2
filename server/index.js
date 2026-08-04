@@ -1,16 +1,17 @@
 import express from 'express';
 import session from 'express-session';
-import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openDb } from './db.js';
 import { seedDemoUsers } from './seed.js';
 import { makeRoutes } from './routes.js';
+import { resolveConfig } from './config.js';
+import { scanFolder } from './scanner.js';
 
-export function createApp({ db }) {
+export function createApp({ db, sessionSecret }) {
   const app = express();
   app.use(express.json({ limit: '4mb' })); // signature PNGs
   app.use(session({
-    secret: process.env.SESSION_SECRET ?? randomBytes(32).toString('hex'),
+    secret: sessionSecret ?? resolveConfig({}).sessionSecret,
     resave: false,
     saveUninitialized: false,
     cookie: { httpOnly: true, sameSite: 'lax' }
@@ -35,8 +36,29 @@ export function createApp({ db }) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const db = openDb();
+  const config = resolveConfig();
+  const db = openDb(config.dbPath);
   seedDemoUsers(db);
-  const port = Number(process.env.PORT ?? 3000);
-  createApp({ db }).listen(port, () => console.log(`PM forms running at http://localhost:${port}`));
+
+  // A container comes up already pointing at its mounted /forms — but only
+  // the first time. Once an admin has set (or cleared) the folder through the
+  // UI, that choice is the source of truth and boot must not override it.
+  if (config.formsDir) {
+    const current = db.prepare("select value from settings where key='forms_folder'").get()?.value ?? '';
+    if (!current) {
+      db.prepare(`insert into settings (key,value) values ('forms_folder',?)
+        on conflict(key) do update set value=excluded.value`).run(config.formsDir);
+      try {
+        const result = await scanFolder(db, config.formsDir);
+        console.log(`Initial scan of ${config.formsDir}: added ${result.added}, updated ${result.updated}, deactivated ${result.deactivated}, failed ${result.failed}`);
+      } catch (err) {
+        // The admin can fix the path from the UI once logged in — a broken
+        // FORMS_DIR at boot must never prevent the server from starting.
+        console.error(`Could not scan FORMS_DIR (${config.formsDir}) at boot — server is starting anyway:`, err);
+      }
+    }
+  }
+
+  createApp({ db, sessionSecret: config.sessionSecret })
+    .listen(config.port, () => console.log(`PM forms running at http://localhost:${config.port}`));
 }

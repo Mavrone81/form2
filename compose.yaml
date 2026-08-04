@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      DB_PATH: /data/pm.sqlite
+      FORMS_DIR: /forms
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env — see .env.example}
+    volumes:
+      # Forms are mounted READ-ONLY. The app must never modify a source form,
+      # and :ro makes that structural rather than a convention.
+      - ${FORMS_HOST_DIR:?set FORMS_HOST_DIR in .env}:/forms:ro
+      - pm-data:/data
+    restart: unless-stopped
+
+volumes:
+  pm-data:
