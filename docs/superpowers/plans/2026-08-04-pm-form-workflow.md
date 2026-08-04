@@ -12,7 +12,7 @@
 
 - Node >= 20. Declare `"engines": {"node": ">=20"}` and `"type": "module"` in `package.json`.
 - Exactly four runtime dependencies: `express`, `express-session`, `better-sqlite3`, `exceljs`. Do not add others. PDFs are rendered by the browser; no PDF library.
-- Tests use the built-in `node:test` runner and `node:assert/strict`. No test framework dependency.
+- Tests use the built-in `node:test` runner and `node:assert/strict`. No test framework dependency. The test script is `node --test` with **no path argument** — Node 22 discovers `*.test.js` recursively and excludes `node_modules`. Do not use `node --test test/` (errors on Node 22) or `node --test test/*.test.js` (a shell glob that silently skips `test/helpers/`).
 - Source form files are **read-only**. Never write to, move, or rename anything in the forms folder.
 - Never commit form files or anything derived from their content. `.gitignore` already covers `*.xlsx`, `*.xls`, `*.pdf`, `Sample of Forms/`, `docs/design/`.
 - Interval order is `1M < 3M < 6M < Y` and scope is **cumulative**: selecting an interval includes every shorter one.
@@ -65,7 +65,7 @@ Expected: FAIL — no `package.json` / cannot find module.
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dependencies": {
     "better-sqlite3": "^11.5.0",
