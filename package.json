@@ -6,7 +6,8 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "check:sensitive": "bash scripts/check-no-sensitive-files.sh"
   },
   "dependencies": {
     "better-sqlite3": "^11.5.0",

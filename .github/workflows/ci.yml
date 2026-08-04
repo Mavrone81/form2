@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Guard against committed form content
+        run: npm run check:sensitive
+      - name: Run tests
+        run: npm test 2>&1 | tee test-output.txt
+      - name: Report skipped tests
+        # The source forms are sensitive and absent from CI, so the tests that
+        # parse them skip. A green run therefore covers less than a local run.
+        # Surface that rather than letting the tick imply full coverage.
+        if: always()
+        run: |
+          skipped=$(grep -E '^# skipped' test-output.txt | awk '{print $3}')
+          echo "### Test summary" >> $GITHUB_STEP_SUMMARY
+          grep -E '^# (tests|pass|fail|skipped)' test-output.txt >> $GITHUB_STEP_SUMMARY
+          if [ "${skipped:-0}" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**$skipped test(s) skipped** — the sample form files are not in this repository, so form-parsing tests cannot run here. Run \`npm test\` locally with the forms present for full coverage." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t pm-forms:ci .
+      - name: Container starts and answers
+        run: |
+          docker run -d --name pm -e SESSION_SECRET=$(openssl rand -hex 32) -p 3000:3000 pm-forms:ci
+          for i in $(seq 1 30); do
+            curl -fsS localhost:3000/api/me && break || sleep 1
+          done
+          curl -fsS localhost:3000/api/me
+          docker rm -f pm
