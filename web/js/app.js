@@ -63,9 +63,15 @@ function emptyNotice(text) {
 // way for a team leader or engineer to reach the record waiting for their
 // signature, even though the brief's own hand-verification steps (2 and 3)
 // require exactly that ("the record appears in the queue"). This picker
-// branches on role: technicians choose a form to start a fresh draft;
-// everyone else browses GET /api/submissions (their real queue) and opens
-// an EXISTING record by id, never creating a new one.
+// branches on role: everyone browses GET /api/submissions (their real
+// queue) and opens an EXISTING record by id, never creating a new one from
+// it; technicians ADDITIONALLY get a "Choose a form" section below their
+// queue, since they are the only role that ever starts a fresh draft. A
+// technician who starts a draft and closes the browser must be able to get
+// back to it — GET /api/submissions already returns exactly their own
+// records in any state (server/workflow.js queueFor) — so their queue is
+// shown FIRST, above the new-draft picker, since a returning technician is
+// most likely here to resume something, not start over.
 async function showPicker() {
   teardownFieldPanel();
   formId = null; submission = null; frequency = '';
@@ -78,6 +84,9 @@ async function showPicker() {
   const formsById = new Map(forms.map((f) => [f.id, f]));
 
   if (user.role === 'technician') {
+    const queue = await api.queue();
+    right.append(queueSection('Your records', queue, formsById, 'You have no records yet.'));
+
     const sec = section('Choose a form');
     if (!forms.length) sec.append(emptyNotice('No forms are set up yet. Ask an admin to add one.'));
     for (const f of forms) {
@@ -90,20 +99,55 @@ async function showPicker() {
     }
     right.append(sec);
   } else {
+    // Team leaders, engineers and admins never create records — only the
+    // queue is shown for them.
     const queue = await api.queue();
-    const sec = section(user.role === 'admin' ? 'All records' : 'Records awaiting you');
-    if (!queue.length) sec.append(emptyNotice('Nothing waiting.'));
-    for (const s of queue) {
-      const f = formsById.get(s.form_id);
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'form-pick';
-      b.textContent = `${f ? (f.title || f.file_name) : `Form #${s.form_id}`} — ${s.frequency || '—'} — ${s.state.replace('_', ' ')}`;
-      b.addEventListener('click', () => openExisting(s));
-      sec.append(b);
-    }
-    right.append(sec);
+    const title = user.role === 'admin' ? 'All records' : 'Records awaiting you';
+    right.append(queueSection(title, queue, formsById, 'Nothing waiting.'));
   }
+}
+
+// A single queue row lays out the record's identity as distinct elements —
+// title, document number/revision and interval code in monospace (they are
+// codes), machine ID, and a state chip using the same red/unapproved ·
+// green/approved rule as the control strip's chip (`.state[data-state]` in
+// app.css) — rather than one concatenated string. See openExisting() for
+// what a click does.
+function queueSection(title, queue, formsById, emptyText) {
+  const sec = section(title);
+  if (!queue.length) sec.append(emptyNotice(emptyText));
+  for (const s of queue) {
+    const f = formsById.get(s.form_id);
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'form-pick queue-row';
+
+    const titleEl = document.createElement('span');
+    titleEl.className = 'queue-title';
+    titleEl.textContent = f ? (f.title || f.file_name) : `Form #${s.form_id}`;
+
+    const docEl = document.createElement('span');
+    docEl.className = 'queue-doc';
+    docEl.textContent = `${f?.doc_number || '—'} · Rev ${f?.revision || '—'}`;
+
+    const machineEl = document.createElement('span');
+    machineEl.className = 'queue-machine';
+    machineEl.textContent = s.machine_id || '—';
+
+    const freqEl = document.createElement('span');
+    freqEl.className = 'queue-freq';
+    freqEl.textContent = s.frequency || '—';
+
+    const stateEl = document.createElement('span');
+    stateEl.className = 'state';
+    stateEl.dataset.state = s.state;
+    stateEl.textContent = s.state.replace('_', ' ');
+
+    b.append(titleEl, docEl, machineEl, freqEl, stateEl);
+    b.addEventListener('click', () => openExisting(s));
+    sec.append(b);
+  }
+  return sec;
 }
 
 async function startNew(pickedFormId) {

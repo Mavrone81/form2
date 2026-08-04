@@ -149,6 +149,23 @@ a{color:var(--ink)}
 .form-pick:last-child{margin-bottom:0}
 .form-pick:hover{border-color:var(--ink)}
 
+/* Queue row: a record listed by api.queue(), laid out as distinct fields —
+   never one concatenated string — reusing the same tokens as the rest of
+   the sheet. `.form-pick`'s block/border/padding still applies; this only
+   turns its single line of text into a grid of fields. Codes (document
+   number/revision, interval) are set in var(--mono), matching the control
+   strip and interval band elsewhere. The state chip reuses the exact
+   red/unapproved · green/approved rule as #control-strip .state. */
+.queue-row{display:grid;grid-template-columns:1fr auto auto auto auto;align-items:center;gap:16px}
+.queue-row .queue-title{font-size:12.5px;color:var(--ink)}
+.queue-row .queue-doc{font:500 11px/1 var(--mono);letter-spacing:.02em;color:var(--mute);white-space:nowrap}
+.queue-row .queue-machine{font-size:11.5px;color:var(--mute);white-space:nowrap}
+.queue-row .queue-freq{font:600 11px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;
+  color:var(--ink);white-space:nowrap}
+.queue-row .state{font:500 9.5px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+  color:#fff;background:var(--stamp);padding:5px 9px;white-space:nowrap}
+.queue-row .state[data-state="approved"]{background:var(--ok)}
+
 /* ---------- Signature block ---------- */
 .sig{border:1px solid var(--rule);background:var(--paper)}
 .sig canvas{display:block;width:100%;height:112px;touch-action:none;cursor:crosshair}

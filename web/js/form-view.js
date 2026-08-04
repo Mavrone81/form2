@@ -27,8 +27,13 @@ export function renderForm(container, form, { grid, inScopeRows } = {}) {
   for (const row of grid.rows) {
     if (!row.cells.length) continue;
     const tr = document.createElement('tr');
-    // Only rows that are actually task rows can be out of scope.
-    if (inScope && inScope.size && row.isTask && !inScope.has(row.index)) tr.className = 'row-out';
+    // Only rows that are actually task rows can be out of scope. `inScope`
+    // is null only when no filter is applied at all (nothing dimmed); once a
+    // filter exists, even an EMPTY array is a real filter that puts every
+    // task row out of scope, so the guard must not also require `.size` —
+    // that would silently disable dimming for the very case (a frequency
+    // covering zero tasks) it exists to catch.
+    if (inScope && row.isTask && !inScope.has(row.index)) tr.className = 'row-out';
     for (const cell of row.cells) {
       const td = document.createElement('td');
       if (cell.span.cols > 1) td.colSpan = cell.span.cols;

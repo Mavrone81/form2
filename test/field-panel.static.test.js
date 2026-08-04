@@ -127,3 +127,54 @@ test('the fields API call site can request server-computed completeness (submiss
   assert.ok(apiSrc, 'expected web/js/api.js to exist');
   assert.match(apiSrc, /submissionId/, 'expected api.js fields() to be able to send submissionId');
 });
+
+// --- Static guards: empty-scope dimming and the technician's own queue ---
+
+test('static guard: form-view.js no longer conjoins the empty-scope guard with .size', () => {
+  // Regression guard for the bug where `inScope.size` in the dimming
+  // condition made an EMPTY (but real) scope array indistinguishable from
+  // no filter at all: `inScope.size` is 0/falsy for an empty array, so the
+  // whole `&&` chain short-circuited and no task row was ever dimmed for a
+  // frequency that covers zero tasks. The fix drops `.size` from the
+  // conjunction entirely — presence of a filter (`inScope` truthy, i.e. not
+  // null) is what must gate dimming, not its size.
+  const formViewSrc = sources.get('form-view.js');
+  assert.ok(formViewSrc, 'expected web/js/form-view.js to exist');
+  assert.doesNotMatch(
+    formViewSrc,
+    /inScope\s*&&\s*inScope\.size/,
+    'form-view.js must not conjoin inScope with inScope.size in the row-out guard'
+  );
+  assert.match(
+    formViewSrc,
+    /if\s*\(\s*inScope\s*&&\s*row\.isTask\s*&&\s*!inScope\.has\(row\.index\)\s*\)/,
+    'expected the row-out guard to depend only on whether a filter (inScope) exists, not its size'
+  );
+});
+
+test('static guard: a technician sees their own existing records via api.queue(), not just a form-to-start picker', () => {
+  // Regression guard for the bug where a technician who started a draft and
+  // closed the browser had no way back to it: the technician branch of
+  // showPicker() only ever listed forms to start a NEW draft. GET
+  // /api/submissions (api.queue()) already returns exactly the technician's
+  // own records in any state (server/workflow.js queueFor), so the
+  // technician branch must call api.queue() too.
+  const technicianBranch = /if\s*\(\s*user\.role\s*===\s*'technician'\s*\)\s*\{[\s\S]*?\n\s*\}\s*else/.exec(appSrc);
+  assert.ok(technicianBranch, "expected an `if (user.role === 'technician') { ... } else` branch in app.js");
+  assert.match(
+    technicianBranch[0],
+    /api\.queue\(\)/,
+    "expected the technician branch of showPicker() to call api.queue() so a technician can reach their own existing records"
+  );
+  // The "start a new draft" picker must remain technician-only: it must not
+  // appear in the else branch (team leader / engineer / admin), which opens
+  // existing records exclusively.
+  const afterElse = appSrc.slice(appSrc.indexOf(technicianBranch[0]) + technicianBranch[0].length);
+  const elseBranch = /^\s*\{[\s\S]*?\n\s*\}\s*\n\}/.exec(afterElse);
+  assert.ok(elseBranch, 'expected an else branch body following the technician branch');
+  assert.doesNotMatch(
+    elseBranch[0],
+    /startNew\(/,
+    'team leader / engineer / admin must never be offered the "start a new draft" picker'
+  );
+});
