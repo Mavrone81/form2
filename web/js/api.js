@@ -41,6 +41,11 @@ export const api = {
   // left the technician's stage).
   setFrequency: (id, frequency) => call('PATCH', `/api/submissions/${id}`, { frequency }),
   sign: (id, signaturePng) => call('POST', `/api/submissions/${id}/sign`, { signaturePng }),
+  // Send a record back to the technician for correction. The reason is
+  // mandatory and the server enforces that (400 with its own message) — the
+  // client checks first only so the technician is not sent a rejection with
+  // nothing to act on, never as the actual rule.
+  reject: (id, reason) => call('POST', `/api/submissions/${id}/reject`, { reason }),
 
   // ---- admin (Task 15) ----
   adminSettings: () => call('GET', '/api/admin/settings'),

@@ -1,10 +1,32 @@
 import { tasksInScope } from './intervals.js';
 
+// `rejected` is a technician stage, not a fourth step: a rejected record has
+// come back to whoever created it, is editable by them again exactly as a
+// draft is, and travels the SAME chain upward from there
+// (technician -> team leader -> engineer). Expressing it as a row in this
+// table rather than as special cases scattered through the module is what
+// makes every existing rule — stage ownership, editability, queue placement,
+// `approved` is terminal — apply to it automatically and identically.
 export const STAGES = [
   { state: 'draft', actor: 'technician', next: 'pending_lead' },
   { state: 'pending_lead', actor: 'team_leader', next: 'pending_engineer' },
-  { state: 'pending_engineer', actor: 'engineer', next: 'approved' }
+  { state: 'pending_engineer', actor: 'engineer', next: 'approved' },
+  { state: 'rejected', actor: 'technician', next: 'pending_lead' }
 ];
+
+// The states a reviewer may reject FROM. Deliberately derived from the two
+// review stages rather than written out again: a technician owns `draft` and
+// `rejected` and has nothing to reject, and `approved` is terminal.
+const REJECTABLE_STATES = new Set(
+  STAGES.filter((s) => s.actor !== 'technician').map((s) => s.state)
+);
+
+// Every state a technician may be sitting on and still edit. Used only where
+// a rule genuinely differs between "the technician holds this record" and
+// "which particular technician-held state it is in".
+const TECHNICIAN_STATES = new Set(
+  STAGES.filter((s) => s.actor === 'technician').map((s) => s.state)
+);
 
 const stageFor = (state) => STAGES.find((s) => s.state === state);
 
@@ -99,7 +121,12 @@ export function saveFields(db, submissionId, values, user) {
 export function setFrequency(db, submissionId, frequency, user) {
   assertCanEdit(db, submissionId, user);
   const sub = db.prepare('select state from submissions where id=?').get(submissionId);
-  if (sub.state !== 'draft') {
+  // A rejected record carries NO signatures — rejection clears them all — so
+  // the rule this message states is literally true of it: nothing has been
+  // signed, and nothing is being re-scoped behind a signer's back. A record
+  // sent back because the wrong interval was worked would otherwise be
+  // uncorrectable, which is the one thing the send-back exists to prevent.
+  if (!TECHNICIAN_STATES.has(sub.state)) {
     throw forbidden('The maintenance interval can no longer be changed — this record has been signed.');
   }
   db.prepare('update submissions set frequency=?, updated_at=? where id=?')
@@ -144,12 +171,87 @@ export function signAndAdvance(db, { submissionId, user, signaturePng }) {
   return tx();
 }
 
+// Send a record back to the technician for correction.
+//
+// Three decisions are encoded here, and each one is load-bearing:
+//
+// 1. A rejection ALWAYS returns the record to the technician, never one stage
+//    back. Both reviewers can reject; either way the record restarts at the
+//    bottom and climbs the same chain again. There is no "back to the team
+//    leader" state, because the work being corrected is the technician's.
+//
+// 2. It clears EVERY signature on the record. A signature is the record's
+//    claim that a named person saw exactly this content; the content is about
+//    to change, so every such claim would become false. When an engineer
+//    rejects, that means the team leader's signature goes too, not only the
+//    technician's — the team leader verified answers that are about to be
+//    rewritten.
+//
+// 3. The rejection itself is permanent. Clearing signatures must not erase
+//    what happened, so who rejected, from which stage, when and why are
+//    written to `rejections` (see server/db.js) before the ink is deleted,
+//    with a SERVER timestamp — a client clock must never decide a date on a
+//    quality record, exactly as with a signature.
+//
+// A missing reason is thrown WITHOUT the FORBIDDEN marker, so routes map it
+// to 400: the caller was entitled to act, their input was unusable. That is
+// the same distinction signAndAdvance already makes for a missing signature.
+export function rejectSubmission(db, { submissionId, user, reason }) {
+  const text = String(reason ?? '').trim();
+  if (!text) throw new Error('A reason is required to reject this record.');
+
+  const tx = db.transaction(() => {
+    // Re-read state inside the transaction, exactly as signAndAdvance does,
+    // so two reviewers acting at the same moment cannot both reject — the
+    // second finds the record already `rejected` (a technician stage) and is
+    // refused by the shared ownership rule below.
+    const sub = db.prepare('select * from submissions where id=?').get(submissionId);
+    if (!sub) throw notFound('Submission not found.');
+
+    // Reuse the one ownership rule rather than writing a parallel one: this
+    // is what makes `approved` terminal here for free, and refuses any role
+    // that does not own the record's current stage.
+    const stage = assertStageOwnership(sub, user, {
+      terminal: 'This record is approved and cannot be changed.',
+      role: 'Your role cannot reject this record at its current stage.',
+      owner: 'Your role cannot reject this record at its current stage.',
+      unknownState: (state) => `Unknown state: ${state}`
+    });
+
+    // Ownership alone is not enough: a technician legitimately owns `draft`
+    // and `rejected`, and has nothing to reject. Only a reviewer awaiting
+    // their own review may send a record back.
+    if (!REJECTABLE_STATES.has(sub.state)) {
+      throw forbidden('Only a reviewer can reject a record, and only while it is awaiting their review.');
+    }
+
+    const now = new Date().toISOString();
+    // History first, then the ink: within one transaction the order does not
+    // change the outcome, but written this way the code reads as what it
+    // guarantees — the record of the rejection outlives the signatures it
+    // invalidates.
+    db.prepare(`insert into rejections (submission_id, rejected_by, full_name, stage, reason, rejected_at)
+      values (?,?,?,?,?,?)`)
+      .run(submissionId, user.id, user.full_name ?? user.fullName ?? '', stage.actor, text, now);
+    db.prepare('delete from signatures where submission_id=?').run(submissionId);
+    db.prepare('update submissions set state=?, updated_at=? where id=?').run('rejected', now, submissionId);
+    return db.prepare('select * from submissions where id=?').get(submissionId);
+  });
+  return tx();
+}
+
 export function queueFor(db, user) {
   if (user.role === 'admin') return db.prepare('select * from submissions order by updated_at desc').all();
-  const stage = STAGES.find((s) => s.actor === user.role);
+  // A technician sees every record they created, in any state — including a
+  // `rejected` one, which is the only place it can be reached and is the
+  // whole point of sending it back to them.
   if (user.role === 'technician') {
     return db.prepare('select * from submissions where created_by=? order by updated_at desc').all(user.id);
   }
+  // A reviewer sees only records sitting in their own review state, so a
+  // record they just rejected leaves their queue immediately rather than
+  // lingering there awaiting an action they have already taken.
+  const stage = STAGES.find((s) => s.actor === user.role);
   return db.prepare('select * from submissions where state=? order by updated_at desc').all(stage.state);
 }
 

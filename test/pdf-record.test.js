@@ -195,3 +195,56 @@ test('a spanning cell near a page boundary does not overflow past the bottom mar
       `a border/line was drawn past the bottom margin (y > ${maxAllowedPathY}): ${overflowingPaths}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+// --- Rejection history on the archival record ----------------------------
+//
+// A rejection is part of what happened to the record. Clearing the
+// signatures removes the (now false) claim that someone approved this
+// content; it must not remove the fact that the record was sent back, by
+// whom, when and why. Text invented for this test, as everywhere else here.
+const REJECTIONS = [
+  { stage: 'team_leader', full_name: 'Bea Reviewer', rejected_at: '2026-08-02T11:15:00Z',
+    reason: 'Torque values were left blank on the third task and the interval looks wrong.' },
+  { stage: 'engineer', full_name: 'Cal Engineer', rejected_at: '2026-08-03T08:05:00Z',
+    reason: 'Grounding measurement is missing its unit.' }
+];
+
+test('a record with no rejections carries no rejection section', async () => {
+  const buf = await renderRecordPdf({ ...FIXTURE, rejections: [] });
+  assert.ok(!buf.toString('latin1').includes('REJECTION'), 'a clean record must not print an empty history block');
+});
+
+test('the rejection reason and the rejecter\'s name appear in the generated PDF',
+  { skip: hasPdftotext ? false : 'pdftotext not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const buf = await renderRecordPdf({ ...FIXTURE, rejections: REJECTIONS });
+  const dir = mkdtempSync(join(tmpdir(), 'pdfrej-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    writeFileSync(file, buf);
+    const normalized = execFileSync('pdftotext', [file, '-'], { encoding: 'utf8' }).replace(/\s+/g, ' ').trim();
+    for (const r of REJECTIONS) {
+      assert.ok(normalized.includes(r.reason), `reason missing from the archived record: "${r.reason}"`);
+      assert.ok(normalized.includes(r.full_name), `rejecter's name missing: "${r.full_name}"`);
+    }
+    assert.ok(/2026-08-02/.test(normalized), 'the rejection timestamp must be printed');
+    assert.ok(/Team Leader/i.test(normalized) && /Engineer/i.test(normalized),
+      'the stage each rejection came from must be printed');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a record carrying rejection history still passes veraPDF as PDF/A-2U',
+  { skip: hasVera ? false : 'veraPDF not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdfa-rej-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    writeFileSync(file, await renderRecordPdf({ ...FIXTURE, rejections: REJECTIONS }));
+    const out = execFileSync('verapdf', ['-f', '2u', '--format', 'text', file], { encoding: 'utf8' });
+    assert.match(out, /PASS/, `veraPDF reported: ${out}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

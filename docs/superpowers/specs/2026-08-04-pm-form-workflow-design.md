@@ -22,6 +22,8 @@ revised or removed without touching the code.
 - A technician can pick any ready form and see form-left / fields-right in one screen.
 - A submission moves Technician → Team Leader → Engineer, each signing before submit.
 - Each stage locks once signed; earlier stages are read-only to later stages.
+- Either reviewer can reject a record with a reason, sending it back to the technician with
+  every signature cleared and the rejection recorded permanently.
 - An admin can create and edit users and assign roles.
 
 ## Architecture
@@ -39,7 +41,7 @@ revised or removed without touching the code.
                               ├──▶ left pane   HTML grid (xlsx) | PDF viewer (pdf)
                               └──▶ right pane  field panel
 
-   SQLite: settings · form_catalog · form_fields · users · submissions · signatures
+   SQLite: settings · form_catalog · form_fields · users · submissions · signatures · rejections
 ```
 
 ### Components
@@ -178,6 +180,10 @@ and timestamp.
 
 ```
 draft ──▶ pending_lead ──▶ pending_engineer ──▶ approved
+             │                    │
+             └──────┬─────────────┘
+                    ▼
+                rejected ──▶ pending_lead ──▶ ...
 ```
 
 
@@ -185,7 +191,10 @@ draft ──▶ pending_lead ──▶ pending_engineer ──▶ approved
 |---|---|---|---|
 | draft | fill, sign, submit | technician (owner) | pending_lead |
 | pending_lead | review, sign, submit | team_leader | pending_engineer |
+| pending_lead | reject, with a reason | team_leader | rejected |
 | pending_engineer | review, sign, approve | engineer | approved |
+| pending_engineer | reject, with a reason | engineer | rejected |
+| rejected | correct, sign, resubmit | technician (owner) | pending_lead |
 
 Rules:
 
@@ -193,10 +202,41 @@ Rules:
   submissions in any state.
 - Signing is required before submitting at every stage.
 - On submit, that stage's fields and signature lock and become read-only to later stages.
-- `approved` is terminal — the record is fully read-only.
-- Rejection is **out of scope** for this version. A record needing correction is handled
-  outside the system. The state column is a string so `rejected` can be added later without
-  migration.
+- `approved` is terminal — the record is fully read-only, and can never be rejected.
+
+### Rejection (send back for correction)
+
+Both reviewers can send a record back. Three decisions define what that means, and each one
+is load-bearing rather than a convenience:
+
+**1. A rejected record always goes back to the technician, never one stage back.** Whether
+the team leader or the engineer rejects, the record restarts at the bottom and climbs the
+same chain again: technician → team leader → engineer. There is no "back to the team leader"
+state, because the work being corrected is the technician's; sending it to an intermediate
+reviewer would ask them to re-verify answers nobody had yet fixed.
+
+**2. Rejection clears the signatures of every stage that must redo its work — which, because
+the record returns to the technician, means all of them.** A signature is the record's claim
+that a named person saw *exactly this content*. The content is about to change, so every such
+claim would become false. When an engineer rejects, the team leader's signature goes too, not
+only the technician's: the team leader verified answers that are about to be rewritten. A
+signature must never stay attached to answers that changed after the person signed.
+
+**3. A reason is mandatory.** A rejection with no reason gives the technician nothing to act
+on. An empty or whitespace-only reason is refused as a bad *input* (400), deliberately
+distinct from a permission failure (403) — the same distinction the workflow already draws
+for a missing signature.
+
+The rejection itself is recorded permanently: who rejected, from which stage, when, and why.
+Clearing the signatures removes a claim that is no longer true; it must not erase the fact
+that the record was sent back. The timestamp is server-side, never client-supplied, for the
+same reason a signature's is. The history survives every subsequent action, appears on the
+archived PDF, and cannot be erased by deleting the rejecting user's account.
+
+`rejected` is modelled as a *technician stage*, not a fourth step in the chain: the record is
+editable by its creator again exactly as a draft is, is visible only in that technician's own
+queue (it leaves the reviewer's immediately), and resubmitting takes it to `pending_lead`.
+Because the state column carries no check constraint, adding it needed no migration.
 
 ## Roles
 
@@ -239,7 +279,16 @@ submission_fields
 signatures
   id, submission_id, stage, user_id, full_name,
   image_png, signed_at                            -- stage ∈ technician|team_leader|engineer
+
+rejections
+  id, submission_id, rejected_by, full_name,
+  stage, reason, rejected_at                      -- stage ∈ team_leader|engineer
 ```
+
+`rejections` carries the same two audit protections as `signatures`: deleting a user who
+rejected is **refused** (no cascade), so history cannot be erased by removing an account, and
+`full_name` is denormalised at rejection time so a later rename cannot rewrite who sent the
+record back. Deleting the submission itself does cascade — the history belongs to the record.
 
 `submission_fields` is key/value rather than wide columns because the field set differs per
 form (sample task counts range from 4 to 18 rows). It stores `label` alongside the value so a
@@ -266,7 +315,9 @@ stored against the submission with the signer's account name and a **server-side
   stay usable rather than vanishing.
 - Source file deleted: marked `inactive`, hidden from technicians, existing submissions
   unaffected.
-- Submitting without a signature: rejected with a clear message, nothing persisted.
+- Submitting without a signature: refused with a clear message, nothing persisted.
+- Rejecting without a reason: refused as a 400 (a bad input, not a permission failure) —
+  state, signatures and rejection history all unchanged.
 - Acting on a submission not in your role's state: 403, state unchanged.
 - Two users acting on one submission at once: the transition checks current state inside the
   write, so the second action fails cleanly rather than double-advancing.
@@ -282,6 +333,12 @@ stored against the submission with the signer's account name and a **server-side
 - **Renderer model**: snapshot the grid for one representative form.
 - **Workflow**: each legal transition advances state; each illegal one is refused and leaves
   state untouched.
+- **Rejection**: a reviewer's rejection clears *every* signature (an engineer's clears the
+  team leader's too), records who/when/why with a server timestamp, and returns the record to
+  the technician, who can edit, re-sign and resubmit to `pending_lead`. An empty reason is a
+  400 that changes nothing; a technician rejecting, a reviewer rejecting out of turn, and
+  rejecting an approved record are all 403 with state untouched. Two reviewers rejecting at
+  once leaves exactly one rejection row. Deleting a rejecting user is refused.
 - **Cumulative interval scope**: selecting `Y` on form F01 puts 18 tasks in scope, not 1;
   selecting `3M` puts 14. Guards the compliance rule directly.
 - **Mapping immutability**: editing a form's mapping does not change an existing submission.
@@ -326,7 +383,6 @@ record, including rows this visit does not cover.
 
 ## Out of scope
 
-- Rejection / send-back flow
 - Export back to `.xlsx` (the app is the record; printing the approved view to PDF is the
   filed copy)
 - Positional field overlays on PDFs — the mapper defines a field *list*, not boxes drawn on

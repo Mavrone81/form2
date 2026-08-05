@@ -422,3 +422,125 @@ test('signing with the wrong role returns 403, matching PATCH\'s status for the 
 
   server.close();
 });
+
+// --- Reject / send-back over HTTP ----------------------------------------
+//
+// The workflow rules themselves are pinned in test/workflow.test.js; these
+// prove the ROUTE maps them onto the right status codes — a permission
+// failure is a 403 and a missing reason is a 400, never the other way round.
+
+async function bootWithDraft() {
+  const { db, server, call } = await boot();
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/f.xlsx','f.xlsx','xlsx','ready')`).run();
+  await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+  const sub = (await call('POST', '/api/submissions', { formId: 1, machineId: 'ED04', frequency: 'Y' })).body;
+  return { db, server, call, sub };
+}
+
+test('POST /api/submissions/:id/reject sends a pending_lead record back to the technician', async () => {
+  const { db, server, call, sub } = await bootWithDraft();
+  try {
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+    await call('POST', '/api/login', { username: 'lead', password: 'lead' });
+
+    const res = await call('POST', `/api/submissions/${sub.id}/reject`, { reason: 'Torque values missing.' });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.state, 'rejected');
+
+    assert.equal(db.prepare('select count(*) as c from signatures where submission_id=?').get(sub.id).c, 0);
+    const rejections = db.prepare('select * from rejections where submission_id=?').all(sub.id);
+    assert.equal(rejections.length, 1);
+    assert.equal(rejections[0].reason, 'Torque values missing.');
+
+    // The technician can see WHY: the reason, who rejected it and when are
+    // returned with the record, or the UI cannot show them.
+    await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+    const detail = (await call('GET', `/api/submissions/${sub.id}`)).body;
+    assert.equal(detail.submission.state, 'rejected');
+    assert.equal(detail.rejections.length, 1);
+    assert.equal(detail.rejections[0].reason, 'Torque values missing.');
+    assert.ok(detail.rejections[0].full_name);
+    assert.ok(detail.rejections[0].rejected_at);
+    assert.equal(detail.rejections[0].stage, 'team_leader');
+  } finally { server.close(); }
+});
+
+test('rejecting with an empty or whitespace-only reason is a 400 and changes nothing', async () => {
+  const { db, server, call, sub } = await bootWithDraft();
+  try {
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+    await call('POST', '/api/login', { username: 'lead', password: 'lead' });
+
+    for (const body of [{ reason: '' }, { reason: '   ' }, {}]) {
+      const res = await call('POST', `/api/submissions/${sub.id}/reject`, body);
+      assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(body)}, got ${res.status}`);
+      assert.match(res.body.error, /reason/i);
+      assert.ok(!/\bat\s+\S+\s*\(/.test(JSON.stringify(res.body)), 'no stack frames may reach the client');
+    }
+
+    assert.equal(db.prepare('select state from submissions where id=?').get(sub.id).state, 'pending_lead');
+    assert.equal(db.prepare('select count(*) as c from signatures where submission_id=?').get(sub.id).c, 1);
+    assert.equal(db.prepare('select count(*) as c from rejections where submission_id=?').get(sub.id).c, 0);
+  } finally { server.close(); }
+});
+
+test('a technician, and a reviewer whose stage it is not, are refused with 403', async () => {
+  const { db, server, call, sub } = await bootWithDraft();
+  try {
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+
+    // Still signed in as the technician who created it.
+    await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+    assert.equal((await call('POST', `/api/submissions/${sub.id}/reject`, { reason: 'x' })).status, 403);
+
+    // The engineer's stage has not arrived yet.
+    await call('POST', '/api/login', { username: 'eng', password: 'eng' });
+    assert.equal((await call('POST', `/api/submissions/${sub.id}/reject`, { reason: 'x' })).status, 403);
+
+    assert.equal(db.prepare('select state from submissions where id=?').get(sub.id).state, 'pending_lead');
+    assert.equal(db.prepare('select count(*) as c from rejections where submission_id=?').get(sub.id).c, 0);
+  } finally { server.close(); }
+});
+
+test('an approved record can never be rejected — 403, state unchanged', async () => {
+  const { db, server, call, sub } = await bootWithDraft();
+  try {
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+    await call('POST', '/api/login', { username: 'lead', password: 'lead' });
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+    await call('POST', '/api/login', { username: 'eng', password: 'eng' });
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+    assert.equal(db.prepare('select state from submissions where id=?').get(sub.id).state, 'approved');
+
+    assert.equal((await call('POST', `/api/submissions/${sub.id}/reject`, { reason: 'too late' })).status, 403);
+    await call('POST', '/api/login', { username: 'lead', password: 'lead' });
+    assert.equal((await call('POST', `/api/submissions/${sub.id}/reject`, { reason: 'too late' })).status, 403);
+
+    assert.equal(db.prepare('select state from submissions where id=?').get(sub.id).state, 'approved');
+    assert.equal(db.prepare('select count(*) as c from signatures where submission_id=?').get(sub.id).c, 3);
+    assert.equal(db.prepare('select count(*) as c from rejections where submission_id=?').get(sub.id).c, 0);
+  } finally { server.close(); }
+});
+
+test('an engineer rejecting clears the team leader signature, and the record walks the chain again', async () => {
+  const { db, server, call, sub } = await bootWithDraft();
+  try {
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+    await call('POST', '/api/login', { username: 'lead', password: 'lead' });
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+    assert.equal(db.prepare('select count(*) as c from signatures where submission_id=?').get(sub.id).c, 2);
+
+    await call('POST', '/api/login', { username: 'eng', password: 'eng' });
+    assert.equal((await call('POST', `/api/submissions/${sub.id}/reject`, { reason: 'Wrong interval.' })).status, 200);
+    assert.equal(db.prepare('select count(*) as c from signatures where submission_id=?').get(sub.id).c, 0,
+      'the team leader signed content that is about to change — their signature must be cleared too');
+
+    // The technician owns it again and can edit, re-sign and resubmit.
+    await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+    assert.equal((await call('PATCH', `/api/submissions/${sub.id}`, { values: { remarks: 'corrected' } })).status, 200);
+    const resigned = await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+    assert.equal(resigned.status, 200);
+    assert.equal(resigned.body.state, 'pending_lead');
+  } finally { server.close(); }
+});

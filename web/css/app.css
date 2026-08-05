@@ -328,6 +328,47 @@ a{color:var(--ink)}
 .act button:hover{background:var(--stamp);color:#fff}
 .act p{font-size:11.5px;color:var(--mute);margin:11px 0 0;text-align:center}
 
+/* ---------- Reject / send back ---------- */
+/* The reviewer's send-back control, sitting under Sign and submit in the same
+   `.act` bar. It uses the record's existing state accent (--stamp, the same
+   red that already marks every unapproved record) and introduces no new
+   colour: this IS the "this record is not approved" action. Sign and submit
+   stays the near-black primary; rejecting is the deliberate, secondary one,
+   which is why it is outlined rather than filled until hovered. */
+.reject{margin-top:14px;border-top:1px solid var(--rule);padding-top:14px}
+.reject label{display:block;font:600 9.5px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase;
+  color:var(--mute);margin-bottom:8px}
+/* Colour restated locally alongside the background, never inherited — a
+   control with a white background and no declared colour renders
+   white-on-white for a dark-mode viewer. font-size:16px on mobile matches
+   .fld input's iOS zoom-on-focus avoidance and is dropped at `sm`. */
+.reject textarea{width:100%;border:1px solid var(--rule);background:var(--paper);color:var(--ink);
+  padding:8px 10px;font:inherit;font-size:16px;border-radius:0;resize:vertical;min-height:76px}
+.reject button.reject-go{width:100%;margin-top:10px;border:1px solid var(--stamp);background:var(--paper);
+  color:var(--stamp);font:600 12px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  padding:15px;min-height:44px;cursor:pointer}
+.reject button.reject-go:hover{background:var(--stamp);color:#fff}
+
+/* The technician's side of the same event: WHY the record came back, above
+   the interval selector and every field, because a technician who cannot see
+   the reason cannot act on it. Same accent again — a left rule in --stamp,
+   the state colour the record already carries — and full reading contrast on
+   the reviewer's own words. The reason is never tinted, muted or truncated:
+   it is the single most actionable text on the screen. */
+.sec-rejected{border-left:3px solid var(--stamp)}
+.reject-note{margin-bottom:13px}
+.reject-note:last-child{margin-bottom:0}
+.reject-who{margin:0;font:600 11px/1.4 var(--mono);letter-spacing:.04em;text-transform:uppercase;
+  color:var(--stamp)}
+.reject-when{margin:3px 0 0;font:400 11px/1.4 var(--mono);letter-spacing:.02em;color:var(--mute)}
+.reject-why{margin:7px 0 0;font-size:13.5px;line-height:1.5;color:var(--ink)}
+
+/* A rejected record is unapproved, so it keeps the default red chip — the
+   same accent as `draft`, distinguished by its LABEL, not by a second
+   colour. Stated explicitly so a future edit to the green list above cannot
+   quietly adopt it. */
+.state[data-state="rejected"]{background:var(--stamp);color:#fff}
+
 /* ---------- Record PDF: preview / archive download (Task 18) ---------- */
 /* Neutral by default (a plain document-control action, like the back
    button); the archive-download link is the one place the record's
@@ -424,7 +465,7 @@ a{color:var(--ink)}
 /* sm (>=640px): plenty of room for a 13px input again — the 16px mobile
    size above exists solely to dodge iOS's zoom-on-focus below this width. */
 @media (min-width:640px){
-  #login input,.fld input,.fld textarea,.fld select{font-size:13px}
+  #login input,.fld input,.fld textarea,.fld select,.reject textarea{font-size:13px}
 }
 
 /* md (>=768px): still a single-column `.split` (see lg below) — a fixed

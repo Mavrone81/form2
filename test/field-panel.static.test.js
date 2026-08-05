@@ -178,3 +178,66 @@ test('static guard: a technician sees their own existing records via api.queue()
     'team leader / engineer / admin must never be offered the "start a new draft" picker'
   );
 });
+
+// --- Static guards: the reject / send-back controls -----------------------
+
+test('the reject path requires a reason before calling the reject API', () => {
+  // A rejection with no reason gives the technician nothing to act on. The
+  // server enforces this too (400), but the client must not fire a request it
+  // knows will fail, and — crucially — must SAY why rather than doing nothing
+  // at all: a button that silently no-ops reads as broken. This checks the
+  // ordering in source: read the reason -> guard on it -> only then call
+  // api.reject().
+  const guard = /if\s*\(\s*!\s*reason\.value\.trim\(\)\s*\)/.exec(appSrc);
+  assert.ok(guard, 'expected an "if (!reason.value.trim())" guard in app.js');
+  const rejectCallIdx = appSrc.indexOf('api.reject(');
+  assert.ok(rejectCallIdx >= 0, 'expected app.js to call api.reject(...)');
+  assert.ok(guard.index < rejectCallIdx, 'expected the empty-reason guard BEFORE the api.reject() call');
+  // Not a silent no-op: the guard branch must set a visible message.
+  const guardBranch = appSrc.slice(guard.index, rejectCallIdx);
+  assert.match(guardBranch, /msg\.textContent\s*=\s*['"][^'"]+['"]/,
+    'an empty reason must produce a clear message, never a silent no-op');
+});
+
+test('the reject control is offered only for the two reviewer stages', () => {
+  // Shown beside Sign and submit, and only when the record is actually
+  // awaiting this reviewer — addSubmitBar only reaches the control when
+  // canAct is true, and this narrows it further to the rejectable states. The
+  // server enforces the real rule; this only avoids offering an action that
+  // would 403.
+  assert.match(
+    appSrc,
+    /REJECTABLE_STATES\s*=\s*new Set\(\s*\[\s*'pending_lead'\s*,\s*'pending_engineer'\s*\]\s*\)/,
+    'expected app.js to name exactly the two states a reviewer may reject from'
+  );
+  assert.match(appSrc, /REJECTABLE_STATES\.has\(sub\.state\)/,
+    'expected the reject control to be gated on the record being in a reviewer stage');
+});
+
+test('a rejected record is a technician stage everywhere in the client, never a special case', () => {
+  // `rejected` must behave like `draft` for the technician who owns it:
+  // editable again, re-signable, and re-submittable. Mirrors
+  // server/workflow.js's STAGES table, where `rejected` is likewise a
+  // technician-actor row rather than a scattered set of exceptions.
+  assert.match(appSrc, /rejected:\s*'technician'/, 'expected `rejected` to map to the technician actor');
+  assert.doesNotMatch(
+    appSrc,
+    /state\s*===\s*'draft'\s*&&\s*canAct/,
+    'editability must be derived from the technician-held states, not hardcoded to draft alone'
+  );
+});
+
+test('the technician is shown WHY a rejected record came back — reason, who and when', () => {
+  // A technician who cannot see the reason cannot act on it. All three parts
+  // must be rendered, and via textContent (the no-innerHTML guard above
+  // already covers the whole directory).
+  assert.match(fieldPanelSrc, /r\.reason/, 'expected the rejection reason to be rendered');
+  assert.match(fieldPanelSrc, /r\.full_name/, 'expected the rejecter\'s name to be rendered');
+  assert.match(fieldPanelSrc, /r\.rejected_at/, 'expected the rejection timestamp to be rendered');
+  assert.match(fieldPanelSrc, /state\s*===\s*'rejected'/, 'expected the notice to be gated on the rejected state');
+  // ...and it must come before the fields it explains, not below them.
+  const noticeIdx = fieldPanelSrc.indexOf("state === 'rejected'");
+  const fieldsIdx = fieldPanelSrc.indexOf('for (const [name, fields] of groups)');
+  assert.ok(fieldsIdx >= 0, 'expected the field-group render loop');
+  assert.ok(noticeIdx < fieldsIdx, 'the rejection reason must render before the fields');
+});

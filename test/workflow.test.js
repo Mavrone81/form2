@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb } from '../server/db.js';
 import { createUser } from '../server/auth.js';
-import { createSubmission, signAndAdvance, queueFor, saveFields, assertCanEdit, completenessFor } from '../server/workflow.js';
+import { createSubmission, signAndAdvance, queueFor, saveFields, assertCanEdit, completenessFor, rejectSubmission } from '../server/workflow.js';
 
 const PNG = 'data:image/png;base64,iVBORw0KGgo=';
 
@@ -272,4 +272,205 @@ test('signAndAdvance does NOT mark a missing-signature failure as FORBIDDEN', ()
   } catch (err) {
     assert.notEqual(err.code, 'FORBIDDEN');
   }
+});
+
+// --- Reject / send-back ---------------------------------------------------
+//
+// A rejection always returns the record to the TECHNICIAN, never one stage
+// back, and clears EVERY signature — because every stage must redo its work
+// against whatever the technician changes next. A signature is the record's
+// claim that a named person saw exactly this content; leaving one attached
+// across an edit would make that claim false. The rejection itself is kept
+// forever in its own table, so clearing the ink never erases the history.
+
+const rejectionsOf = (db, id) =>
+  db.prepare('select * from rejections where submission_id=? order by id').all(id);
+const stateOf = (db, id) => db.prepare('select state from submissions where id=?').get(id).state;
+const signatureStages = (db, id) =>
+  db.prepare('select stage from signatures where submission_id=? order by stage').all(id).map((s) => s.stage);
+
+test('a team leader rejects a pending_lead record: state, signatures and the recorded rejection', () => {
+  const { db, users, sub } = setup();
+  signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+  assert.deepEqual(signatureStages(db, sub.id), ['technician']);
+
+  const before = Date.now();
+  const returned = rejectSubmission(db, {
+    submissionId: sub.id, user: users.lead, reason: 'Torque values missing on task 4.'
+  });
+
+  assert.equal(returned.state, 'rejected', 'the returned row must already carry the new state');
+  assert.equal(stateOf(db, sub.id), 'rejected');
+  assert.deepEqual(signatureStages(db, sub.id), [], 'every signature must be cleared');
+
+  const rows = rejectionsOf(db, sub.id);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].reason, 'Torque values missing on task 4.');
+  assert.equal(rows[0].rejected_by, users.lead.id);
+  assert.equal(rows[0].full_name, 'Lead', 'the name is denormalised so a later rename cannot rewrite history');
+  assert.equal(rows[0].stage, 'team_leader');
+  const at = new Date(rows[0].rejected_at).getTime();
+  assert.ok(at >= before - 1000 && at <= Date.now() + 1000, 'rejected_at must be a server clock timestamp');
+});
+
+test('an engineer rejecting clears the TEAM LEADER\'s signature too, not just the technician\'s', () => {
+  const { db, users, sub } = setup();
+  signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+  signAndAdvance(db, { submissionId: sub.id, user: users.lead, signaturePng: PNG });
+  assert.deepEqual(signatureStages(db, sub.id), ['team_leader', 'technician']);
+
+  rejectSubmission(db, { submissionId: sub.id, user: users.eng, reason: 'Wrong interval worked.' });
+
+  assert.equal(stateOf(db, sub.id), 'rejected');
+  assert.deepEqual(signatureStages(db, sub.id), [],
+    'the team leader signed content that is about to change, so their signature must go too');
+  assert.equal(rejectionsOf(db, sub.id)[0].stage, 'engineer');
+});
+
+test('a rejection with an empty or whitespace-only reason fails, and changes nothing', () => {
+  for (const reason of ['', '   ', '\t\n ', undefined, null]) {
+    const { db, users, sub } = setup();
+    signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+
+    let thrown;
+    try {
+      rejectSubmission(db, { submissionId: sub.id, user: users.lead, reason });
+      assert.fail(`expected a reason of ${JSON.stringify(reason)} to be refused`);
+    } catch (err) { thrown = err; }
+
+    // An input problem, not a permission problem — the route maps a
+    // non-FORBIDDEN throw to 400, exactly as a missing signature already does.
+    assert.notEqual(thrown.code, 'FORBIDDEN', 'a missing reason is a 400, not a 403');
+    assert.match(thrown.message, /reason/i);
+
+    assert.equal(stateOf(db, sub.id), 'pending_lead', 'state must be untouched');
+    assert.deepEqual(signatureStages(db, sub.id), ['technician'], 'signatures must be untouched');
+    assert.deepEqual(rejectionsOf(db, sub.id), [], 'no rejection may be recorded');
+  }
+});
+
+test('only the reviewer whose stage it currently is may reject', () => {
+  // A technician can never reject.
+  {
+    const { db, users, sub } = setup();
+    signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+    try {
+      rejectSubmission(db, { submissionId: sub.id, user: users.tech, reason: 'nope' });
+      assert.fail('a technician must not be able to reject');
+    } catch (err) { assert.equal(err.code, 'FORBIDDEN'); }
+    assert.equal(stateOf(db, sub.id), 'pending_lead');
+    assert.deepEqual(rejectionsOf(db, sub.id), []);
+  }
+
+  // A technician cannot reject their OWN draft either — reject is a
+  // reviewer's action, and `draft`/`rejected` are the technician's own stages.
+  {
+    const { db, users, sub } = setup();
+    try {
+      rejectSubmission(db, { submissionId: sub.id, user: users.tech, reason: 'nope' });
+      assert.fail('a technician must not be able to reject their own draft');
+    } catch (err) { assert.equal(err.code, 'FORBIDDEN'); }
+    assert.equal(stateOf(db, sub.id), 'draft');
+  }
+
+  // An engineer cannot reject a record still awaiting the team leader.
+  {
+    const { db, users, sub } = setup();
+    signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+    try {
+      rejectSubmission(db, { submissionId: sub.id, user: users.eng, reason: 'too early' });
+      assert.fail('an engineer must not be able to reject a pending_lead record');
+    } catch (err) { assert.equal(err.code, 'FORBIDDEN'); }
+    assert.equal(stateOf(db, sub.id), 'pending_lead');
+    assert.deepEqual(signatureStages(db, sub.id), ['technician']);
+    assert.deepEqual(rejectionsOf(db, sub.id), []);
+  }
+
+  // `approved` is terminal: nobody can reject it, ever.
+  {
+    const { db, users, sub } = setup();
+    for (const u of [users.tech, users.lead, users.eng])
+      signAndAdvance(db, { submissionId: sub.id, user: u, signaturePng: PNG });
+    for (const u of [users.tech, users.lead, users.eng]) {
+      try {
+        rejectSubmission(db, { submissionId: sub.id, user: u, reason: 'too late' });
+        assert.fail('an approved record must never be rejectable');
+      } catch (err) { assert.equal(err.code, 'FORBIDDEN'); }
+    }
+    assert.equal(stateOf(db, sub.id), 'approved');
+    assert.deepEqual(signatureStages(db, sub.id), ['engineer', 'team_leader', 'technician']);
+    assert.deepEqual(rejectionsOf(db, sub.id), []);
+  }
+});
+
+test('after a rejection the technician can edit, re-sign and resubmit — back to pending_lead', () => {
+  const { db, users, sub } = setup();
+  saveFields(db, sub.id, { task_28: 'OK' }, users.tech);
+  signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+  rejectSubmission(db, { submissionId: sub.id, user: users.lead, reason: 'Task 28 needs the measured value.' });
+
+  // Editable again by its creator, exactly as a draft is.
+  assert.doesNotThrow(() => assertCanEdit(db, sub.id, users.tech));
+  assert.throws(() => assertCanEdit(db, sub.id, users.lead), /cannot/i);
+  saveFields(db, sub.id, { task_28: 'Measured 4.2 Nm' }, users.tech);
+  assert.equal(
+    db.prepare('select value from submission_fields where submission_id=? and field_key=?').get(sub.id, 'task_28').value,
+    'Measured 4.2 Nm'
+  );
+
+  // And it travels the whole chain again from the bottom.
+  assert.equal(signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG }).state, 'pending_lead');
+  assert.deepEqual(signatureStages(db, sub.id), ['technician'], 'the fresh signature is the only one');
+  assert.equal(signAndAdvance(db, { submissionId: sub.id, user: users.lead, signaturePng: PNG }).state, 'pending_engineer');
+  assert.equal(signAndAdvance(db, { submissionId: sub.id, user: users.eng, signaturePng: PNG }).state, 'approved');
+
+  // The rejection is still on the record afterwards — an approved record must
+  // still be able to say it was sent back once, by whom, and why.
+  assert.equal(rejectionsOf(db, sub.id).length, 1);
+});
+
+test('a rejected record sits in its technician\'s queue, not in any reviewer\'s', () => {
+  const { db, users, sub } = setup();
+  signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+  assert.equal(queueFor(db, users.lead).length, 1);
+
+  rejectSubmission(db, { submissionId: sub.id, user: users.lead, reason: 'Send it back.' });
+
+  assert.equal(queueFor(db, users.lead).length, 0, 'a rejected record must leave the reviewer\'s queue');
+  assert.equal(queueFor(db, users.eng).length, 0);
+  const techQueue = queueFor(db, users.tech);
+  assert.equal(techQueue.length, 1, 'the technician must be able to see it to act on it');
+  assert.equal(techQueue[0].state, 'rejected');
+});
+
+test('concurrency: a second reviewer rejecting the same record fails cleanly, leaving one rejection', () => {
+  const { db, users, sub } = setup();
+  signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG });
+
+  const first = rejectSubmission(db, { submissionId: sub.id, user: users.lead, reason: 'First reason.' });
+  assert.equal(first.state, 'rejected');
+
+  // The state was re-read INSIDE the transaction, so a second actor working
+  // from a stale view of the record cannot reject it a second time.
+  try {
+    rejectSubmission(db, { submissionId: sub.id, user: users.lead, reason: 'Second reason.' });
+    assert.fail('the second rejection must fail');
+  } catch (err) { assert.equal(err.code, 'FORBIDDEN'); }
+  try {
+    rejectSubmission(db, { submissionId: sub.id, user: users.eng, reason: 'Third reason.' });
+    assert.fail('a different reviewer must not be able to reject an already-rejected record');
+  } catch (err) { assert.equal(err.code, 'FORBIDDEN'); }
+
+  const rows = rejectionsOf(db, sub.id);
+  assert.equal(rows.length, 1, 'exactly one rejection row');
+  assert.equal(rows[0].reason, 'First reason.');
+  assert.equal(stateOf(db, sub.id), 'rejected');
+});
+
+test('rejecting a record that does not exist is a NOT_FOUND, not a crash', () => {
+  const { db, users } = setup();
+  try {
+    rejectSubmission(db, { submissionId: 999999, user: users.lead, reason: 'x' });
+    assert.fail('expected a throw');
+  } catch (err) { assert.equal(err.code, 'NOT_FOUND'); }
 });

@@ -27,7 +27,7 @@ const GRID_ROW_SCALE = 0.62; // Excel row heights read tall next to a Helvetica-
  * licence-tracked sRGB profile — not PDFKit's bundled one — is what actually
  * ships as the record's archival OutputIntent.
  */
-export async function renderRecordPdf({ form, submission, snapshot, values, signatures, grid, identity = null, notice = '' }) {
+export async function renderRecordPdf({ form, submission, snapshot, values, signatures, rejections = [], grid, identity = null, notice = '' }) {
   // `identity` is the controlled document as it stood WHEN THIS RECORD WAS
   // SIGNED (stamped on the submission at creation — see server/workflow.js).
   // The live catalog row is only a fallback for records created before those
@@ -66,6 +66,7 @@ export async function renderRecordPdf({ form, submission, snapshot, values, sign
 
   drawGrid(doc, grid, { doc_number: id.doc_number, file_name: id.title });
   drawValues(doc, snapshot, values);
+  drawRejections(doc, rejections);
   drawSignatures(doc, signatures);
 
   stampPageNumbers(doc, ctx);
@@ -321,6 +322,50 @@ function drawValues(doc, snapshot, values) {
       .text(`${field.label}: `, PAGE_MARGIN, doc.y, { continued: true })
       .font('bold').text(String(value));
   }
+}
+
+// A record that was sent back for correction says so on its own face. The
+// signatures that rejection invalidated are gone from the database — they
+// were claims about content that then changed — but the fact that a named
+// reviewer sent it back, from which stage, when, and why, is part of what
+// happened to this record and belongs on the archived document.
+//
+// Deliberately short: one heading and one block per rejection. A clean record
+// prints nothing at all here, so this never becomes standing furniture on the
+// 99% of documents that were never rejected.
+function drawRejections(doc, rejections) {
+  if (!rejections?.length) return;
+
+  const width = doc.page.width - PAGE_MARGIN * 2;
+  ensureSpace(doc, 24);
+  doc.moveDown(0.6);
+  doc.font('bold').fontSize(9).fillColor('#000').text('REJECTION HISTORY', PAGE_MARGIN, doc.y);
+  doc.moveDown(0.3);
+
+  for (const r of rejections) {
+    const reason = String(r.reason ?? '');
+    // Reserve the block's REAL height before drawing any of it, the same
+    // discipline drawGrid uses: a long reason must break onto a new page
+    // whole rather than have its first line orphaned under the heading. No
+    // explicit `height` is ever passed to .text(), so a reason longer than a
+    // page flows onto the next one instead of being silently clipped — the
+    // exact defect that was found and fixed in the task grid.
+    doc.font('body').fontSize(8);
+    ensureSpace(doc, 22 + doc.heightOfString(reason, { width }));
+
+    doc.font('bold').fontSize(8).fillColor('#000')
+      .text(`${rejectionStageLabel(r.stage)} — ${r.full_name || ''}`, PAGE_MARGIN, doc.y, { width });
+    doc.font('mono').fontSize(6).fillColor('#333')
+      .text(formatTimestamp(r.rejected_at), PAGE_MARGIN, doc.y, { width });
+    doc.font('body').fontSize(8).fillColor('#000')
+      .text(reason, PAGE_MARGIN, doc.y, { width });
+    doc.moveDown(0.4);
+  }
+}
+
+function rejectionStageLabel(stage) {
+  return ({ team_leader: 'Rejected by Team Leader', engineer: 'Rejected by Engineer' })[stage]
+    || `Rejected at stage ${stage}`;
 }
 
 function drawSignatures(doc, signatures) {

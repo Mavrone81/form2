@@ -247,3 +247,64 @@ test('submissions.state accepts arbitrary values (no check constraint)', () => {
     .get('rejected');
   assert.equal(submission.state, 'rejected', 'arbitrary state should be stored');
 });
+
+// --- rejections: the same audit protections signatures already carry ------
+
+test('schema creates the rejections table', () => {
+  const db = openDb(':memory:');
+  const names = db.prepare("select name from sqlite_master where type='table'")
+    .all().map((r) => r.name);
+  assert.ok(names.includes('rejections'), 'missing table rejections');
+});
+
+test('deleting a user who rejected throws (no cascade) — rejection history survives', () => {
+  const db = openDb(':memory:');
+  const { submissionId, userId } = setupTestData(db);
+
+  db.prepare(`
+    insert into rejections (submission_id, rejected_by, full_name, stage, reason, rejected_at)
+    values (?, ?, ?, ?, ?, ?)
+  `).run(submissionId, userId, 'Tech One', 'team_leader', 'Missing torque values', '2026-01-01T00:00:00Z');
+
+  assert.throws(
+    () => db.prepare('delete from users where id = ?').run(userId),
+    'cannot delete a user referenced by a rejection (audit trail protection)'
+  );
+
+  assert.equal(
+    db.prepare('select count(*) as count from rejections where rejected_by = ?').get(userId).count, 1,
+    'the rejection must survive the attempted deletion'
+  );
+  assert.equal(
+    db.prepare('select count(*) as count from users where id = ?').get(userId).count, 1,
+    'user should still exist after failed delete'
+  );
+});
+
+test('deleting a submission cascades its rejections away', () => {
+  const db = openDb(':memory:');
+  const { submissionId, userId } = setupTestData(db);
+
+  db.prepare(`
+    insert into rejections (submission_id, rejected_by, full_name, stage, reason, rejected_at)
+    values (?, ?, ?, ?, ?, ?)
+  `).run(submissionId, userId, 'Tech One', 'engineer', 'Wrong interval', '2026-01-01T00:00:00Z');
+
+  db.prepare('delete from submissions where id = ?').run(submissionId);
+  assert.equal(
+    db.prepare('select count(*) as count from rejections where submission_id = ?').get(submissionId).count, 0,
+    'rejections should cascade delete with their submission'
+  );
+});
+
+test('rejections.stage rejects a stage that can never reject', () => {
+  const db = openDb(':memory:');
+  const { submissionId, userId } = setupTestData(db);
+  assert.throws(
+    () => db.prepare(`
+      insert into rejections (submission_id, rejected_by, full_name, stage, reason, rejected_at)
+      values (?, ?, ?, ?, ?, ?)
+    `).run(submissionId, userId, 'Tech One', 'technician', 'x', '2026-01-01T00:00:00Z'),
+    'rejections.stage rejects a non-reviewer stage'
+  );
+});

@@ -5,7 +5,7 @@ import { listForms, scanFolder } from './scanner.js';
 import { buildGrid } from './grid-model.js';
 import { parseWorkbook } from './excel-parser.js';
 import { tasksInScope, scopeSummary } from './intervals.js';
-import { createSubmission, saveFields, signAndAdvance, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
+import { createSubmission, saveFields, signAndAdvance, rejectSubmission, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
 import { renderRecordPdf } from './pdf-record.js';
 
 const signedIn = requireRole(...ROLES);
@@ -18,9 +18,24 @@ const signedIn = requireRole(...ROLES);
 // every record's sign-off inverted. Built from STAGES so it can never drift
 // from the workflow it claims to mirror; the values are module constants,
 // never request input.
-const STAGE_ORDER_SQL = `case stage ${STAGES.map((s, i) => `when '${s.actor}' then ${i}`).join(' ')} else ${STAGES.length} end`;
+// Deduplicated by actor: STAGES gained a second technician-actor row when
+// `rejected` was added (a rejected record is back with its technician), and
+// a stage actor must appear exactly once in this CASE. Set preserves first
+// insertion order, so the sign-off order technician -> team_leader ->
+// engineer is still read straight off the workflow table.
+const SIGNING_ACTORS = [...new Set(STAGES.map((s) => s.actor))];
+const STAGE_ORDER_SQL = `case stage ${SIGNING_ACTORS.map((a, i) => `when '${a}' then ${i}`).join(' ')} else ${SIGNING_ACTORS.length} end`;
 const SIGNATURES_SQL =
   `select stage, full_name, image_png, signed_at from signatures where submission_id=? order by ${STAGE_ORDER_SQL}`;
+
+// Rejection history, oldest first. A technician who cannot see WHY their
+// record came back cannot act on it, so this travels with the record itself
+// rather than sitting behind a separate, easily-forgotten call. There is no
+// ink here to withhold — only attribution and the reviewer's own words — so
+// unlike signatures it is returned in full to every reader entitled to read
+// the record at all.
+const REJECTIONS_SQL =
+  'select stage, full_name, reason, rejected_at from rejections where submission_id=? order by id';
 
 // Signature ink is replayable: an image lifted from one record could be
 // pasted onto another. Attribution (who signed, when) stays legible to every
@@ -148,7 +163,8 @@ export function makeRoutes(db) {
       submission: sub,
       snapshot: JSON.parse(sub.form_snapshot),
       values: db.prepare('select field_key, value from submission_fields where submission_id=?').all(sub.id),
-      signatures: visibleSignatures(db.prepare(SIGNATURES_SQL).all(sub.id), req.session.user)
+      signatures: visibleSignatures(db.prepare(SIGNATURES_SQL).all(sub.id), req.session.user),
+      rejections: db.prepare(REJECTIONS_SQL).all(sub.id)
     });
   });
 
@@ -200,6 +216,26 @@ export function makeRoutes(db) {
         submissionId: Number(req.params.id),
         user: req.session.user,
         signaturePng: req.body?.signaturePng ?? ''
+      }));
+    } catch (err) { res.status(statusFor(err, 400)).json({ error: err.message }); }
+  });
+
+  // Send a record back to the technician. Every rule about who may do this,
+  // and when, lives in rejectSubmission (server/workflow.js) — this route
+  // only translates its two failure shapes into status codes, exactly as the
+  // sign route above does: a FORBIDDEN throw is a 403, and anything else
+  // (here, a missing reason) falls back to 400. Deliberately NOT wrapped in
+  // asyncRoute: this handler awaits nothing, so like /sign it is fully
+  // synchronous and cannot produce an unhandled rejection. The moment
+  // anything in here becomes async it MUST gain the wrapper — see the
+  // asyncRoute contract at the top of this file. Only `err.message`, which
+  // is workflow.js's own operator-facing wording, ever reaches the client.
+  r.post('/submissions/:id/reject', signedIn, (req, res) => {
+    try {
+      res.json(rejectSubmission(db, {
+        submissionId: Number(req.params.id),
+        user: req.session.user,
+        reason: req.body?.reason ?? ''
       }));
     } catch (err) { res.status(statusFor(err, 400)).json({ error: err.message }); }
   });
@@ -264,8 +300,12 @@ export function makeRoutes(db) {
     const snapshot = JSON.parse(sub.form_snapshot);
     const values = db.prepare('select field_key, value from submission_fields where submission_id=?').all(sub.id);
     const signatures = db.prepare(SIGNATURES_SQL).all(sub.id);
+    // A rejection is part of what happened to this record, so the archived
+    // document says so. The signatures it invalidated are gone; the fact that
+    // it was sent back, by whom and why, is not.
+    const rejections = db.prepare(REJECTIONS_SQL).all(sub.id);
 
-    const buffer = await renderRecordPdf({ form, submission: sub, snapshot, values, signatures, grid, identity, notice });
+    const buffer = await renderRecordPdf({ form, submission: sub, snapshot, values, signatures, rejections, grid, identity, notice });
 
     // A machine id typed into a spreadsheet cell is untrusted input reaching
     // an HTTP response header — strip everything but alphanumerics, dash,

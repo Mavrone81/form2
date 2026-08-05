@@ -76,8 +76,34 @@ create table if not exists signatures (
   unique (submission_id, stage)
 );
 
+-- A rejection sends a record back to the technician and clears every
+-- signature on it, because every stage must redo its work against whatever
+-- changes next. Clearing the ink removes a claim that is no longer true; it
+-- must NOT remove the fact that the record was sent back. That history lives
+-- here, and carries the same two audit protections signatures already do:
+--   * "on delete cascade" from the submission, so deleting a record takes
+--     its history with it — but nothing else can.
+--   * NO cascade from users, so deleting an account cannot erase who
+--     rejected what. The delete is refused instead.
+--   * full_name denormalised at rejection time, so a later rename cannot
+--     retroactively rewrite who sent the record back.
+-- "stage" is the reviewer stage the rejection came from. Only a reviewer can
+-- ever reject — a technician owns draft/rejected and has nothing to reject —
+-- so the check constraint says exactly that, in the same shape as
+-- signatures.stage.
+create table if not exists rejections (
+  id integer primary key,
+  submission_id integer not null references submissions(id) on delete cascade,
+  rejected_by integer not null references users(id),
+  full_name text not null,
+  stage text not null check (stage in ('team_leader','engineer')),
+  reason text not null,
+  rejected_at text not null
+);
+
 create index if not exists idx_sub_state on submissions(state);
 create index if not exists idx_sub_creator on submissions(created_by);
+create index if not exists idx_rejection_sub on rejections(submission_id);
 `;
 
 // `create table if not exists` cannot add a column to a table that already

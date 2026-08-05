@@ -13,12 +13,28 @@ let user = null, formId = null, submission = null, frequency = '';
 // the general record fields and whether to offer a signature pad for the
 // current user's own stage. If the two ever disagree, the server wins and
 // the failure is surfaced verbatim (see addSubmitBar / the save handler).
-const STAGE_ACTOR = { draft: 'technician', pending_lead: 'team_leader', pending_engineer: 'engineer' };
+// `rejected` is a technician stage, exactly as it is in server/workflow.js's
+// STAGES table: a rejected record has come back to whoever created it and is
+// theirs to correct, re-sign and resubmit. TECHNICIAN_STATES is what the
+// ownership check below and the editability rule in paint() both read, so the
+// two can never disagree about which states the technician holds.
+const STAGE_ACTOR = {
+  draft: 'technician', rejected: 'technician',
+  pending_lead: 'team_leader', pending_engineer: 'engineer'
+};
+const TECHNICIAN_STATES = new Set(
+  Object.entries(STAGE_ACTOR).filter(([, actor]) => actor === 'technician').map(([state]) => state)
+);
+// The two states a reviewer may reject FROM, mirroring the server's own
+// REJECTABLE_STATES. Used only to decide whether to OFFER the control — the
+// route enforces the real rule and returns 403 regardless of what is shown.
+const REJECTABLE_STATES = new Set(['pending_lead', 'pending_engineer']);
+
 function isCurrentActor(sub) {
   if (sub.state === 'approved') return false;
   const actor = STAGE_ACTOR[sub.state];
   if (actor !== user.role) return false;
-  if (sub.state === 'draft' && sub.created_by !== user.id) return false;
+  if (TECHNICIAN_STATES.has(sub.state) && sub.created_by !== user.id) return false;
   return true;
 }
 
@@ -339,14 +355,20 @@ async function paint() {
     // they render as read-only text for everyone, including the technician
     // who filled them. This is stricter than the brief's
     // `locked: state === 'approved'`, which left every reviewer's stage
-    // free to edit the previous stage's already-entered data.
-    locked: !(detail.submission.state === 'draft' && canAct),
+    // free to edit the previous stage's already-entered data. A `rejected`
+    // record is unlocked for the same reason a draft is — it is back with its
+    // technician, carries no signatures at all, and exists precisely to be
+    // corrected.
+    locked: !(TECHNICIAN_STATES.has(detail.submission.state) && canAct),
     // Signature-pad availability is a SEPARATE question from the above: a
     // team leader/engineer must still get a pad on their own stage even
     // though the general fields are locked for them.
     canSign: canAct,
     currentUser: user,
     completeness: spec.completeness,
+    // Why the record came back, shown above the fields while it is rejected.
+    rejections: detail.rejections,
+    state: detail.submission.state,
     onChange: async (key, value) => {
       try {
         await api.save(submission.id, { [key]: value });
@@ -360,11 +382,12 @@ async function paint() {
     // The chosen interval is persisted, not just repainted: the stored value
     // is what the team leader is later shown, what the completeness warning
     // counts against, and what the archived PDF header prints. It is only
-    // sent while the record is the technician's own draft — the server
-    // refuses it afterwards, and a reviewer's local scope-preview must not
-    // fire a request that would 403.
+    // sent while the record is the technician's own (draft or rejected — a
+    // rejected record carries no signatures, so re-scoping it re-scopes
+    // nothing anyone has signed) — the server refuses it afterwards, and a
+    // reviewer's local scope-preview must not fire a request that would 403.
     onFrequencyChange: async (f) => {
-      if (detail.submission.state === 'draft' && canAct) {
+      if (TECHNICIAN_STATES.has(detail.submission.state) && canAct) {
         try {
           await api.setFrequency(submission.id, f);
           submission = { ...submission, frequency: f };
@@ -429,12 +452,68 @@ function addSubmitBar(sub, canAct) {
       }
     });
     bar.append(btn);
+    if (REJECTABLE_STATES.has(sub.state)) bar.append(rejectControl(sub, msg));
   } else {
     const actor = STAGE_ACTOR[sub.state];
     msg.textContent = actor ? `Waiting on ${actor.replace('_', ' ')}.` : '';
   }
   bar.append(msg);
   right.append(bar);
+}
+
+// Send the record back to the technician, beside Sign and submit and only for
+// the reviewer whose stage it currently is — addSubmitBar only reaches here
+// when canAct is true and the record is sitting in one of the two review
+// states.
+//
+// The reason is mandatory, and this is the client half of that rule: with the
+// box empty the Reject button does nothing except say why, out loud, in the
+// same alert region the sign path already uses. A silent no-op would read as
+// a broken button. The server enforces the rule independently (400 with its
+// own wording), so a reviewer who defeats this check still cannot land a
+// rejection the technician has nothing to act on.
+function rejectControl(sub, msg) {
+  const wrap = document.createElement('div');
+  wrap.className = 'reject';
+
+  const id = `reject-reason-${sub.id}`;
+  const label = document.createElement('label');
+  label.htmlFor = id;
+  label.textContent = 'Reason for sending back (required)';
+  wrap.append(label);
+
+  const reason = document.createElement('textarea');
+  reason.id = id;
+  reason.rows = 3;
+  reason.placeholder = 'What must the technician correct?';
+  wrap.append(reason);
+
+  const reject = document.createElement('button');
+  reject.type = 'button';
+  reject.className = 'reject-go';
+  reject.textContent = 'Reject and send back';
+  reject.addEventListener('click', async () => {
+    if (!reason.value.trim()) {
+      msg.textContent = 'Give a reason before sending this record back.';
+      reason.focus();
+      return;
+    }
+    try {
+      await api.reject(submission.id, reason.value);
+      msg.textContent = '';
+      // Repaint from the server rather than patching local state: the record
+      // is now `rejected`, every signature on it is gone, and this reviewer's
+      // own queue no longer holds it.
+      submission = { ...submission, state: 'rejected' };
+      await paint();
+    } catch (err) {
+      // 403 (not your stage / already acted on) or 400 (no reason) —
+      // surfaced verbatim, never re-worded.
+      msg.textContent = err.message;
+    }
+  });
+  wrap.append(reject);
+  return wrap;
 }
 
 // Preview/download links, shown only when this rule — mirroring the server's

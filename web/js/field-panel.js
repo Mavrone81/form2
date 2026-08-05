@@ -34,12 +34,45 @@ export function teardownFieldPanel() {
 // (app.js) computes both from the submission's actual stage-ownership rule.
 export function renderFields(container, { snapshot, values, signatures, frequencies,
                                           selectedFrequency, locked, canSign, currentUser,
-                                          completeness, onChange, onFrequencyChange }) {
+                                          completeness, rejections, state, onChange, onFrequencyChange }) {
   teardownActivePad();
   container.replaceChildren();
   container.pads = {};
   const byKey = new Map((values ?? []).map((v) => [v.field_key, v.value]));
   const signed = new Map((signatures ?? []).map((s) => [s.stage, s]));
+
+  // WHY the record came back, before anything else on the panel. A technician
+  // who cannot see the reason cannot act on it, so this sits above the
+  // interval selector and every field rather than below them where it would
+  // be scrolled past on a phone. Only while the record is actually `rejected`:
+  // once it has been resubmitted the history belongs on the archived PDF, not
+  // in the way of the person filling it in.
+  if (state === 'rejected' && rejections?.length) {
+    const sec = section('Sent back for correction');
+    sec.className = 'sec sec-rejected';
+    for (const r of rejections) {
+      const item = document.createElement('div');
+      item.className = 'reject-note';
+
+      const who = document.createElement('p');
+      who.className = 'reject-who';
+      who.textContent = `${r.full_name || 'A reviewer'} · ${stageLabel(r.stage)}`;
+      item.append(who);
+
+      const when = document.createElement('p');
+      when.className = 'reject-when';
+      when.textContent = new Date(r.rejected_at).toLocaleString();
+      item.append(when);
+
+      const why = document.createElement('p');
+      why.className = 'reject-why';
+      why.textContent = r.reason;
+      item.append(why);
+
+      sec.append(item);
+    }
+    container.append(sec);
+  }
 
   if (frequencies?.length) {
     const sec = section('Maintenance interval');
@@ -137,6 +170,12 @@ export function renderFields(container, { snapshot, values, signatures, frequenc
     h.textContent = title;
     s.append(h);
     return s;
+  }
+  // Reads as a role, not as a state name: "Team leader" is who sent it back,
+  // which is what the technician needs, whereas "pending_lead" is internal
+  // vocabulary.
+  function stageLabel(stage) {
+    return ({ team_leader: 'Team leader', engineer: 'Engineer' })[stage] || String(stage ?? '').replace('_', ' ');
   }
   function textField(f, value, isLocked, change) {
     const wrap = document.createElement('div');
