@@ -115,12 +115,49 @@ export function mergeMap(ws) {
   return { spans, covered };
 }
 
+// A side's Excel border style ('thin', 'medium', 'double', ...) or null,
+// hoisted above buildGrid so the trimming scan below and the per-cell body
+// further down share one definition.
+function borderSide(b) { return b?.style ? String(b.style) : null; }
+
+// The sheet's own declared columnCount/rowCount routinely runs past what the
+// form actually uses — Excel's print area stops short of it. Rendering the
+// surplus draws a dead strip with no content and no border, past which the
+// table's own outer frame still sits: the "warp" a user sees on a printed
+// form's on-screen preview. This finds the last column and row that carry
+// anything real ANYWHERE in the sheet — text, or a border on any side, on
+// ANY cell, including one a merge covers, since Excel can still write a
+// border on a covered cell that forms the merge's own visual perimeter.
+// Nothing past that point is emitted below.
+function realExtent(ws) {
+  let lastCol = 0, lastRow = 0;
+  for (let r = 1; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    for (let c = 1; c <= ws.columnCount; c++) {
+      const cell = row.getCell(c);
+      const text = cell.value == null ? '' : String(cell.text ?? cell.value).trim();
+      const b = cell.border ?? {};
+      const hasBorder = !!(borderSide(b.top) || borderSide(b.right) || borderSide(b.bottom) || borderSide(b.left));
+      if (text || hasBorder) {
+        if (c > lastCol) lastCol = c;
+        if (r > lastRow) lastRow = r;
+      }
+    }
+  }
+  // A wholly empty sheet (no test fixture does this) falls back to the
+  // sheet's own declared extent rather than trimming to nothing.
+  return {
+    maxCol: lastCol > 0 ? lastCol : ws.columnCount,
+    maxRow: lastRow > 0 ? lastRow : ws.rowCount
+  };
+}
+
 export async function buildGrid(path, definition = null) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(path);
   const ws = wb.worksheets[0];
 
-  const maxCol = ws.columnCount;
+  const { maxCol, maxRow } = realExtent(ws);
   const columns = [];
   for (let c = 1; c <= maxCol; c++) {
     const w = ws.getColumn(c).width ?? DEFAULT_COL_WIDTH;
@@ -134,18 +171,17 @@ export async function buildGrid(path, definition = null) {
   // definition is optional so existing single-argument callers keep working.
   const taskRows = new Set((definition?.tasks ?? []).map((t) => t.row));
 
-  // A side's Excel border style ('thin', 'medium', 'double', ...) or null.
   // The style string is kept verbatim rather than reduced to a weight, so the
   // renderer decides how to draw it and this model stays a faithful record of
   // what the document says.
-  const side = (b) => (b?.style ? String(b.style) : null);
+  const side = borderSide;
 
   const sizes = new Map();
   const families = new Map();
   const tally = (map, key) => { if (key != null) map.set(key, (map.get(key) ?? 0) + 1); };
 
   const rows = [];
-  for (let r = 1; r <= ws.rowCount; r++) {
+  for (let r = 1; r <= maxRow; r++) {
     const row = ws.getRow(r);
     const cells = [];
     let hasReal = false;
@@ -184,7 +220,18 @@ export async function buildGrid(path, definition = null) {
       tally(families, family);
 
       const out = { col: c, text };
-      if (span && (span.rows > 1 || span.cols > 1)) out.span = span;
+      if (span && (span.rows > 1 || span.cols > 1)) {
+        // A merge can reach past the trimmed extent (its anchor real, its
+        // tail cells blank/unbordered and therefore not what pushed the
+        // extent out). Clamp so the tiling invariant still holds exactly
+        // against the trimmed column/row count, and drop the span entirely
+        // if clamping leaves it 1x1 — same convention as never spanning.
+        const clamped = {
+          rows: Math.min(span.rows, maxRow - r + 1),
+          cols: Math.min(span.cols, maxCol - c + 1)
+        };
+        if (clamped.rows > 1 || clamped.cols > 1) out.span = clamped;
+      }
       if (cell.font?.bold) out.bold = true;
       if (align && align !== 'left') out.align = align;
       if (hasBorder) out.borders = borders;

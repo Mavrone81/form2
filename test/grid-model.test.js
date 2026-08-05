@@ -127,6 +127,72 @@ test('buildGrid(path, definition) marks exactly the task rows from definition.ta
   assert.deepEqual(actualTaskRows, expectedTaskRows, 'expected isTask to be true on exactly the rows listed in definition.tasks[].row, and no others');
 });
 
+// A sheet's declared column/row count can run past what the form actually
+// uses — Excel's print area stops short of it. Rendering the surplus draws a
+// dead strip with no content and no border, past which the table's own frame
+// still sits: the "warp" a user sees. "Real" is independently recomputed here
+// (never delegated to grid-model's own notion of it) so this test cannot pass
+// merely because both sides agree with themselves: text, or a border on any
+// side, on ANY cell — including one a merge covers, since Excel can still
+// write a border on the covered cell that forms the merge's own perimeter.
+async function rawExtent(path) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(path);
+  const ws = wb.worksheets[0];
+  const side = (b) => (b?.style ? String(b.style) : null);
+  let lastCol = 0, lastRow = 0;
+  for (let r = 1; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    for (let c = 1; c <= ws.columnCount; c++) {
+      const cell = row.getCell(c);
+      const text = cell.value == null ? '' : String(cell.text ?? cell.value).trim();
+      const b = cell.border ?? {};
+      const hasBorder = !!(side(b.top) || side(b.right) || side(b.bottom) || side(b.left));
+      if (text || hasBorder) {
+        if (c > lastCol) lastCol = c;
+        if (r > lastRow) lastRow = r;
+      }
+    }
+  }
+  return { lastCol, lastRow };
+}
+
+test('the grid trims to exactly the last column and row that carry anything real, on every sample form',
+  { skip: fx ? false : SKIP }, async () => {
+    for (const sample of samples()) {
+      const grid = await gridFor(sample);
+      const { lastCol, lastRow } = await rawExtent(sample.path);
+      assert.equal(grid.columns.length, lastCol,
+        `${sample.id}: expected the grid to trim to column ${lastCol}, the last one carrying text or a border`);
+      assert.equal(grid.rows.length, lastRow,
+        `${sample.id}: expected the grid to trim to row ${lastRow}, the last one carrying text or a border`);
+    }
+  });
+
+// The cell map is what places a technician's entered value on the sheet. If
+// trimming ever removed a column or row a mapped field points at, that field
+// would silently stop appearing in the preview with no error anywhere.
+test('no coordinate in cellFor falls outside the trimmed grid, on every sample form',
+  { skip: fx ? false : SKIP }, async () => {
+    const { cellMapFor } = await import('../server/cell-map.js');
+    for (const sample of samples()) {
+      const grid = await gridFor(sample);
+      const def = await parseWorkbook(sample.path);
+      const { cellFor, titleCell, intervalCells } = cellMapFor(def);
+      const coords = [
+        ...Object.entries(cellFor).map(([k, v]) => [k, v]),
+        ...Object.entries(intervalCells).map(([code, v]) => [`interval ${code}`, v]),
+        ...(titleCell ? [['title', titleCell]] : [])
+      ];
+      for (const [label, coord] of coords) {
+        assert.ok(coord.col >= 1 && coord.col <= grid.columns.length,
+          `${sample.id}: ${label} points at column ${coord.col}, outside the trimmed grid's ${grid.columns.length} columns`);
+        assert.ok(coord.row >= 1 && coord.row <= grid.rows.length,
+          `${sample.id}: ${label} points at row ${coord.row}, outside the trimmed grid's ${grid.rows.length} rows`);
+      }
+    }
+  });
+
 // THE regression guard for the preview-vs-print mismatch. A consumer that
 // appends one cell per emitted cell, in order, only lands each cell in its
 // true column if the emitted cells account for EVERY column of the row.
