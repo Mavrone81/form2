@@ -57,6 +57,33 @@ function emptyNotice(text) {
   return p;
 }
 
+// The picker screen (showPicker) never puts anything in `#pane-left` — the
+// technician's queue and form list both render into `#pane-right` — but
+// app.css's `.split` rule still reserved 76vh of blank white for it, sitting
+// ABOVE the list in the mobile single-column layout: the "large white panel
+// that shows nothing" the end user reported, and the reason the list's first
+// (and only visible, below that void) entry read as the only form that
+// existed. Collapsing is done from script, not left to an `:empty`/`:has()`
+// selector, so it happens at the exact moments the DOM state is known here —
+// right when the pane is cleared, and undone the moment paint() gives it the
+// form again — rather than depending on a CSS selector feature being
+// supported. `.split--list` goes on the pane's own `.split` parent (not just
+// `#pane-left`) because collapsing the pane isn't enough on its own: the `lg`
+// breakpoint's `grid-template-columns:1fr 400px` would otherwise still
+// reserve a 400px track for a now-hidden element.
+function collapsePaneLeft() {
+  const left = $('#pane-left');
+  left.replaceChildren();
+  left.classList.add('is-empty');
+  left.closest('.split')?.classList.add('split--list');
+}
+
+function expandPaneLeft() {
+  const left = $('#pane-left');
+  left.classList.remove('is-empty');
+  left.closest('.split')?.classList.remove('split--list');
+}
+
 // Deviation from the brief: the brief's showPicker() only ever lists forms
 // to start a NEW draft, via POST /api/submissions — a route restricted to
 // technicians (server/routes.js: requireRole('technician')). That leaves no
@@ -80,7 +107,7 @@ async function showPicker() {
   $('#control-strip').replaceChildren(
     chip(`${user.full_name} · ${user.role.replace('_', ' ')}`), signOutButton()
   );
-  $('#pane-left').replaceChildren();
+  collapsePaneLeft();
   const right = $('#pane-right');
   right.replaceChildren();
 
@@ -89,19 +116,42 @@ async function showPicker() {
 
   if (user.role === 'technician') {
     const queue = await api.queue();
-    right.append(queueSection('Your records', queue, formsById, 'You have no records yet.'));
 
     const sec = section('Choose a form');
     if (!forms.length) sec.append(emptyNotice('No forms are set up yet. Ask an admin to add one.'));
     for (const f of forms) {
       const b = document.createElement('button');
       b.type = 'button';
-      b.className = 'form-pick';
-      b.textContent = f.title || f.file_name;
+      b.className = 'form-pick catalog-row';
+
+      const titleEl = document.createElement('span');
+      titleEl.className = 'catalog-title';
+      titleEl.textContent = f.title || f.file_name;
+
+      const docEl = document.createElement('span');
+      docEl.className = 'catalog-doc';
+      // The controlled-document code, not just the title: several titles are
+      // near-identical ("Preventive Maintenance Record EP01" vs "PM01") and
+      // the code in monospace is what actually distinguishes one form from
+      // another for a technician scanning a list of 12 on a phone screen.
+      docEl.textContent = `${f.doc_number || '—'} · Rev ${f.revision || '—'}`;
+
+      b.append(titleEl, docEl);
       b.addEventListener('click', () => startNew(f.id));
       sec.append(b);
     }
-    right.append(sec);
+
+    const queueSec = queueSection('Your records', queue, formsById, 'You have no records yet.');
+    // A returning technician with records in flight is most likely here to
+    // resume one, so the queue stays first when it actually has content
+    // (unchanged from before). But when it is empty, leading with it just
+    // means leading with an empty-state notice sitting above the one thing
+    // every technician CAN do on this screen — pick a form and start —
+    // which is exactly the "large blank panel with nothing in it" complaint
+    // one level down. With no records to resume, the form list is the
+    // obvious primary action, so it goes first instead.
+    if (queue.length) right.append(queueSec, sec);
+    else right.append(sec, queueSec);
   } else {
     // Team leaders, engineers and admins never create records — only the
     // queue is shown for them.
@@ -203,6 +253,7 @@ async function paint() {
   // never coerced to null to "make it work". form-view.js relies on exactly
   // that distinction: null means dim nothing, an empty array means dim every
   // task row, because none of them apply to this visit.
+  expandPaneLeft();
   renderForm($('#pane-left'), form, { grid, inScopeRows: frequency ? spec.inScope : null });
 
   const saveError = document.createElement('p');
@@ -385,7 +436,7 @@ async function signOut() {
   teardownFieldPanel();
   user = null; formId = null; submission = null; frequency = '';
   $('#control-strip').replaceChildren();
-  $('#pane-left').replaceChildren();
+  collapsePaneLeft();
   $('#pane-right').replaceChildren();
   $('#app').hidden = true;
   $('#login-error').textContent = '';

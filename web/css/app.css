@@ -109,6 +109,24 @@ a{color:var(--ink)}
 #pane-left{padding:16px}
 #pane-right{background:var(--soft);padding:0}
 
+/* Picker screen: `#pane-left` renders nothing there (app.js's showPicker()
+   builds the technician's queue/form list into `#pane-right` only) but the
+   76vh min-height above still reserved a full screenful of blank white
+   ABOVE the list on the mobile single-column layout — the exact "large
+   white panel that shows nothing" the end user reported, and the reason
+   the first (and only visible) form read as the only one that existed.
+   `.is-empty`/`.split--list` are toggled by app.js itself (showPicker,
+   signOut) rather than left to an `:empty`/`:has()` selector, so the
+   collapse does not depend on selector support: it happens exactly when the
+   script knows the pane has no content, and is undone the moment paint()
+   gives it the form again. `.split--list` (2 classes) outranks the bare
+   `.split` rule inside the `lg` media query below by specificity alone, so
+   the picker stays single-column even at desktop widths — this only ever
+   applies to the picker; the FILL screen's own two-pane `.split` is
+   untouched. */
+#pane-left.is-empty{display:none;min-height:0;padding:0}
+.split.split--list{grid-template-columns:1fr}
+
 /* ---------- Document sheet header ---------- */
 /* Not currently rendered by any script in web/js (a leftover from the design
    mockup, see docs/design/directions.html) — fixed defensively anyway so it
@@ -237,6 +255,22 @@ a{color:var(--ink)}
 .queue-row .state{font:500 9.5px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
   color:#fff;background:var(--stamp);padding:5px 9px;white-space:nowrap}
 .queue-row .state[data-state="approved"]{background:var(--ok)}
+
+/* Catalog row: one entry in "Choose a form" (app.js showPicker()), the
+   technician's list of the 12 catalogued forms. Several titles are
+   near-identical ("Preventive Maintenance Record EP01" vs "PM01") — the
+   controlled-document code (doc number · revision) underneath, in
+   monospace, is what actually tells two such entries apart, so it is always
+   shown, never only on hover/wide screens. Stacked (not `.queue-row`'s
+   single-line flex), because unlike a queue row this only carries two
+   fields — title and code — and the title must be free to wrap onto a
+   second line on a narrow phone rather than clip or ellipsize, since a
+   truncated title is exactly what made two forms look identical in the
+   first place. `.form-pick`'s block/border/padding/44px tap target still
+   applies. */
+.catalog-row{display:flex;flex-direction:column;align-items:flex-start;gap:4px}
+.catalog-row .catalog-title{color:var(--ink);font-size:13px;line-height:1.35}
+.catalog-row .catalog-doc{font:600 11px/1 var(--mono);letter-spacing:.03em;color:var(--mute)}
 
 /* ---------- Signature block ---------- */
 .sig{border:1px solid var(--rule);background:var(--paper)}
