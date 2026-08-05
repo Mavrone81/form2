@@ -34,7 +34,8 @@ export function teardownFieldPanel() {
 // (app.js) computes both from the submission's actual stage-ownership rule.
 export function renderFields(container, { snapshot, values, signatures, frequencies,
                                           selectedFrequency, locked, canSign, currentUser,
-                                          completeness, rejections, state, onChange, onFrequencyChange }) {
+                                          completeness, rejections, state, onChange, onPreview,
+                                          onFrequencyChange }) {
   teardownActivePad();
   container.replaceChildren();
   container.pads = {};
@@ -158,7 +159,7 @@ export function renderFields(container, { snapshot, values, signatures, frequenc
         sec.append(wrap);
         continue;
       }
-      sec.append(textField(f, byKey.get(f.field_key) ?? '', locked, onChange));
+      sec.append(textField(f, byKey.get(f.field_key) ?? '', locked, onChange, onPreview));
     }
     container.append(sec);
   }
@@ -177,7 +178,12 @@ export function renderFields(container, { snapshot, values, signatures, frequenc
   function stageLabel(stage) {
     return ({ team_leader: 'Team leader', engineer: 'Engineer' })[stage] || String(stage ?? '').replace('_', ' ');
   }
-  function textField(f, value, isLocked, change) {
+  // `change` saves (one request, on blur/commit — unchanged). `preview` is
+  // display only and never touches the network: it mirrors what is being
+  // typed into the left-hand sheet as it is typed, which is the whole point
+  // of showing the form beside the fields. Keeping them separate is what
+  // stops a live preview from turning into a PATCH per keystroke.
+  function textField(f, value, isLocked, change, preview) {
     const wrap = document.createElement('div');
     wrap.className = 'fld';
     const id = `f-${f.field_key}`;
@@ -194,6 +200,7 @@ export function renderFields(container, { snapshot, values, signatures, frequenc
       const input = document.createElement('input');
       input.id = id;
       input.value = value;
+      if (preview) input.addEventListener('input', () => preview(f.field_key, input.value));
       input.addEventListener('change', () => change(f.field_key, input.value));
       wrap.append(input);
     }

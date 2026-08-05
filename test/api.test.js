@@ -544,3 +544,66 @@ test('an engineer rejecting clears the team leader signature, and the record wal
     assert.equal(resigned.body.state, 'pending_lead');
   } finally { server.close(); }
 });
+
+// --- The fields payload tells the client where each value belongs ---------
+//
+// Without this the left-hand pane can only ever render a BLANK form: it has
+// the sheet and it has the values, but nothing connecting the two. Every
+// coordinate here is derived from the parsed definition — none is guessed.
+
+test('GET /forms/:id/fields says which cell each task status belongs in', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cellfor-'));
+  try {
+    // Header on row 1 (Status in column D = 4), tasks on rows 2 and 3.
+    await writeSyntheticWorkbook(join(dir, 'form.xlsx'), [
+      ['3M', 'Widget check A'],
+      ['Y', 'Widget check B']
+    ]);
+    const { db, server, call } = await boot();
+    try {
+      await scanFolder(db, dir);
+      const form = db.prepare("select * from form_catalog where file_name='form.xlsx'").get();
+      await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+
+      const res = await call('GET', `/api/forms/${form.id}/fields?frequency=`);
+      assert.equal(res.status, 200);
+      assert.deepEqual(res.body.cellFor.task_2, { row: 2, col: 4 });
+      assert.deepEqual(res.body.cellFor.task_3, { row: 3, col: 4 });
+    } finally { server.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a form with no status column omits task statuses and still returns a valid payload', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cellfor-'));
+  try {
+    // Same workbook shape, minus the Status header cell. Two of the twelve
+    // real controlled documents are exactly this shape: their task statuses
+    // have nowhere on the sheet to go, and the preview must render without
+    // them rather than throwing or picking a neighbouring column.
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Sheet1');
+    ws.getRow(1).getCell(1).value = 'No';
+    ws.getRow(1).getCell(2).value = 'Freq.';
+    ws.getRow(1).getCell(3).value = 'Instruction';
+    ws.getRow(2).getCell(1).value = 1;
+    ws.getRow(2).getCell(2).value = '3M';
+    ws.getRow(2).getCell(3).value = 'Widget check A';
+    await wb.xlsx.writeFile(join(dir, 'form.xlsx'));
+
+    const { db, server, call } = await boot();
+    try {
+      await scanFolder(db, dir);
+      const form = db.prepare("select * from form_catalog where file_name='form.xlsx'").get();
+      await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+
+      const res = await call('GET', `/api/forms/${form.id}/fields?frequency=`);
+      assert.equal(res.status, 200);
+      assert.ok(res.body.cellFor, 'cellFor is still present');
+      assert.deepEqual(Object.keys(res.body.cellFor).filter((k) => k.startsWith('task_')), []);
+      // The rest of the payload is unaffected — the form is still usable.
+      assert.equal(res.body.tasks.length, 1);
+      assert.ok(res.body.fields.some((f) => f.field_key === 'task_2'),
+        'the task is still a field in the right-hand panel; only its sheet cell is unknown');
+    } finally { server.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

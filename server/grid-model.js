@@ -3,20 +3,15 @@ import ExcelJS from 'exceljs';
 const DEFAULT_COL_WIDTH = 8.43;
 const PX_PER_CHAR = 7.5;
 
-export async function buildGrid(path, definition = null) {
-  const wb = new ExcelJS.Workbook();
-  await wb.xlsx.readFile(path);
-  const ws = wb.worksheets[0];
-
-  const maxCol = ws.columnCount;
-  const columns = [];
-  for (let c = 1; c <= maxCol; c++) {
-    const w = ws.getColumn(c).width ?? DEFAULT_COL_WIDTH;
-    columns.push({ index: c, width: Math.round(w * PX_PER_CHAR) });
-  }
-
-  // Map every cell covered by a merge to its anchor, so covered cells can be
-  // skipped and the anchor can carry the span.
+// Map every cell covered by a merge to its anchor, so covered cells can be
+// skipped and the anchor can carry the span.
+//
+// Exported because excel-parser.js needs the SAME notion of "covered" when it
+// locates the cells an entered value belongs in: a coordinate this function
+// reports as covered is never rendered by buildGrid below, so pointing a
+// field at one would silently drop the technician's value. One definition,
+// used by both, is the only way those two can never disagree.
+export function mergeMap(ws) {
   const spans = new Map();
   const covered = new Set();
   for (const range of Object.values(ws.model.merges ?? {})) {
@@ -29,6 +24,22 @@ export async function buildGrid(path, definition = null) {
       for (let c = c1; c <= c2; c++)
         if (!(r === r1 && c === c1)) covered.add(`${r}:${c}`);
   }
+  return { spans, covered };
+}
+
+export async function buildGrid(path, definition = null) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(path);
+  const ws = wb.worksheets[0];
+
+  const maxCol = ws.columnCount;
+  const columns = [];
+  for (let c = 1; c <= maxCol; c++) {
+    const w = ws.getColumn(c).width ?? DEFAULT_COL_WIDTH;
+    columns.push({ index: c, width: Math.round(w * PX_PER_CHAR) });
+  }
+
+  const { spans, covered } = mergeMap(ws);
 
   // Rows that carry an actual maintenance task (per the parsed definition),
   // so the left pane can dim rows the current interval does not cover.

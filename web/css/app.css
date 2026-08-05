@@ -193,6 +193,21 @@ a{color:var(--ink)}
 .sheet td.status-cell input:focus-visible{outline:2px solid var(--ink);outline-offset:-2px;
   background:var(--paper);color:var(--ink)}
 
+/* What the technician entered, shown in the cell it will occupy on paper.
+   It has to be tellable apart from the document's own printed text at a
+   glance — but without a new hue and without a fill, both of which this
+   design forbids (monochrome, exactly one accent, and that accent means
+   record state, not "this is typed"). So the separation is typographic:
+   entered values are set in the monospace this design already reserves for
+   codes — which is what these values are, machine IDs and status marks —
+   with a solid rule beneath standing in for the printed blank being filled.
+   Full --ink on --paper, so entered data is never the faintest thing in the
+   cell. Nothing here is interactive: the left pane is a reproduction of a
+   controlled document, and an approved record renders identically. */
+.sheet .entry{font-family:var(--mono);font-size:11.5px;font-weight:600;color:var(--ink);
+  border-bottom:1.5px solid var(--ink);padding-bottom:1px;
+  white-space:pre-wrap;overflow-wrap:anywhere}
+
 /* Out of scope: tint the row, never fade the words. Instruction and Freq stay
    at full reading contrast — a technician must be able to read every line,
    including the tasks this visit does not cover. */

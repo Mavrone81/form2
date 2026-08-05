@@ -1,5 +1,5 @@
 import { api } from './api.js';
-import { renderForm } from './form-view.js';
+import { renderForm, updatePreviewField } from './form-view.js';
 import { renderFields, teardownFieldPanel } from './field-panel.js';
 
 const $ = (s) => document.querySelector(s);
@@ -106,6 +106,9 @@ function adminLinkButton() {
 function collapsePaneLeft() {
   const left = $('#pane-left');
   left.replaceChildren();
+  // The pane's cell map refers to <td>s that have just been detached. Drop it
+  // with them, so a stray live update can never write into an orphaned tree.
+  left.preview = null;
   left.classList.add('is-empty');
   left.closest('.split')?.classList.add('split--list');
 }
@@ -341,7 +344,19 @@ async function paint() {
   // that distinction: null means dim nothing, an empty array means dim every
   // task row, because none of them apply to this visit.
   expandPaneLeft();
-  renderForm($('#pane-left'), form, { grid, inScopeRows: frequency ? spec.inScope : null });
+  // The record's own values go into the sheet, in the cells the server says
+  // they belong in (spec.cellFor / spec.titleCell — see server/cell-map.js).
+  // Without these the left pane is a preview of a BLANK form while everything
+  // typed lives only in the right-hand panel, which is exactly the gap the
+  // end user reported: a machine ID they had entered was nowhere on the
+  // sheet beside them. The machine ID is read from the record's own field
+  // value, falling back to the column saveFields keeps in step with it.
+  const machineId = detail.values.find((v) => v.field_key === 'machine_id')?.value ?? sub.machine_id ?? '';
+  renderForm($('#pane-left'), form, {
+    grid, inScopeRows: frequency ? spec.inScope : null,
+    values: detail.values, cellFor: spec.cellFor, titleCell: spec.titleCell,
+    machineId, signatures: detail.signatures
+  });
 
   const saveError = document.createElement('p');
   saveError.className = 'notice';
@@ -369,7 +384,16 @@ async function paint() {
     // Why the record came back, shown above the fields while it is rejected.
     rejections: detail.rejections,
     state: detail.submission.state,
+    // Typing, mirrored into the sheet with no request at all. Only the one
+    // cell that changed is rewritten — never the whole grid, which on a
+    // 71-row form would mean rebuilding hundreds of cells per keystroke (see
+    // updatePreviewField in form-view.js).
+    onPreview: (key, value) => { updatePreviewField($('#pane-left'), key, value); },
     onChange: async (key, value) => {
+      // Also applied here, not only on `input`: `change` is what fires for a
+      // value committed without typing (autofill, paste-and-blur), and the
+      // preview must not miss those.
+      updatePreviewField($('#pane-left'), key, value);
       try {
         await api.save(submission.id, { [key]: value });
         saveError.textContent = '';

@@ -5,6 +5,7 @@ import { listForms, scanFolder } from './scanner.js';
 import { buildGrid } from './grid-model.js';
 import { parseWorkbook } from './excel-parser.js';
 import { tasksInScope, scopeSummary } from './intervals.js';
+import { cellMapFor } from './cell-map.js';
 import { createSubmission, saveFields, signAndAdvance, rejectSubmission, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
 import { renderRecordPdf } from './pdf-record.js';
 
@@ -120,6 +121,14 @@ export function makeRoutes(db) {
     if (!form) return res.status(404).json({ error: 'Form not found.' });
     const fields = db.prepare('select * from form_fields where form_id=? order by sort_order').all(form.id);
     let tasks = [], frequencies = [];
+    // Where each entered value belongs on the reproduced sheet, so the left
+    // pane can show the record as it will look on paper instead of a blank
+    // form. Derived from the parsed definition, never guessed: a field with
+    // no determinate cell (e.g. every task status on the two forms that have
+    // no Status column) is simply absent, and the client renders only what it
+    // is told. Both default to an empty/absent map so a pdf form, or one that
+    // is not `ready`, still returns a valid payload.
+    let cellFor = {}, titleCell = null;
     if (form.file_type === 'xlsx' && form.state === 'ready') {
       let def;
       try {
@@ -128,10 +137,11 @@ export function makeRoutes(db) {
         return unreadableForm(res, form.id, err);
       }
       tasks = def.tasks; frequencies = def.frequencies;
+      ({ cellFor, titleCell } = cellMapFor(def));
     }
     const selected = String(req.query.frequency ?? '');
     const response = {
-      form, fields, frequencies, tasks,
+      form, fields, frequencies, tasks, cellFor, titleCell,
       inScope: (selected ? tasksInScope(tasks, selected) : tasks).map((t) => t.row),
       summary: selected ? scopeSummary(tasks, selected) : null
     };

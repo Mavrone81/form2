@@ -22,3 +22,44 @@ test('form-view.js sets cell text via textContent and never touches innerHTML, i
   assert.doesNotMatch(src, /\.outerHTML\b/, 'must never use outerHTML on content sourced from spreadsheet files');
   assert.doesNotMatch(src, /document\.write\(/, 'must never use document.write on content sourced from spreadsheet files');
 });
+
+test('renderForm receives the record\'s values and where they belong, not just the blank sheet', () => {
+  // The reported gap: renderForm rendered the BLANK form, so a machine ID or
+  // task status the technician had entered appeared nowhere on the left pane.
+  // It must take the entered values AND the server-computed cell map.
+  const signature = /export function renderForm\(container,\s*form,\s*\{([\s\S]*?)\}\s*=\s*\{\}\s*\)/.exec(src);
+  assert.ok(signature, 'expected renderForm to destructure a named options object');
+  for (const opt of ['grid', 'inScopeRows', 'values', 'cellFor', 'titleCell', 'machineId', 'signatures']) {
+    assert.match(signature[1], new RegExp(`\\b${opt}\\b`), `renderForm must accept \`${opt}\``);
+  }
+});
+
+test('an entered value is written as text, never as markup', () => {
+  // Entered values are as untrusted as the spreadsheet text around them —
+  // both must reach the DOM only through textContent. (The no-unsafe-API
+  // assertions above cover the whole file; this pins the specific path that
+  // places a value into a cell.)
+  const paint = /function paintCell\([\s\S]*?\n\}/.exec(src);
+  assert.ok(paint, 'expected a helper that paints a value into a cell');
+  assert.match(paint[0], /\.textContent\s*=/, 'the cell painter must assign textContent');
+  assert.doesNotMatch(paint[0], /innerHTML|insertAdjacentHTML|outerHTML|document\.write/,
+    'the cell painter must never build markup');
+});
+
+test('a single field update never re-renders the grid', () => {
+  // Typing must not rebuild a 71-row sheet on every keystroke. The live
+  // update path must touch one cell and must not call renderForm.
+  const update = /export function updatePreviewField\([\s\S]*$/.exec(src);
+  assert.ok(update, 'expected an exported single-cell update function');
+  assert.doesNotMatch(update[0], /renderForm\(/, 'the live update must not re-render the whole form');
+  assert.match(update[0], /paintCell\(/, 'the live update must go through the same cell painter');
+});
+
+test('nothing in the left pane is an editable control', () => {
+  // The left pane reproduces a controlled document. It shows values; it never
+  // collects them — which is also what makes an approved (read-only) record
+  // render identically to a draft, with no editable surface at all.
+  assert.doesNotMatch(src, /createElement\(\s*['"](input|textarea|select|button)['"]\s*\)/i,
+    'the left pane must never create an editable control');
+  assert.doesNotMatch(src, /contentEditable/i, 'the left pane must never be contenteditable');
+});

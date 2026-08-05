@@ -1,8 +1,33 @@
 import ExcelJS from 'exceljs';
 import { ORDER } from './intervals.js';
+import { mergeMap } from './grid-model.js';
 
 const txt = (cell) => (cell?.value == null ? '' : String(cell.text ?? cell.value).trim());
 const norm = (s) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+// Comparison key for a printed label: case- and punctuation-insensitive, so
+// the sheet's "Verified By: (Workshop Team Leader)" still matches the
+// definition's own "Verified by (Workshop Team Leader)". Deriving the search
+// term from SIGNATURE_BLOCKS rather than hardcoding a second list means the
+// two can never drift apart.
+const flat = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+// The three sign-off blocks every one of these controlled documents carries.
+// Named once, used both for the definition's `signatures` array and for
+// locating each block's printed signature blank.
+const SIGNATURE_BLOCKS = [
+  { key: 'technician', label: 'Maintenance performed by' },
+  { key: 'team_leader', label: 'Verified by (Workshop Team Leader)' },
+  { key: 'engineer', label: 'Verified by (Workshop Supervisor/Engr)' }
+];
+
+// A printed blank: a cell whose entire content is a run of underscores, i.e.
+// the ruled line the form leaves for someone to write on. That is the only
+// signal in these sheets that is unambiguously "an entry goes HERE", which
+// is why it — and not proximity to a label — decides whether a field has a
+// determinate cell at all. A label cell that merely CONTAINS underscores
+// (the KNS form writes "Maintenance Performed by:   ______" in one cell) is
+// deliberately not a blank: writing into it would erase printed text.
+const isPrintedBlank = (s) => /^_{2,}$/.test(s.replace(/\s+/g, ''));
 
 // Column letter for a 1-based column index: 1 -> A, 27 -> AA.
 function colLetter(n) {
@@ -17,6 +42,63 @@ function findCell(ws, predicate, maxRow = ws.rowCount) {
     for (let c = 1; c <= (row.cellCount || 0); c++) {
       const v = txt(row.getCell(c));
       if (v && predicate(norm(v))) return { row: r, col: c, value: v };
+    }
+  }
+  return null;
+}
+
+// Every cell on `row` at or after `fromCol` whose text is a printed blank and
+// which is not swallowed by a merge. Merge-covered coordinates are excluded
+// because buildGrid never renders them (see mergeMap): a field pointed at one
+// would have nowhere on screen to appear.
+function blanksOnRow(ws, row, fromCol, covered) {
+  const found = [];
+  const r = ws.getRow(row);
+  for (let c = fromCol; c <= (r.cellCount || 0); c++) {
+    if (covered.has(`${row}:${c}`)) continue;
+    if (isPrintedBlank(txt(r.getCell(c)))) found.push({ row, col: c });
+  }
+  return found;
+}
+
+// The cell an entered value belongs in for a labelled field: the first
+// printed blank to the right of the label, on the label's own row. Several
+// cells can match a label prefix (these forms carry both a "Remarks" column
+// header in the parts table and a printed "Remarks:" note lower down), so
+// every candidate anchor is tried and the first that actually has a blank
+// wins. When none does, this returns null and the field is simply omitted —
+// there is no cell on the sheet where that value would land, and inventing
+// one would print a technician's words into a cell the document uses for
+// something else.
+function labelledBlank(ws, prefix, covered) {
+  for (let r = 1; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    for (let c = 1; c <= (row.cellCount || 0); c++) {
+      if (covered.has(`${r}:${c}`)) continue;
+      const v = txt(row.getCell(c));
+      if (!v || !norm(v).startsWith(prefix)) continue;
+      const [blank] = blanksOnRow(ws, r, c + 1, covered);
+      if (blank) return blank;
+    }
+  }
+  return null;
+}
+
+// Where a signature block's signer name goes: the leftmost printed blank on
+// the row BELOW the block's label, which on these forms is the ruled
+// signature line (the blank further right on that same row is the date).
+// A form that prints its signature line inside the label cell itself has no
+// separate blank on the next row, so this returns null and that block is
+// omitted rather than having the name written over the date.
+function signatureBlank(ws, label, covered) {
+  const want = flat(label);
+  for (let r = 1; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    for (let c = 1; c <= (row.cellCount || 0); c++) {
+      if (covered.has(`${r}:${c}`)) continue;
+      const v = txt(row.getCell(c));
+      if (!v || !flat(v).startsWith(want)) continue;
+      return blanksOnRow(ws, r + 1, 1, covered)[0] ?? null;
     }
   }
   return null;
@@ -119,6 +201,20 @@ export async function parseWorkbook(path) {
 
   const freqs = ORDER.filter((f) => tasks.some((t) => t.freq === f));
 
+  // Where an entered value belongs on the sheet. Each entry is either an
+  // exact (row, col) the grid genuinely renders, or null — never a guess.
+  // The client writes values only into the cells named here, so a null is a
+  // field that stays in the right-hand panel and off the preview.
+  const { covered } = mergeMap(ws);
+  const cells = {
+    title: titleAnchor ? { row: titleAnchor.row + 1, col: titleAnchor.col } : null,
+    special_tools: labelledBlank(ws, 'special tool', covered),
+    remarks: labelledBlank(ws, 'remark', covered),
+    signatures: Object.fromEntries(
+      SIGNATURE_BLOCKS.map((s) => [s.key, signatureBlank(ws, s.label, covered)])
+    )
+  };
+
   return {
     title: below(titleAnchor),
     docNumber: below(numAnchor),
@@ -127,6 +223,7 @@ export async function parseWorkbook(path) {
     frequencies: freqs,
     statusColumn: header.status ? colLetter(header.status) : null,
     tasks,
+    cells,
     partsRows,
     sections: {
       safety: sectionText('safety'),
@@ -134,10 +231,6 @@ export async function parseWorkbook(path) {
       ppe,
       remarks: sectionText('remarks')
     },
-    signatures: [
-      { key: 'technician', label: 'Maintenance performed by' },
-      { key: 'team_leader', label: 'Verified by (Workshop Team Leader)' },
-      { key: 'engineer', label: 'Verified by (Workshop Supervisor/Engr)' }
-    ]
+    signatures: SIGNATURE_BLOCKS.map((s) => ({ ...s }))
   };
 }
