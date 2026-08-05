@@ -12,7 +12,7 @@
 
 - Node >= 20. Declare `"engines": {"node": ">=20"}` and `"type": "module"` in `package.json`.
 - Exactly four runtime dependencies: `express`, `express-session`, `better-sqlite3`, `exceljs`. Do not add others. PDFs are rendered by the browser; no PDF library.
-- Tests use the built-in `node:test` runner and `node:assert/strict`. No test framework dependency.
+- Tests use the built-in `node:test` runner and `node:assert/strict`. No test framework dependency. The test script is `node --test` with **no path argument** — Node 22 discovers `*.test.js` recursively and excludes `node_modules`. Do not use `node --test test/` (errors on Node 22) or `node --test test/*.test.js` (a shell glob that silently skips `test/helpers/`).
 - Source form files are **read-only**. Never write to, move, or rename anything in the forms folder.
 - Never commit form files or anything derived from their content. `.gitignore` already covers `*.xlsx`, `*.xls`, `*.pdf`, `Sample of Forms/`, `docs/design/`.
 - Interval order is `1M < 3M < 6M < Y` and scope is **cumulative**: selecting an interval includes every shorter one.
@@ -65,7 +65,7 @@ Expected: FAIL — no `package.json` / cannot find module.
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dependencies": {
     "better-sqlite3": "^11.5.0",
@@ -2371,6 +2371,718 @@ Expected: all tests pass.
 ```bash
 git add web/admin.html web/js/admin.js
 git commit -m "Add admin screens for folder, users and PDF field mapping"
+```
+
+---
+
+### Task 16: Docker Compose deployment
+
+Package the app so deployment is `docker compose up`. Two volumes: the forms folder mounted **read-only**, and a named volume for the database. The read-only mount makes the spec's "source form files are never modified" guarantee structural rather than conventional.
+
+**Files:**
+- Create: `Dockerfile`
+- Create: `compose.yaml`
+- Create: `.dockerignore`
+- Create: `.env.example`
+- Modify: `server/index.js` (read `PORT`, `SESSION_SECRET`, `FORMS_DIR`, `DB_PATH` from env)
+- Modify: `README.md` (deployment section)
+- Test: `test/config.test.js`
+
+**Interfaces:**
+- Consumes: `createApp({db})`, `openDb(path)`, `seedDemoUsers(db)`.
+- Produces: `resolveConfig(env) -> {port, dbPath, formsDir, sessionSecret}` exported from `server/config.js`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/config.test.js`:
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { resolveConfig } from '../server/config.js';
+
+test('defaults suit local development', () => {
+  const c = resolveConfig({});
+  assert.equal(c.port, 3000);
+  assert.equal(c.dbPath, 'data/pm.sqlite');
+  assert.equal(c.formsDir, '');
+  assert.ok(c.sessionSecret.length >= 32, 'a secret is generated when unset');
+});
+
+test('environment overrides every default', () => {
+  const c = resolveConfig({ PORT: '8080', DB_PATH: '/data/pm.sqlite', FORMS_DIR: '/forms', SESSION_SECRET: 'x'.repeat(40) });
+  assert.equal(c.port, 8080);
+  assert.equal(c.dbPath, '/data/pm.sqlite');
+  assert.equal(c.formsDir, '/forms');
+  assert.equal(c.sessionSecret, 'x'.repeat(40));
+});
+
+test('a short SESSION_SECRET is rejected rather than silently accepted', () => {
+  // A weak secret lets an attacker forge a session cookie and sign a QA
+  // record as someone else. Fail loudly at boot instead.
+  assert.throws(() => resolveConfig({ SESSION_SECRET: 'short' }), /SESSION_SECRET/);
+});
+
+test('generated secrets differ between boots', () => {
+  assert.notEqual(resolveConfig({}).sessionSecret, resolveConfig({}).sessionSecret);
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `node --test test/config.test.js`
+Expected: FAIL — cannot find module `../server/config.js`.
+
+- [ ] **Step 3: Write the config module**
+
+`server/config.js`:
+```js
+import { randomBytes } from 'node:crypto';
+
+const MIN_SECRET = 32;
+
+export function resolveConfig(env = process.env) {
+  const secret = env.SESSION_SECRET ?? '';
+  if (secret && secret.length < MIN_SECRET)
+    throw new Error(`SESSION_SECRET must be at least ${MIN_SECRET} characters.`);
+  return {
+    port: Number(env.PORT ?? 3000),
+    dbPath: env.DB_PATH ?? 'data/pm.sqlite',
+    formsDir: env.FORMS_DIR ?? '',
+    // Unset means a fresh secret each boot: sessions do not survive a restart,
+    // which is acceptable locally but wrong for a deployment. compose.yaml sets it.
+    sessionSecret: secret || randomBytes(32).toString('hex')
+  };
+}
+```
+
+Then modify `server/index.js` to use it: `createApp({ db, sessionSecret })` passes the secret into `express-session`, and the boot block uses `resolveConfig()` for port and db path. If `formsDir` is set and the `forms_folder` setting is empty, write it into `settings` and run an initial scan at boot — so a container comes up already pointing at its mounted folder.
+
+- [ ] **Step 4: Write the Dockerfile**
+
+`Dockerfile`:
+```dockerfile
+FROM node:22-bookworm-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+# better-sqlite3 ships prebuilt binaries; python3/make/g++ are the fallback
+# if a prebuild is unavailable for this platform.
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
+ && npm ci --omit=dev \
+ && apt-get purge -y python3 make g++ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
+
+FROM node:22-bookworm-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY server ./server
+COPY web ./web
+# The database lives on a volume; the app must own the mount point.
+RUN mkdir -p /data && chown -R node:node /data /app
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT??3000)+'/api/me').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["node", "server/index.js"]
+```
+
+- [ ] **Step 5: Write compose.yaml and .dockerignore**
+
+`compose.yaml`:
+```yaml
+services:
+  app:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      DB_PATH: /data/pm.sqlite
+      FORMS_DIR: /forms
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env — see .env.example}
+    volumes:
+      # Forms are mounted READ-ONLY. The app must never modify a source form,
+      # and :ro makes that structural rather than a convention.
+      - ${FORMS_HOST_DIR:?set FORMS_HOST_DIR in .env}:/forms:ro
+      - pm-data:/data
+    restart: unless-stopped
+
+volumes:
+  pm-data:
+```
+
+`.dockerignore`:
+```
+node_modules
+npm-debug.log*
+.git
+.gitignore
+.superpowers
+data
+docs
+test
+scripts
+*.xlsx
+*.xls
+*.pdf
+Sample of Forms
+.env
+.DS_Store
+```
+
+`.env.example`:
+```bash
+# Absolute path on the host to the folder holding the form files.
+# Mounted read-only into the container at /forms.
+FORMS_HOST_DIR=/absolute/path/to/your/forms
+
+# Required. Generate with: openssl rand -hex 32
+# Without a stable value every restart invalidates all sessions.
+SESSION_SECRET=
+
+# Host port to publish. Optional, defaults to 3000.
+PORT=3000
+```
+
+Note `.env` is already git-ignored. `.env.example` is committed; `.env` never is.
+
+- [ ] **Step 6: Verify the build and run**
+
+```bash
+cp .env.example .env
+# edit .env: set FORMS_HOST_DIR to the real forms folder, and
+# SESSION_SECRET=$(openssl rand -hex 32)
+docker compose build
+docker compose up -d
+sleep 5
+curl -fsS localhost:3000/api/me
+docker compose ps        # expect healthy
+```
+Expected: `/api/me` returns `null` (signed out), and the container reports healthy. Sign in as `admin` and confirm the forms folder is already populated from `/forms` without manual configuration.
+
+Then confirm the read-only mount actually holds:
+```bash
+docker compose exec app sh -c 'touch /forms/should-fail 2>&1 || echo "read-only confirmed"'
+```
+Expected: "read-only confirmed".
+
+- [ ] **Step 7: Run the suite and commit**
+
+Run: `npm test`
+Expected: all tests pass, including the four new config tests.
+
+```bash
+git add Dockerfile compose.yaml .dockerignore .env.example server/config.js server/index.js test/config.test.js README.md
+git commit -m "Add Docker Compose deployment"
+```
+
+---
+
+### Task 17: PDF/A-2u record generation
+
+Render a completed record as an archival PDF. **Verified by spike before planning** (PDFKit 0.19.1): `subset: 'PDF/A-2'` alone produces conformance **B** with no embedded font and no `ToUnicode`. Registering a real TTF yields `FontFile2` and `ToUnicode`. The conformance letter and the ICC OutputIntent must be supplied explicitly.
+
+**Files:**
+- Create: `server/pdf-record.js`
+- Create: `assets/fonts/DejaVuSans.ttf`, `assets/fonts/DejaVuSans-Bold.ttf` (vendored — a container has no system fonts)
+- Create: `assets/sRGB.icc`
+- Create: `test/pdf-record.test.js`
+- Modify: `package.json` (add `pdfkit`)
+
+**Interfaces:**
+- Consumes: `buildGrid`, `parseWorkbook`, the submission record and its signatures.
+- Produces: `renderRecordPdf({form, submission, snapshot, values, signatures, grid}) -> Promise<Buffer>`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/pdf-record.test.js`:
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { renderRecordPdf } from '../server/pdf-record.js';
+
+const FIXTURE = {
+  form: { file_name: 'x.xlsx', title: 'Sample Record', doc_number: 'DOC 001', revision: 'A', file_type: 'xlsx' },
+  submission: { id: 1, machine_id: 'AA01', frequency: 'Y', state: 'approved', created_at: '2026-08-01T00:00:00Z' },
+  snapshot: [
+    { field_key: 'machine_id', label: 'Machine ID', section: 'Record', kind: 'text' },
+    { field_key: 'task_28', label: 'Check the widget', section: 'Tasks', kind: 'text' }
+  ],
+  values: [{ field_key: 'machine_id', value: 'AA01' }, { field_key: 'task_28', value: 'OK' }],
+  signatures: [{ stage: 'technician', full_name: 'A Person', image_png: null, signed_at: '2026-08-02T09:00:00Z' }],
+  grid: { columns: [{ index: 1, width: 60 }], rows: [{ index: 1, height: 15, cells: [
+    { col: 1, span: { rows: 1, cols: 1 }, text: 'Header', bold: true, align: 'left',
+      borders: { t: true, r: true, b: true, l: true } }] }] }
+};
+
+test('produces a PDF carrying every PDF/A-2u structure', async () => {
+  const buf = await renderRecordPdf(FIXTURE);
+  const s = buf.toString('latin1');
+  assert.match(s.slice(0, 9), /^%PDF-1\.7/);
+  assert.ok(s.includes('FontFile2'), 'font must be embedded');
+  assert.ok(s.includes('ToUnicode'), 'text must carry a Unicode map — this is what the "u" means');
+  assert.ok(s.includes('ICCBased'), 'OutputIntent needs a real ICC profile stream');
+  assert.ok(s.includes('OutputIntent'), 'PDF/A requires an OutputIntent');
+  assert.match(s, /pdfaid:part[^0-9]*2/, 'must declare part 2');
+  assert.match(s, /pdfaid:conformance[^A-Z]*U/, 'must declare conformance U, not the PDFKit default B');
+  assert.ok(!s.includes('/Encrypt'), 'PDF/A forbids encryption');
+});
+
+test('embeds a signature image when present', async () => {
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const buf = await renderRecordPdf({ ...FIXTURE,
+    signatures: [{ stage: 'technician', full_name: 'A Person', image_png: png, signed_at: '2026-08-02T09:00:00Z' }] });
+  assert.ok(buf.toString('latin1').includes('/Image'), 'signature image should be drawn');
+});
+
+test('a malformed signature image does not abort the record', async () => {
+  // A record must still be producible even if one signature blob is corrupt.
+  const buf = await renderRecordPdf({ ...FIXTURE,
+    signatures: [{ stage: 'technician', full_name: 'A Person', image_png: 'data:image/png;base64,NOTVALID', signed_at: 'x' }] });
+  assert.ok(buf.length > 1000);
+});
+
+// Real conformance is a claim an archive will reject if wrong. Validate it for
+// real where veraPDF is available, and skip cleanly where it is not.
+const hasVera = (() => {
+  try { execFileSync('verapdf', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
+})();
+
+test('veraPDF confirms PDF/A-2U conformance', { skip: hasVera ? false : 'veraPDF not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdfa-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    writeFileSync(file, await renderRecordPdf(FIXTURE));
+    const out = execFileSync('verapdf', ['-f', '2u', '--format', 'text', file], { encoding: 'utf8' });
+    assert.match(out, /PASS/, `veraPDF reported: ${out}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `node --test test/pdf-record.test.js`
+Expected: FAIL — cannot find module `../server/pdf-record.js`.
+
+- [ ] **Step 3: Vendor the font and colour profile**
+
+Fonts must be vendored: a container has no system fonts, and PDF/A requires embedding. Use DejaVu Sans (public-domain-equivalent licence, broad Unicode coverage). Place `DejaVuSans.ttf` and `DejaVuSans-Bold.ttf` in `assets/fonts/`, and an sRGB IEC61966-2.1 ICC profile at `assets/sRGB.icc`.
+
+`.gitignore` blocks `*.pdf` but not `.ttf`/`.icc`; these are program assets, not form content, and are committed deliberately. Confirm with `git status --short` that they stage.
+
+- [ ] **Step 4: Write the generator**
+
+`server/pdf-record.js`:
+```js
+import PDFDocument from 'pdfkit';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const asset = (p) => fileURLToPath(new URL(`../assets/${p}`, import.meta.url));
+const REGULAR = asset('fonts/DejaVuSans.ttf');
+const BOLD = asset('fonts/DejaVuSans-Bold.ttf');
+const ICC = asset('sRGB.icc');
+
+export async function renderRecordPdf({ form, submission, snapshot, values, signatures, grid }) {
+  const doc = new PDFDocument({
+    pdfVersion: '1.7', subset: 'PDF/A-2', tagged: true, lang: 'en-GB',
+    size: 'A4', margin: 28,
+    info: {
+      Title: `${form.title || form.file_name} — ${submission.machine_id}`,
+      Author: 'Preventive maintenance records',
+      Subject: `${form.doc_number} rev ${form.revision}`,
+      CreationDate: new Date(submission.created_at)
+    }
+  });
+  doc.registerFont('body', REGULAR);
+  doc.registerFont('bold', BOLD);
+  doc.font('body');
+
+  // PDFKit hardcodes conformance B and does not embed an ICC profile. Both are
+  // required for 2u, so patch the XMP and attach the OutputIntent explicitly.
+  forcePdfA2u(doc);
+  attachOutputIntent(doc, readFileSync(ICC));
+
+  drawHeader(doc, form, submission);
+  drawGrid(doc, grid);
+  drawValues(doc, snapshot, values);
+  drawSignatures(doc, signatures);
+
+  doc.end();
+  return await streamToBuffer(doc);
+}
+```
+
+Implement the helpers:
+- `forcePdfA2u(doc)` — replace `pdfaid:conformance` `B` with `U` in the XMP packet PDFKit emits. The spike confirmed PDFKit writes `B` unconditionally.
+- `attachOutputIntent(doc, iccBuffer)` — add an `/OutputIntent` with an `ICCBased` stream (`/N 3` for sRGB), referenced from the catalog.
+- `drawGrid` — walk `grid.rows`/`grid.cells`, honouring `span`, `borders`, `bold`, `align` and `columns[].width`, scaled to the page width. This is what reproduces the form's layout.
+- `drawSignatures` — draw each signature's PNG (strip the `data:image/png;base64,` prefix) with the signer's name and server timestamp beneath. Wrap each in try/catch so one corrupt blob cannot abort the record.
+- `streamToBuffer(doc)` — collect `data` events into a Buffer, resolve on `end`.
+
+- [ ] **Step 5: Run tests**
+
+Run: `node --test test/pdf-record.test.js`
+Expected: PASS. The veraPDF test skips unless veraPDF is installed.
+
+To validate conformance for real (recommended once before shipping):
+```bash
+brew install verapdf     # or download from verapdf.org
+npm test                 # the conformance test now runs instead of skipping
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add server/pdf-record.js assets/ test/pdf-record.test.js package.json package-lock.json
+git commit -m "Add PDF/A-2u record generation"
+```
+
+---
+
+### Task 18: Preview and download
+
+Team leader and engineer can preview the record as a PDF once they have signed; the engineer can download it after approving.
+
+**Files:**
+- Modify: `server/routes.js`
+- Modify: `web/js/app.js`, `web/css/app.css`
+- Test: `test/pdf-routes.test.js`
+
+**Interfaces:**
+- `GET /api/submissions/:id/pdf` — inline preview (`Content-Disposition: inline`)
+- `GET /api/submissions/:id/pdf?download=1` — attachment, filename `<machine_id>.pdf`
+
+Access rules, enforced server-side:
+
+| Role | Before they sign | After they sign |
+|---|---|---|
+| technician | ✗ 403 | ✗ 403 |
+| team_leader | ✗ 403 | ✓ preview |
+| engineer | ✗ 403 | ✓ preview + download |
+| admin | ✓ preview | ✓ preview |
+
+- [ ] **Step 1: Write the failing test**
+
+`test/pdf-routes.test.js` — using the same in-process server pattern as `test/api.test.js`:
+```js
+test('a team leader cannot preview before signing, and can after', async () => { /* … */ });
+test('a technician is refused the pdf in every state', async () => { /* … */ });
+test('download sets an attachment filename from the machine id', async () => { /* … */ });
+test('an unknown submission returns 404, not a stack trace', async () => { /* … */ });
+```
+Assert real status codes and the `content-disposition` header; assert the body starts with `%PDF`.
+
+- [ ] **Step 2: Run to verify it fails, then implement the route**
+
+```js
+r.get('/submissions/:id/pdf', signedIn, async (req, res) => {
+  const sub = db.prepare('select * from submissions where id=?').get(req.params.id);
+  if (!sub) return res.status(404).json({ error: 'Record not found.' });
+  const user = req.session.user;
+  const signed = db.prepare('select stage from signatures where submission_id=?').all(sub.id).map((s) => s.stage);
+  const allowed = user.role === 'admin'
+    || ((user.role === 'team_leader' || user.role === 'engineer') && signed.includes(user.role));
+  if (!allowed) return res.status(403).json({ error: 'Available once you have signed this record.' });
+  // …build inputs, call renderRecordPdf, set headers, send buffer
+});
+```
+
+- [ ] **Step 3: Add the UI**
+
+A "Preview PDF" button in the right pane, shown only when the signed-in user's stage signature exists. It opens the inline URL. For the engineer on an approved record, also show "Download for archive", pointing at `?download=1`.
+
+- [ ] **Step 4: Run the suite and commit**
+
+---
+
+### Task 20: Queue view — the missing entry point
+
+Found by auditing all 19 API endpoints against planned UI. `GET /api/submissions` returns the queue for the signed-in role, and `api.queue()` exists in the client, but **nothing renders it**. Task 14 builds only a form picker, which is the technician's "start something new" path.
+
+Without this, a team leader signs in, sees a list of blank forms, and has no way to open the record awaiting their signature. The three-stage workflow is reachable in the API and unreachable in the UI for stages 2 and 3 — the app cannot actually complete a sign-off.
+
+Build to approved Direction A: monochrome, grid-forward, codes in monospace, one accent for state.
+
+**Files:**
+- Create: `web/js/queue-view.js`
+- Modify: `web/js/app.js` (route to the queue on sign-in), `web/css/app.css`
+
+**Interfaces:**
+- Consumes: `api.queue()`, `api.forms()`, `api.submission(id)`.
+- Produces: `renderQueue(container, {submissions, forms, user, onOpen, onNew}) -> void`.
+
+Per role, the queue is what that person is expected to act on:
+
+| Role | Sees | Primary action |
+|---|---|---|
+| technician | own records, any state | "Start a new record" → form picker |
+| team_leader | records at `pending_lead` | open and sign |
+| engineer | records at `pending_engineer` | open and approve |
+| admin | everything | open (read-only) |
+
+- [ ] **Step 1: Write the failing test**
+
+`test/queue-view.static.test.js` — a static guard, labelled as such:
+```js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+// Static guards. These check the source's shape, not its runtime behaviour —
+// there is no DOM here. Real behaviour is verified in the browser in Task 19.
+const src = readFileSync(new URL('../web/js/queue-view.js', import.meta.url), 'utf8');
+
+test('queue view never interprets record text as markup', () => {
+  for (const bad of ['innerHTML', 'insertAdjacentHTML', 'outerHTML', 'document.write']) {
+    assert.ok(!src.includes(bad), `${bad} must not appear`);
+  }
+});
+
+test('queue view renders an empty state rather than a blank pane', () => {
+  assert.match(src, /empty|nothing|no records/i);
+});
+
+test('app routes to the queue after sign-in', () => {
+  const app = readFileSync(new URL('../web/js/app.js', import.meta.url), 'utf8');
+  assert.match(app, /renderQueue/);
+});
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `node --test test/queue-view.static.test.js`
+Expected: FAIL — cannot find `web/js/queue-view.js`.
+
+- [ ] **Step 3: Build the queue**
+
+`web/js/queue-view.js` renders one row per submission: machine ID, form title, document number and revision in monospace, the interval code, who it is with, when it last moved, and a state chip using the same `#control-strip .state` colours (red unapproved, green approved). Clicking a row calls `onOpen(submission.id)`.
+
+Use `textContent` throughout. Reuse `.sec`, `.sheet` and the tokens; add rules only where genuinely needed, and set `color` on any control.
+
+**Empty state matters.** A team leader with nothing pending must see a plain sentence — "Nothing is waiting for you." — not an empty pane they mistake for a loading failure. A technician with no records sees an invitation to start one.
+
+For a technician, show "Start a new record" leading to the existing form picker. Do not show that button to a team leader or engineer: they never create records.
+
+- [ ] **Step 4: Route sign-in to the queue**
+
+In `web/js/app.js`, after `boot()` establishes the user, render the queue rather than the form picker. The form picker becomes what "Start a new record" opens, for technicians only.
+
+- [ ] **Step 5: Verify every role can complete the chain**
+
+Run the app. As `tech`, create and submit a record. Sign out. As `lead`, confirm it appears in the queue, open it, sign, submit. As `eng`, confirm it appears, open, approve. This is the first time the full chain is walkable in a browser rather than over HTTP.
+
+- [ ] **Step 6: Run the suite and commit**
+
+```bash
+git add web/js/queue-view.js web/js/app.js web/css/app.css test/queue-view.static.test.js
+git commit -m "Add queue view so team leaders and engineers can reach their records"
+```
+
+---
+
+### Task 19: Visual design pass
+
+Direction **A — Document control** was reviewed and approved by the user on 2026-08-04, after the contrast defect in the mockup was fixed. Monochrome, grid-forward, codes set as codes; one accent carries record state.
+
+Tasks 11–15 build the UI with the right tokens and structure, but nothing yet checks whether the running app actually *looks* like approved Direction A. This task closes that gap against the real app with real data.
+
+Run after Task 15, when the app is clickable end to end. This is the only task that requires a real browser.
+
+**Files:**
+- Modify: `web/css/app.css`, and the `web/js/*` render functions where markup changes are needed
+- Reference (read-only): `docs/design/directions.html` — Direction A, git-ignored because it renders real form content
+
+**Interfaces:** no API changes. Presentation only. If a change would alter behaviour, it belongs in another task.
+
+- [ ] **Step 1: Capture the current state**
+
+Start the app, sign in as each role, and screenshot every screen with a real form loaded — pick one with a long task table (18 rows) and one short (4 rows), since density is where layouts break:
+
+1. Login
+2. Form picker
+3. Technician fill view — left pane form, right pane fields
+4. The same view with an interval selected, showing out-of-scope rows tinted
+5. Team leader review — technician's entries read-only, their signature visible
+6. Engineer view of an approved record — state chip green, everything locked
+7. Admin: folder settings, user list, PDF field mapper
+
+- [ ] **Step 2: Compare against the mockup**
+
+Open `docs/design/directions.html` (Direction A) beside the screenshots. For each screen, list concrete differences under: type scale and weight, spacing rhythm, table density and row height, the control strip, the state chip, borders and rules, alignment of the two panes.
+
+Write the list into the report before changing anything — a written list prevents an unfocused tweak-until-it-feels-right pass.
+
+- [ ] **Step 3: Close the gaps**
+
+Fix the listed differences. Constraints that still bind:
+- Monochrome plus exactly one accent carrying record state. No new hues.
+- Every control declares its own `color`; light panels declare `color-scheme: light`.
+- Instruction and frequency text is never faded — out-of-scope rows are de-emphasised by background tint only.
+- Codes (document numbers, revisions, `1M`/`3M`/`6M`/`Y`) stay monospace.
+- Reuse tokens; add a token rather than a bare hex.
+- The css-contract tests must still pass, unweakened.
+
+- [ ] **Step 4: Verify the signature pad for real**
+
+Task 13 was implemented and reviewed without a browser, and it is where the worst defect in this build lived. In the real browser:
+- Draw a signature with the mouse. Confirm strokes are smooth and continuous.
+- Resize the window mid-signature, and resize rapidly several times. **The signature must survive.** This is the regression check for the fixed race.
+- Click Clear; confirm the pad empties and Submit then reports "Sign before submitting."
+- Sign, submit, and confirm the stored signature renders correctly for the next role.
+
+- [ ] **Step 5: Re-screenshot and present**
+
+Capture the same screens again and present before/after to the user. Note anything deliberately left alone and why.
+
+- [ ] **Step 6: Run the suite and commit**
+
+Run: `npm test` — all tests pass, css-contract tests unweakened.
+
+```bash
+git add web/
+git commit -m "Visual design pass against the approved direction"
+```
+
+---
+
+### Task 21: Continuous integration
+
+GitHub Actions, so pushes and pull requests are checked automatically.
+
+Two facts about this project shape the design, and ignoring either produces CI that lies:
+
+1. **The form files are not in the repo.** They are commercially sensitive and git-ignored, as is the generated `test/fixtures.local.json`. So the fixture-dependent tests — the ones that parse all 12 real forms — will SKIP on CI. That is correct and by design, but a green tick must not be read as "everything was tested". CI has to report the skip count prominently.
+2. **The repo's central constraint is that form content never gets committed.** That deserves an automated gate, not just discipline. A human will eventually run `git add -A` and CI should catch it. (I did exactly that once during this build.)
+
+**Files:**
+- Create: `.github/workflows/ci.yml`
+- Create: `scripts/check-no-sensitive-files.sh`
+- Modify: `package.json` (add a `check:sensitive` script)
+- Modify: `README.md` (CI section explaining what CI does and does not cover)
+
+- [ ] **Step 1: Write the sensitive-file guard**
+
+`scripts/check-no-sensitive-files.sh` — fails if anything matching a form-content pattern is TRACKED by git. It checks the index, not the working tree, so local ignored files are fine.
+
+```bash
+#!/usr/bin/env bash
+# Fails if any form content is tracked by git. The source forms and completed
+# records are commercially sensitive and must never enter the repository.
+set -euo pipefail
+
+PATTERNS='\.(xlsx|xls|pdf)$|^Sample of Forms/|^PM Document 2026/|^test/fixtures\.local\.json$|\.sqlite$|\.db$|^data/'
+
+tracked=$(git ls-files | grep -E "$PATTERNS" || true)
+
+if [ -n "$tracked" ]; then
+  echo "Sensitive files are tracked by git:"
+  echo "$tracked" | sed 's/^/  /'
+  echo
+  echo "These must never be committed. Remove them with:"
+  echo "  git rm --cached <file>"
+  echo "and confirm .gitignore covers them."
+  exit 1
+fi
+
+echo "No sensitive files tracked."
+```
+
+Make it executable (`chmod +x`) and add to `package.json`:
+```json
+"check:sensitive": "bash scripts/check-no-sensitive-files.sh"
+```
+
+- [ ] **Step 2: Verify the guard actually catches something**
+
+A guard that has never failed is not known to work.
+
+```bash
+npm run check:sensitive              # expect: "No sensitive files tracked."
+touch decoy.xlsx && git add -f decoy.xlsx
+npm run check:sensitive              # expect: FAILS, naming decoy.xlsx
+git rm -q --cached decoy.xlsx && rm decoy.xlsx
+npm run check:sensitive              # expect: passes again
+```
+Record all three outputs in the report. Do not commit the decoy.
+
+- [ ] **Step 3: Write the workflow**
+
+`.github/workflows/ci.yml`:
+```yaml
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Guard against committed form content
+        run: npm run check:sensitive
+      - name: Run tests
+        run: npm test 2>&1 | tee test-output.txt
+      - name: Report skipped tests
+        # The source forms are sensitive and absent from CI, so the tests that
+        # parse them skip. A green run therefore covers less than a local run.
+        # Surface that rather than letting the tick imply full coverage.
+        if: always()
+        run: |
+          skipped=$(grep -E '^# skipped' test-output.txt | awk '{print $3}')
+          echo "### Test summary" >> $GITHUB_STEP_SUMMARY
+          grep -E '^# (tests|pass|fail|skipped)' test-output.txt >> $GITHUB_STEP_SUMMARY
+          if [ "${skipped:-0}" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**$skipped test(s) skipped** — the sample form files are not in this repository, so form-parsing tests cannot run here. Run \`npm test\` locally with the forms present for full coverage." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t pm-forms:ci .
+      - name: Container starts and answers
+        run: |
+          docker run -d --name pm -e SESSION_SECRET=$(openssl rand -hex 32) -p 3000:3000 pm-forms:ci
+          for i in $(seq 1 30); do
+            curl -fsS localhost:3000/api/me && break || sleep 1
+          done
+          curl -fsS localhost:3000/api/me
+          docker rm -f pm
+```
+
+The `docker` job depends on Task 16's `Dockerfile`. If Task 16 has not landed when you implement this, still write the job but note it in your report; do not delete it.
+
+- [ ] **Step 4: Validate the workflow file**
+
+There is no YAML linter dependency in this project and you may not add one. Instead verify the file parses using Node's built-in capabilities or a simple structural check, and confirm the job/step names and indentation are consistent. State in your report how you validated it.
+
+- [ ] **Step 5: Document honestly in the README**
+
+Add a CI section stating plainly: CI runs the full suite minus the form-parsing tests, which skip because the sample forms are sensitive and excluded from the repository; full coverage requires running locally with the forms present and `scripts/build-fixtures.js` run.
+
+- [ ] **Step 6: Run everything and commit**
+
+```bash
+npm run check:sensitive
+npm test
+git add .github/ scripts/check-no-sensitive-files.sh package.json README.md
+git commit -m "Add CI with a guard against committing form content"
 ```
 
 ---

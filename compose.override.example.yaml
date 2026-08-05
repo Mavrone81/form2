@@ -1,0 +1,14 @@
+# Copy to compose.override.yaml on any host where a reverse proxy sits in front.
+#
+# compose.yaml publishes ${PORT:-30000}:3000, which binds ALL interfaces. On a
+# shared host that exposes the app directly on its public IP, bypassing the
+# proxy and anything in front of it. This override restricts the published port
+# to loopback so the proxy is the only route in.
+#
+# Verify after starting — the second command is the one that matters:
+#   docker ps --filter name=app --format '{{.Ports}}'    # 127.0.0.1:30000->3000/tcp
+#   curl --max-time 6 http://<public-ip>:30000/api/me    # connection refused
+services:
+  app:
+    ports: !override
+      - "127.0.0.1:30000:3000"

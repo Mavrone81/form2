@@ -18,6 +18,7 @@ node_modules/
 npm-debug.log*
 .env
 .env.*
+!.env.example
 
 # macOS
 .DS_Store
@@ -25,3 +26,12 @@ npm-debug.log*
 # Design mockups render real form content (task text, doc numbers) for
 # fidelity. That content is sensitive, so mockups stay local.
 docs/design/
+
+# Generated from the sensitive forms folder
+test/fixtures.local.json
+
+# Completed/signed PM records (the expected output format). Sensitive.
+PM Document 2026/
+
+# Host-specific compose override; only the .example is committed
+compose.override.yaml

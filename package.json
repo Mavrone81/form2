@@ -1,0 +1,21 @@
+{
+  "name": "pm-forms",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test",
+    "check:sensitive": "bash scripts/check-no-sensitive-files.sh"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.1",
+    "express-session": "^1.18.1",
+    "pdfkit": "^0.19.1"
+  }
+}
