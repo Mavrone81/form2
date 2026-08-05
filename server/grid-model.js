@@ -1,5 +1,26 @@
 import ExcelJS from 'exceljs';
 
+// Every row that emits anything accounts for EVERY one of its columns: the
+// emitted cells' `col` plus `span.cols`, together with the columns a cell in
+// an earlier row spans down into, tile 1..columns.length with no hole and no
+// overlap. A consumer can therefore append one element per cell, in order,
+// and land each one in its true column — which is exactly what the browser
+// does with <td>, where cells pack from the left. Without that guarantee a
+// row whose leading columns are blank slides left and stops lining up with
+// the row above it, so the preview and the printed sheet disagree.
+//
+// The columns a sheet leaves genuinely blank are filled by placeholder cells
+// carrying `filler: true`. That flag is the difference between "nothing is
+// here" and "an empty bordered box the form intends someone to write in" —
+// the latter is a real cell and is never flagged. A placeholder carries no
+// text, no bold, no borders and never spans. Real cells do not carry the
+// flag at all, so test it as `cell.filler === true`.
+//
+// Two things deliberately emit nothing. A cell a merge covers is left out —
+// its anchor carries the span, and re-emitting it would both duplicate the
+// column and (a past defect) blank the anchor's content. And a row with no
+// real cell at all emits no cells, keeping blank spacer rows out of the
+// render and the document's vertical rhythm intact.
 const DEFAULT_COL_WIDTH = 8.43;
 const PX_PER_CHAR = 7.5;
 
@@ -47,17 +68,39 @@ export async function buildGrid(path, definition = null) {
   const taskRows = new Set((definition?.tasks ?? []).map((t) => t.row));
 
   const side = (b) => (b?.style ? true : false);
+  const filler = (c) => ({
+    col: c,
+    span: { rows: 1, cols: 1 },
+    text: '',
+    bold: false,
+    align: 'left',
+    borders: { t: false, r: false, b: false, l: false },
+    filler: true
+  });
+
   const rows = [];
   for (let r = 1; r <= ws.rowCount; r++) {
     const row = ws.getRow(r);
     const cells = [];
+    let hasReal = false;
     for (let c = 1; c <= maxCol; c++) {
+      // Covered by a merge: the anchor's span already accounts for this
+      // column, in this row and in every row the merge reaches down into.
+      // Nothing may be emitted here, placeholder included.
       if (covered.has(`${r}:${c}`)) continue;
       const cell = row.getCell(c);
       const text = cell.value == null ? '' : String(cell.text ?? cell.value).trim();
       const b = cell.border ?? {};
       const hasBorder = side(b.top) || side(b.right) || side(b.bottom) || side(b.left);
-      if (!text && !hasBorder && !spans.has(`${r}:${c}`)) continue;
+      if (!text && !hasBorder && !spans.has(`${r}:${c}`)) {
+        // Blank, unbordered, unmerged: hold the column open so everything to
+        // its right keeps its place. One placeholder per column, never a run
+        // collapsed under a span, so that every column of the row is
+        // addressable by its own coordinate.
+        cells.push(filler(c));
+        continue;
+      }
+      hasReal = true;
       cells.push({
         col: c,
         span: spans.get(`${r}:${c}`) ?? { rows: 1, cols: 1 },
@@ -67,7 +110,9 @@ export async function buildGrid(path, definition = null) {
         borders: { t: side(b.top), r: side(b.right), b: side(b.bottom), l: side(b.left) }
       });
     }
-    rows.push({ index: r, height: Math.round(row.height ?? 15), isTask: taskRows.has(r), cells });
+    // A row of nothing but placeholders is a blank spacer row: emit nothing,
+    // as before, so the renderer keeps skipping it.
+    rows.push({ index: r, height: Math.round(row.height ?? 15), isTask: taskRows.has(r), cells: hasReal ? cells : [] });
   }
   return { columns, rows };
 }
