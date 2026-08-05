@@ -63,6 +63,22 @@ function noticeEl() {
   return p;
 }
 
+// The way back to the main app (web/index.html) — this page previously had
+// no link to it at all, only Sign out, so a user who landed here (whether
+// by following app.js's own new "Admin" link or by typing the URL) had to
+// edit the address bar by hand to get back to their records. Same shared
+// `.navlink` control-strip class app.js's own "Admin" link uses (see
+// app.css), shown to every signed-in role — not just admins — since even a
+// non-admin who lands here (paint() below shows them a "cannot perform this
+// action" notice) needs a way out that isn't Sign out.
+function appLinkButton() {
+  const a = document.createElement('a');
+  a.className = 'navlink';
+  a.href = '/';
+  a.textContent = '‹ Back to app';
+  return a;
+}
+
 // Same control, same class and same behaviour as app.js's — a shared browser
 // must never leave the previous user signed in, and the admin console can
 // change users and form mappings, so it least of all.
@@ -92,6 +108,7 @@ async function paint() {
   $('#control-strip').replaceChildren(
     chip('Admin'),
     chip(`${user.full_name} · ${user.role.replace('_', ' ')}`),
+    appLinkButton(),
     signOutButton()
   );
 

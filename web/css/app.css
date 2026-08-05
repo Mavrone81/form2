@@ -89,6 +89,23 @@ a{color:var(--ink)}
 #control-strip .signout:hover,#control-strip .signout:focus-visible{text-decoration:underline}
 #control-strip .signout:focus-visible{outline:2px solid #fff;outline-offset:-3px}
 
+/* Control-strip navigation link — the "Admin" link app.js shows an admin
+   role (to /admin.html), and the "‹ Back to app" link admin.js shows every
+   signed-in role (to /). One shared class for both directions: same cell
+   treatment as Sign out (code type, padding, divider, 44px tap target),
+   colour and background restated locally for the same reason as
+   `.signout` above. `margin-left:auto` mirrors `.state`'s own rule so this
+   link (and Sign out after it) sit flush right even on a screen with no
+   state chip (the picker screens); `~` overrides below stop the auto
+   margin doubling up whichever combination of .state/.navlink/.signout is
+   actually present on a given screen. */
+#control-strip .navlink{margin-left:auto;border:0;border-left:1px solid var(--line-dark);
+  background:var(--ink);color:#fff;font:inherit;letter-spacing:inherit;text-transform:inherit;
+  padding:11px 16px;min-height:44px;display:flex;align-items:center;text-decoration:none;cursor:pointer}
+#control-strip .state~.navlink,#control-strip .navlink~.signout{margin-left:0}
+#control-strip .navlink:hover,#control-strip .navlink:focus-visible{text-decoration:underline}
+#control-strip .navlink:focus-visible{outline:2px solid #fff;outline-offset:-3px}
+
 /* ---------- Two-pane split: the form on the left, fill-in on the right ---------- */
 /* Mobile-first: a single column by default (the form, then the fill-in panel,
    in DOM order) — the fixed 400px right pane used to be the main source of
@@ -271,6 +288,20 @@ a{color:var(--ink)}
 .catalog-row{display:flex;flex-direction:column;align-items:flex-start;gap:4px}
 .catalog-row .catalog-title{color:var(--ink);font-size:13px;line-height:1.35}
 .catalog-row .catalog-doc{font:600 11px/1 var(--mono);letter-spacing:.03em;color:var(--mute)}
+
+/* Read-only catalog row on the admin landing screen (app.js
+   catalogSection()) — same title/doc-number/revision layout as
+   `.catalog-row` above (still applied alongside this class), rendered as a
+   plain <div>, never a <button>: admins do not start new records from this
+   screen, so nothing here should look pressable. `.form-pick`'s box model
+   (border/padding/spacing) is deliberately NOT reused, since that rule also
+   sets `cursor:pointer` unconditionally — the box treatment is restated
+   here instead, with `cursor:default`, so a non-interactive row never
+   invites a click it does nothing with. */
+.catalog-row--static{border:1px solid var(--rule);background:var(--paper);
+  padding:12px 13px;margin-bottom:8px;cursor:default}
+.catalog-row--static:last-child{margin-bottom:0}
+.catalog-row--static .state{margin-top:2px}
 
 /* ---------- Signature block ---------- */
 .sig{border:1px solid var(--rule);background:var(--paper)}

@@ -57,6 +57,22 @@ function emptyNotice(text) {
   return p;
 }
 
+// The only way from this app to web/admin.html (forms folder, user
+// management, PDF field mapper) — there was previously no link anywhere,
+// so those screens were reachable only by typing the URL by hand. Admin
+// only: every other role has no admin actions, and the server's own
+// GET /api/admin/* routes reject them regardless. Placed in the control
+// strip beside Sign out (see #control-strip .navlink in app.css), since
+// that strip is the one thing present on every screen this app shows once
+// signed in.
+function adminLinkButton() {
+  const a = document.createElement('a');
+  a.className = 'navlink';
+  a.href = '/admin.html';
+  a.textContent = 'Admin';
+  return a;
+}
+
 // The picker screen (showPicker) never puts anything in `#pane-left` — the
 // technician's queue and form list both render into `#pane-right` — but
 // app.css's `.split` rule still reserved 76vh of blank white for it, sitting
@@ -105,7 +121,9 @@ async function showPicker() {
   // Who is signed in, and the way out — the list screen needs both just as
   // much as an open record does.
   $('#control-strip').replaceChildren(
-    chip(`${user.full_name} · ${user.role.replace('_', ' ')}`), signOutButton()
+    chip(`${user.full_name} · ${user.role.replace('_', ' ')}`),
+    ...(user.role === 'admin' ? [adminLinkButton()] : []),
+    signOutButton()
   );
   collapsePaneLeft();
   const right = $('#pane-right');
@@ -157,8 +175,60 @@ async function showPicker() {
     // queue is shown for them.
     const queue = await api.queue();
     const title = user.role === 'admin' ? 'All records' : 'Records awaiting you';
-    right.append(queueSection(title, queue, formsById, 'Nothing waiting.'));
+    const queueSec = queueSection(title, queue, formsById, 'Nothing waiting.');
+    // Admins additionally get the read-only form catalog on this same
+    // landing screen — this is the fix for the reported gap: an admin
+    // signing in previously saw only this queue (headed "All records"),
+    // with the 12 indexed forms visible nowhere on it, and reasonably
+    // concluded the forms were missing even though GET /api/forms confirmed
+    // all 12 as `ready` all along. Below the queue (the queue is still what
+    // a returning admin most likely wants first), never above it.
+    right.append(queueSec, ...(user.role === 'admin' ? [catalogSection(forms)] : []));
   }
+}
+
+// Read-only form catalog for an admin's landing screen — the same 12
+// indexed forms a technician's "Choose a form" picker shows above, but with
+// no click handler and no button semantics: admins never start a new
+// record (POST /api/submissions is restricted to technicians), so nothing
+// here should look pressable. GET /api/forms already returns every form for
+// an admin caller, including non-ready ones (server-confirmed), so each
+// row's own state chip is shown — the one thing genuinely useful to this
+// role that a technician's picker (ready-only) has no reason to surface:
+// spotting a form stuck at `needs_setup` or gone `inactive` at a glance.
+// The heading states the count explicitly, e.g. "Indexed forms (12)" —
+// answering the reported complaint ("I do not see 12 forms") without
+// making the admin count rows themselves.
+function catalogSection(forms) {
+  const sec = section(`Indexed forms (${forms.length})`);
+  if (!forms.length) {
+    sec.append(emptyNotice('No forms are indexed yet.'));
+    return sec;
+  }
+  for (const f of forms) {
+    const row = document.createElement('div');
+    row.className = 'catalog-row catalog-row--static';
+
+    const titleEl = document.createElement('span');
+    titleEl.className = 'catalog-title';
+    titleEl.textContent = f.title || f.file_name;
+
+    const docEl = document.createElement('span');
+    docEl.className = 'catalog-doc';
+    // Same reasoning as the technician picker's own doc/rev line: several
+    // titles are near-identical, and the controlled-document code is what
+    // actually tells them apart.
+    docEl.textContent = `${f.doc_number || '—'} · Rev ${f.revision || '—'}`;
+
+    const stateEl = document.createElement('span');
+    stateEl.className = 'state';
+    stateEl.dataset.state = f.state;
+    stateEl.textContent = f.state.replace('_', ' ');
+
+    row.append(titleEl, docEl, stateEl);
+    sec.append(row);
+  }
+  return sec;
 }
 
 // A single queue row lays out the record's identity as distinct elements —
@@ -243,6 +313,7 @@ async function paint() {
     chip(sub.doc_number || form.doc_number || form.file_name),
     chip(`Rev ${sub.revision || form.revision || '—'}`),
     chip(`${user.full_name} · ${user.role.replace('_', ' ')}`), stateChip(detail.submission.state),
+    ...(user.role === 'admin' ? [adminLinkButton()] : []),
     signOutButton()
   );
 
