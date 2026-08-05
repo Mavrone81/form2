@@ -17,6 +17,28 @@
 
   <div id="app" hidden>
     <div id="control-strip"></div>
+    <!-- Below the lg breakpoint the two panes become a two-tab switcher: the
+         single-column stack put the form's 71-row grid ABOVE the fields, so a
+         technician on a phone scrolled past an entire spreadsheet before
+         reaching the first input. Reordering alone would not fix it — the
+         grid would still sit in the same scroll — so only one pane is shown
+         at a time, defaulting to "Fill in" (the working surface; the form is
+         reference material).
+         Markup is static and the panes are never re-rendered by a tab switch:
+         switching only flips attributes, so in-progress input and the live
+         signature pad are untouched (see applyTabs()/selectTab() in app.js).
+         `hidden` and the tab roles are managed by app.js — the bar is present
+         only on an open record below 1024px, never on the list screens, and
+         at >=1024px it is removed from the accessibility tree entirely so the
+         desktop two-pane layout keeps exactly its previous semantics. -->
+    <div id="pane-tabs" role="tablist" aria-label="Record view" hidden>
+      <button type="button" id="tab-fill" role="tab" aria-selected="true" aria-controls="pane-right">
+        <span class="tab-name">Fill in</span><span class="tab-note" id="tab-fill-note"></span>
+      </button>
+      <button type="button" id="tab-form" role="tab" aria-selected="false" aria-controls="pane-left" tabindex="-1">
+        <span class="tab-name">Form</span>
+      </button>
+    </div>
     <main class="split">
       <section id="pane-left" aria-label="The form"></section>
       <section id="pane-right" aria-label="Fill in"></section>

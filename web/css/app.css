@@ -144,6 +144,54 @@ a{color:var(--ink)}
 #pane-left.is-empty{display:none;min-height:0;padding:0}
 .split.split--list{grid-template-columns:1fr}
 
+/* ---------- Fill in / Form tabs (mobile only) ---------- */
+/* Below the `lg` breakpoint the single-column `.split` stacked the panes in
+   DOM order — the form first — so a technician on a phone scrolled past a
+   71-row spreadsheet before reaching the first input, which is the reported
+   "I cannot see the filling up fields, only the Preview". Swapping the order
+   would not fix it: the grid would still occupy the same scroll. So only one
+   pane is shown at a time and a tab chooses which, defaulting to the fields.
+   `data-tab` is set by app.js ONLY while an open record is on screen and the
+   viewport is below `lg` (see applyTabs()); the list screens never carry it,
+   so `collapsePaneLeft()`'s behaviour above is untouched. Attribute-driven,
+   so switching tabs is one attribute write — no re-render, no pane rebuild,
+   and therefore no chance of tearing down and recreating the signature pad. */
+.split[data-tab="fill"]>#pane-left{display:none}
+.split[data-tab="form"]>#pane-right{display:none}
+
+/* Sticky: a technician deep in a long field list must be able to reach the
+   form without scrolling back to the top and down again. The control strip
+   above is allowed to scroll away; the switcher is not. */
+#pane-tabs{display:flex;position:sticky;top:0;z-index:5;
+  background:var(--paper);border-bottom:1px solid var(--rule)}
+/* Same trap as #login: the unconditional `display:flex` above (an ID
+   selector) outranks the UA stylesheet's bare `[hidden]{display:none}`, so
+   without this rule the bar would stay on screen on every list screen and at
+   desktop width. Combining the ID with the attribute outranks both. */
+#pane-tabs[hidden]{display:none}
+/* Segmented-control language, deliberately identical to `.segs` (the interval
+   picker) — same monospace code type, same selected = ink-on-paper inversion.
+   No new colour: the state accent stays reserved for the record's own state.
+   `button` is named in the selector, not just [role="tab"], so the
+   css-contract control-colour guards actually cover these rules. min-height
+   44px is the tap-target floor; flex-wrap lets the outstanding-count note
+   drop to a second line rather than push the bar wider than the viewport. */
+#pane-tabs button{flex:1 1 0;min-width:0;min-height:44px;padding:12px 10px;border:0;
+  border-right:1px solid var(--rule);background:var(--paper);color:var(--ink);
+  font:600 11px/1.35 var(--mono);letter-spacing:.1em;text-transform:uppercase;cursor:pointer;
+  display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:2px 8px}
+#pane-tabs button:last-child{border-right:0}
+#pane-tabs button[aria-selected="true"]{background:var(--ink);color:#fff}
+#pane-tabs button:focus-visible{outline:2px solid var(--ink);outline-offset:-3px}
+#pane-tabs button[aria-selected="true"]:focus-visible{outline-color:var(--paper)}
+/* The outstanding-task count, e.g. "Fill in · 18 left" — the same number the
+   completeness banner states, surfaced on the tab so a technician knows work
+   is outstanding without switching. Quiet and monochrome: a muted grey on the
+   unselected tab, the dark strip's own muted grey when the tab is selected. */
+#pane-tabs .tab-note{font:500 10px/1.35 var(--mono);letter-spacing:.06em;color:var(--mute)}
+#pane-tabs button[aria-selected="true"] .tab-note{color:var(--mute-on-dark)}
+#pane-tabs .tab-note:empty{display:none}
+
 /* ---------- Document sheet header ---------- */
 /* Not currently rendered by any script in web/js (a leftover from the design
    mockup, see docs/design/directions.html) — fixed defensively anyway so it
@@ -499,6 +547,16 @@ a{color:var(--ink)}
    this change. */
 @media (min-width:1024px){
   .split{grid-template-columns:1fr 400px}
+  /* The tab switcher is a mobile-only affordance: at desktop width both panes
+     are on screen at once, so there is nothing to switch between. app.js also
+     drops the `hidden` flag and every tab/tabpanel role at this width (see
+     applyTabs()), so the desktop layout keeps exactly the semantics it had
+     before the tabs existed; these two rules are the belt-and-braces half —
+     even if script state were wrong, no pane can be hidden at desktop. Both
+     restate the same (id + 2) specificity as the base rules above and come
+     later in source order, so they win. */
+  #pane-tabs{display:none}
+  .split[data-tab]>#pane-left,.split[data-tab]>#pane-right{display:block}
   .sheet-hd{display:grid;grid-template-columns:1fr 150px 60px 66px}
   .fld input,.fld textarea,.fld select{min-height:0}
   .segs button{padding:10px 0;min-height:0}

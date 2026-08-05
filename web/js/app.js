@@ -5,6 +5,171 @@ import { renderFields, teardownFieldPanel } from './field-panel.js';
 const $ = (s) => document.querySelector(s);
 let user = null, formId = null, submission = null, frequency = '';
 
+// ---------------------------------------------------------------------------
+// Fill in / Form tabs — the mobile view switcher.
+//
+// Below the `lg` breakpoint `.split` is a single column, so the two panes
+// stacked in DOM order: the form first, the fields underneath it. A real
+// form's grid is 71 rows, so on a phone the technician scrolled past an
+// entire spreadsheet before reaching the first input — the reported "I cannot
+// see the filling up fields and only see the Preview". Reordering alone would
+// not have fixed it (the grid would still sit in the same scroll), so only
+// one pane is shown at a time and a tab chooses which.
+//
+// Three properties this implementation is built around:
+//  1. It NEVER re-renders. selectTab() writes attributes only — no
+//     renderFields(), no renderForm(), no paint(). The signature pad is
+//     therefore never destroyed and recreated by a tab switch (which would
+//     leak listeners and could clear a drawn signature), and no in-progress
+//     input is lost: the DOM nodes holding it are the same nodes throughout.
+//     Hiding is done in CSS, on the pane the technician is not looking at.
+//  2. It is inert above the breakpoint. `DESKTOP` is consulted on every
+//     apply, so at >=1024px the bar is hidden AND every tab/tabpanel role is
+//     removed — the desktop two-pane layout keeps precisely the semantics it
+//     had before tabs existed, rather than being a tablist with no visible
+//     tabs.
+//  3. It exists only where there are two panes to switch between. The tabs
+//     are bound to the left pane's own presence (expandPaneLeft /
+//     collapsePaneLeft), so the picker and queue screens — where
+//     collapsePaneLeft() already hides the form pane — never show them.
+const DESKTOP = window.matchMedia('(min-width:1024px)');
+// Which pane the switcher is showing. Reset to 'fill' when a record is
+// opened (the fields are the working surface), but deliberately NOT on every
+// paint(): a repaint after a save or an interval change must not yank a
+// technician off the form pane they were reading.
+let activeTab = 'fill';
+// Whether this screen has two panes at all. Set from expandPaneLeft() /
+// collapsePaneLeft() so it can never disagree with what is on screen.
+let tabsEnabled = false;
+
+const TAB_PANES = { fill: '#pane-right', form: '#pane-left' };
+const TAB_IDS = { fill: 'tab-fill', form: 'tab-form' };
+const TAB_ORDER = ['fill', 'form'];
+
+// The single place that reconciles the DOM with (tabsEnabled, viewport,
+// activeTab). Called whenever any of the three changes.
+function applyTabs() {
+  const bar = $('#pane-tabs');
+  const split = $('.split');
+  const panes = { fill: $(TAB_PANES.fill), form: $(TAB_PANES.form) };
+  const on = tabsEnabled && !DESKTOP.matches;
+  bar.hidden = !on;
+
+  if (!on) {
+    // No data-tab attribute means neither pane is hidden by the tab rules in
+    // app.css, and no tabpanel role is left behind pointing at a tab that is
+    // not on screen.
+    split.removeAttribute('data-tab');
+    for (const pane of Object.values(panes)) {
+      pane.removeAttribute('role');
+      pane.removeAttribute('aria-labelledby');
+    }
+    return;
+  }
+
+  split.dataset.tab = activeTab;
+  for (const name of TAB_ORDER) {
+    const pane = panes[name];
+    pane.setAttribute('role', 'tabpanel');
+    // aria-labelledby (the tab's own text) supersedes the pane's static
+    // aria-label; the two say the same thing, so nothing is renamed.
+    pane.setAttribute('aria-labelledby', TAB_IDS[name]);
+    const btn = $(`#${TAB_IDS[name]}`);
+    const selected = name === activeTab;
+    btn.setAttribute('aria-selected', String(selected));
+    // Roving tabindex: one stop in the page tab order for the whole tablist,
+    // with the arrow keys moving between the tabs themselves (WAI-ARIA
+    // tabs pattern).
+    btn.tabIndex = selected ? 0 : -1;
+  }
+}
+
+function setTabsEnabled(on) {
+  tabsEnabled = on;
+  if (!on) resetOutstanding();
+  applyTabs();
+}
+
+// Attribute writes only — nothing is rendered, nothing is replaced.
+function selectTab(name, { focus = false } = {}) {
+  if (!TAB_ORDER.includes(name)) return;
+  activeTab = name;
+  applyTabs();
+  if (focus) $(`#${TAB_IDS[name]}`).focus();
+}
+
+// The outstanding-task count shown on the Fill in tab, e.g. "Fill in · 18
+// left" — the same number the completeness banner states, so a technician
+// sitting on the form pane can see there is work left without switching.
+//
+// `completeness.missing` (server-computed, the banner's own source) seeds it;
+// `spec.inScope` gives the in-scope task rows, whose field keys are
+// `task_<row>` exactly as server/workflow.js's completenessFor() builds them.
+// Knowing that set is what lets the count follow typing without another
+// request: a key outside it can never change the count.
+let inScopeTaskKeys = new Set();
+let outstandingKeys = new Set();
+
+function setOutstanding(spec) {
+  inScopeTaskKeys = new Set((spec?.inScope ?? []).map((row) => `task_${row}`));
+  outstandingKeys = new Set(spec?.completeness?.missing ?? []);
+  paintOutstanding();
+}
+
+function resetOutstanding() {
+  inScopeTaskKeys = new Set();
+  outstandingKeys = new Set();
+  paintOutstanding();
+}
+
+// Same "non-empty after trimming" rule as completenessFor(), so the tab and
+// the banner can never disagree about whether a task counts as filled.
+function noteFieldValue(key, value) {
+  if (!inScopeTaskKeys.has(key)) return;
+  const before = outstandingKeys.size;
+  if (String(value ?? '').trim() === '') outstandingKeys.add(key);
+  else outstandingKeys.delete(key);
+  if (outstandingKeys.size !== before) paintOutstanding();
+}
+
+function paintOutstanding() {
+  const note = $('#tab-fill-note');
+  if (!note) return;
+  note.textContent = outstandingKeys.size ? `· ${outstandingKeys.size} left` : '';
+}
+
+// Bound once, at module load, against markup that is static in index.html —
+// so no listener is ever added twice and none needs tearing down.
+for (const name of TAB_ORDER) {
+  $(`#${TAB_IDS[name]}`).addEventListener('click', () => selectTab(name));
+}
+// Enter and Space are the browser's own activation for a <button>, so they
+// already reach the click handler above. This adds the rest of the WAI-ARIA
+// tabs keyboard contract: arrow keys (with automatic activation, the standard
+// behaviour for tabs whose panels are already in the document) plus Home/End.
+$('#pane-tabs').addEventListener('keydown', (e) => {
+  const keys = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -1, ArrowDown: 1 };
+  let next = null;
+  if (e.key in keys) {
+    const i = TAB_ORDER.indexOf(activeTab);
+    next = TAB_ORDER[(i + keys[e.key] + TAB_ORDER.length) % TAB_ORDER.length];
+  } else if (e.key === 'Home') next = TAB_ORDER[0];
+  else if (e.key === 'End') next = TAB_ORDER[TAB_ORDER.length - 1];
+  if (!next) return;
+  e.preventDefault();
+  selectTab(next, { focus: true });
+});
+// A rotation or a window drag across the breakpoint must land in a coherent
+// state: both panes and no tabs above it, one pane and the tabs below.
+//
+// Note what does NOT depend on this listener: which panes are VISIBLE is
+// decided entirely in app.css (the `.split[data-tab]` rules and their `lg`
+// overrides), so even if this never fired, no pane could be left hidden at
+// desktop width or shown at both widths on mobile. What it reconciles is the
+// ARIA layer — the tab/tabpanel roles, which must not survive into a width
+// where the tablist itself is not rendered.
+DESKTOP.addEventListener('change', applyTabs);
+
 // Mirrors the server's stage-ownership rule (server/workflow.js
 // assertStageOwnership) for UI purposes only. The server remains the sole
 // source of truth and enforces this independently on every PATCH/sign
@@ -111,12 +276,19 @@ function collapsePaneLeft() {
   left.preview = null;
   left.classList.add('is-empty');
   left.closest('.split')?.classList.add('split--list');
+  // No form pane means nothing to switch between: the picker and the queue
+  // are one pane of content, so the tab bar must not appear there. Bound to
+  // the pane's own collapse/expand rather than to a list of screen names, so
+  // a future screen that collapses the left pane gets this for free and
+  // cannot forget it.
+  setTabsEnabled(false);
 }
 
 function expandPaneLeft() {
   const left = $('#pane-left');
   left.classList.remove('is-empty');
   left.closest('.split')?.classList.remove('split--list');
+  setTabsEnabled(true);
 }
 
 // Deviation from the brief: the brief's showPicker() only ever lists forms
@@ -303,6 +475,9 @@ async function startNew(pickedFormId) {
   formId = pickedFormId;
   frequency = spec.frequencies.at(-1) || '';
   submission = await api.createSubmission(formId, '', frequency);
+  // A record always opens on the fields: that is the technician's working
+  // surface, and the form beside it is reference material.
+  activeTab = 'fill';
   await paint();
 }
 
@@ -310,6 +485,7 @@ async function openExisting(sub) {
   submission = sub;
   formId = sub.form_id;
   frequency = sub.frequency || '';
+  activeTab = 'fill';
   await paint();
 }
 
@@ -344,6 +520,10 @@ async function paint() {
   // that distinction: null means dim nothing, an empty array means dim every
   // task row, because none of them apply to this visit.
   expandPaneLeft();
+  // Seeds the "Fill in · N left" count on the tab from the same server-computed
+  // completeness the banner below uses, and records which field keys can move
+  // it as the technician types.
+  setOutstanding(spec);
   // The record's own values go into the sheet, in the cells the server says
   // they belong in (spec.cellFor / spec.titleCell — see server/cell-map.js).
   // Without these the left pane is a preview of a BLANK form while everything
@@ -388,12 +568,19 @@ async function paint() {
     // cell that changed is rewritten — never the whole grid, which on a
     // 71-row form would mean rebuilding hundreds of cells per keystroke (see
     // updatePreviewField in form-view.js).
-    onPreview: (key, value) => { updatePreviewField($('#pane-left'), key, value); },
+    onPreview: (key, value) => {
+      updatePreviewField($('#pane-left'), key, value);
+      // Keeps the tab's outstanding count honest while the technician is on
+      // the Fill in tab, so that when they switch to Form it already reads
+      // the right number. Local arithmetic over a known key set — no request.
+      noteFieldValue(key, value);
+    },
     onChange: async (key, value) => {
       // Also applied here, not only on `input`: `change` is what fires for a
       // value committed without typing (autofill, paste-and-blur), and the
       // preview must not miss those.
       updatePreviewField($('#pane-left'), key, value);
+      noteFieldValue(key, value);
       try {
         await api.save(submission.id, { [key]: value });
         saveError.textContent = '';

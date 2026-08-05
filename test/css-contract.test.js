@@ -131,3 +131,59 @@ test('.row-tint rows (inactive users/forms, added in Task 15) are tinted, never 
 test('reduced motion is honoured', () => {
   assert.match(css, /prefers-reduced-motion/);
 });
+
+test('the responsive scale stays mobile-first: no max-width breakpoint anywhere', () => {
+  // Every rule outside a media query is the mobile baseline; the 640/768/1024
+  // `min-width` blocks only add width back. A single `max-width` block would
+  // invert that and reintroduce the desktop-down layout this file replaced.
+  assert.doesNotMatch(css, /@media[^{]*max-width/i, 'app.css must not use a max-width breakpoint');
+  assert.match(css, /@media\s*\(min-width:1024px\)/, 'expected the lg min-width breakpoint');
+});
+
+test('the Fill in / Form tab switcher is mobile-only and never hides a pane at desktop width', () => {
+  // The tabs exist because below `lg` the single-column `.split` stacked a
+  // 71-row form grid ABOVE the fields. At >=1024px both panes are on screen
+  // at once, so the bar must be gone and neither pane may be hidden — this is
+  // the regression guard on "the desktop two-pane layout is unchanged".
+  const lg = /@media\s*\(min-width:1024px\)\s*\{([\s\S]*?)\n\}/.exec(css);
+  assert.ok(lg, 'expected the lg (min-width:1024px) block');
+
+  const base = css.slice(0, lg.index);
+  // The pane-hiding rules are part of the MOBILE baseline, never inside a
+  // media query.
+  assert.match(base, /\.split\[data-tab="fill"\]\s*>\s*#pane-left\s*\{[^}]*display:\s*none/,
+    'expected the Fill in tab to hide the form pane at mobile width');
+  assert.match(base, /\.split\[data-tab="form"\]\s*>\s*#pane-right\s*\{[^}]*display:\s*none/,
+    'expected the Form tab to hide the fill-in pane at mobile width');
+
+  // ...and both are undone at desktop, at equal-or-higher specificity and
+  // later in source order, so neither pane can ever be hidden there.
+  assert.match(lg[1], /#pane-tabs\s*\{[^}]*display:\s*none/,
+    'the tab bar must be display:none at >=1024px');
+  assert.match(lg[1], /\.split\[data-tab\]\s*>\s*#pane-left\s*,\s*\.split\[data-tab\]\s*>\s*#pane-right\s*\{[^}]*display:\s*block/,
+    'both panes must be restored to display:block at >=1024px');
+});
+
+test('the tab bar is reachable without scrolling back to the top', () => {
+  // A technician deep in a long field list must be able to switch to the form
+  // in place. Sticky, not static.
+  const bar = rules.find((r) => r.selector.split(',').some((s) => s.trim() === '#pane-tabs'));
+  assert.ok(bar, 'expected a #pane-tabs rule');
+  assert.match(bar.body, /position:\s*sticky/, 'the tab bar must be sticky');
+});
+
+test('the tabs meet the 44px tap-target floor and are not shrunk at any breakpoint', () => {
+  const tabRules = rules.filter((r) => /#pane-tabs\b[^,]*\bbutton\b/.test(r.selector));
+  assert.ok(tabRules.length > 0, 'expected at least one #pane-tabs button rule');
+  assert.ok(
+    tabRules.some((r) => /min-height:\s*44px/.test(r.body)),
+    'expected a 44px minimum tap target on the tabs'
+  );
+  // The lg block drops several mobile tap targets back to their compact
+  // desktop size; the tabs must not be among them, since they do not exist at
+  // desktop width at all — a min-height:0 there would be a sign the bar had
+  // been made visible on a screen it does not belong on.
+  for (const r of tabRules) {
+    assert.doesNotMatch(r.body, /min-height:\s*0\b/, `"${r.selector}" must not drop below the tap-target floor`);
+  }
+});

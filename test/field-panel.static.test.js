@@ -179,6 +179,109 @@ test('static guard: a technician sees their own existing records via api.queue()
   );
 });
 
+// --- Static guards: the mobile Fill in / Form tab switcher ----------------
+
+const indexHtml = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+
+test('the mobile view switcher declares real tab semantics', () => {
+  // Not a pair of styled buttons: a screen reader must announce these as tabs
+  // controlling the two panes.
+  assert.match(indexHtml, /role="tablist"/, 'expected a role="tablist" container');
+  const tabs = indexHtml.match(/role="tab"/g) ?? [];
+  assert.equal(tabs.length, 2, 'expected exactly two tabs — Fill in and Form');
+  assert.match(indexHtml, /id="tab-fill"[^>]*aria-selected="true"/,
+    'Fill in must be the selected tab in the initial markup — it is the working surface');
+  assert.match(indexHtml, /id="tab-form"[^>]*aria-selected="false"/);
+  assert.match(indexHtml, /aria-controls="pane-right"/, 'the Fill in tab must control the fields pane');
+  assert.match(indexHtml, /aria-controls="pane-left"/, 'the Form tab must control the form pane');
+  // The panes become tabpanels only while the tabs are live (mobile width,
+  // record open); app.js is what applies and removes those roles.
+  assert.match(appSrc, /setAttribute\(\s*'role'\s*,\s*'tabpanel'\s*\)/,
+    'expected app.js to mark the panes as tabpanels while the tabs are live');
+  assert.match(appSrc, /removeAttribute\(\s*'role'\s*\)/,
+    'expected app.js to remove the tabpanel role where the tabs do not apply');
+});
+
+test('the tabs are keyboard operable and carry a roving tabindex', () => {
+  assert.match(appSrc, /ArrowLeft|ArrowRight/, 'expected arrow-key navigation between tabs');
+  assert.match(appSrc, /tabIndex\s*=\s*selected\s*\?\s*0\s*:\s*-1/,
+    'expected a roving tabindex so the tablist is one stop in the page tab order');
+  // Enter/Space activation comes from these being real <button> elements —
+  // a <div role="tab"> would silently lose it.
+  const tabMarkup = indexHtml.match(/<button[^>]*role="tab"[^>]*>/g) ?? [];
+  assert.equal(tabMarkup.length, 2, 'both tabs must be real <button> elements (Enter/Space activation)');
+});
+
+test('switching tabs never re-renders a pane, so input and the signature pad survive', () => {
+  // The hard requirement: createSignaturePad() registers listeners and owns a
+  // canvas holding a drawn signature. Re-creating it on every tab switch
+  // would leak listeners and could clear the drawing, and re-rendering the
+  // field panel would discard uncommitted keystrokes. selectTab() must
+  // therefore write attributes only — hide and show, never rebuild.
+  const selectTab = /function selectTab\([\s\S]*?\n\}/.exec(appSrc);
+  assert.ok(selectTab, 'expected a selectTab() function in app.js');
+  for (const forbidden of ['renderFields(', 'renderForm(', 'paint(', 'replaceChildren(', 'createSignaturePad(']) {
+    assert.ok(
+      !selectTab[0].includes(forbidden),
+      `selectTab() must not call ${forbidden} — a tab switch must not rebuild a pane`
+    );
+  }
+  const applyTabs = /function applyTabs\([\s\S]*?\n\}\n/.exec(appSrc);
+  assert.ok(applyTabs, 'expected an applyTabs() function in app.js');
+  for (const forbidden of ['renderFields(', 'renderForm(', 'paint(', 'replaceChildren(']) {
+    assert.ok(
+      !applyTabs[0].includes(forbidden),
+      `applyTabs() must not call ${forbidden} — showing a pane must not rebuild it`
+    );
+  }
+});
+
+test('the tabs never appear on a screen with no form pane (picker, queue, signed out)', () => {
+  // collapsePaneLeft() is what the list screens already call to hide the form
+  // pane; binding the switcher to it means a screen with one pane of content
+  // can never grow a switcher with nothing to switch to.
+  const collapse = /function collapsePaneLeft\([\s\S]*?\n\}/.exec(appSrc);
+  assert.ok(collapse, 'expected collapsePaneLeft() in app.js');
+  assert.match(collapse[0], /setTabsEnabled\(false\)/,
+    'collapsing the form pane must also remove the tab switcher');
+  const expand = /function expandPaneLeft\([\s\S]*?\n\}/.exec(appSrc);
+  assert.ok(expand, 'expected expandPaneLeft() in app.js');
+  assert.match(expand[0], /setTabsEnabled\(true\)/,
+    'restoring the form pane must restore the tab switcher');
+  // ...and the bar starts hidden, so it cannot flash on the login screen.
+  assert.match(indexHtml, /id="pane-tabs"[^>]*\shidden\b/, 'the tab bar must start hidden');
+});
+
+test('the tabs are inert above the desktop breakpoint', () => {
+  // At >=1024px both panes are visible at once, so the bar is hidden and the
+  // tab/tabpanel roles are removed — the desktop layout keeps exactly the
+  // semantics it had before the tabs existed.
+  assert.match(appSrc, /matchMedia\(\s*'\(min-width:1024px\)'\s*\)/,
+    'expected app.js to gate the tabs on the same 1024px breakpoint as app.css');
+  assert.match(appSrc, /tabsEnabled\s*&&\s*!DESKTOP\.matches/,
+    'the tabs must be active only below the desktop breakpoint');
+  assert.match(appSrc, /DESKTOP\.addEventListener\(\s*'change'/,
+    'crossing the breakpoint must reconcile the layout, not leave a stale state');
+});
+
+test('the Fill in tab surfaces the same outstanding count the completeness banner computes', () => {
+  // "Fill in · 18 left". It must be the banner's own number — the server's
+  // completeness.missing — not a second, independently-derived count that
+  // could disagree with it.
+  assert.match(appSrc, /completeness\?\.missing/,
+    'the tab count must be seeded from the server-computed completeness.missing');
+  assert.match(appSrc, /left`|left'/, 'expected the "N left" label on the tab');
+  // In-scope task keys are `task_<row>`, exactly as server/workflow.js's
+  // completenessFor() builds them, so typing can move the count without
+  // another request and without inventing a second rule for what counts.
+  assert.match(appSrc, /`task_\$\{row\}`/, 'expected in-scope task keys derived as task_<row>');
+  assert.match(appSrc, /String\(value \?\? ''\)\.trim\(\) === ''/,
+    'a task must count as filled by the same non-empty-after-trimming rule the server uses');
+  // ...and it must never gate anything: warn, never block.
+  assert.doesNotMatch(appSrc, /outstandingKeys\.size[^\n]*disabled/,
+    'the outstanding count must never disable a control');
+});
+
 // --- Static guards: the reject / send-back controls -----------------------
 
 test('the reject path requires a reason before calling the reject API', () => {
