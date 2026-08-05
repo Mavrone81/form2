@@ -11,6 +11,22 @@
 // Nothing rendered here is editable, ever. This pane is a reproduction of a
 // controlled document, so an approved (read-only) record renders exactly the
 // same way a draft does — with its values shown and nothing to type into.
+//
+// ---------------------------------------------------------------------------
+// DELIBERATE EXCEPTION TO THIS APP'S DESIGN LANGUAGE — do not "correct" it
+// ---------------------------------------------------------------------------
+// Everything else in this app follows one monochrome document-control
+// direction with its own type scale. The sheet below does NOT. Its font
+// sizes, families, border weights, shading, alignment and wrapping are taken
+// from the SPREADSHEET, cell by cell, because this pane is not a design — it
+// is a reproduction of somebody else's controlled document, and the person
+// filling it in has the printed original in front of them. A 14pt title is
+// rendered at 14pt because the form prints it at 14pt; Calibri and Aptos
+// Narrow appear here because the documents are set in them.
+// So: do not fold these into the app's type scale, and do not replace the
+// per-cell values with a tidier uniform rule. Making the two agree is the
+// whole point of this file. The exception stops at the edge of the sheet —
+// every control, panel and label around it stays in the app's own language.
 
 // A machine ID filled into the blank the printed title leaves for it, e.g.
 // "BESI Die Attach Preventive Maintenance Record ED____" with machine ID
@@ -68,6 +84,142 @@ function paintCell(td, printed, value) {
 }
 
 const at = (cell) => `${cell.row}:${cell.col}`;
+
+// How a spreadsheet border style is drawn. The WEIGHT is the point: these
+// documents frame each section in `medium` and rule the gridlines inside it in
+// `thin`, and that contrast is the document's entire visual hierarchy. Drawing
+// both at one weight — which a blanket `td{border:1px}` does — flattens the
+// form into an undifferentiated mesh, which is exactly why the preview did not
+// look like the print.
+//
+// Tone follows weight for the same reason: a section frame is drawn in the
+// document ink, an interior gridline in the lighter rule grey the rest of this
+// app uses for gridlines. Both are monochrome, so this borrows nothing from
+// the state accent.
+//
+// An unrecognised style still draws a line (thin, solid). A border the sheet
+// asks for must never silently disappear, and none of the twelve forms uses
+// anything but thin and medium, so this branch is insurance rather than a
+// guess about content.
+const BORDER = {
+  hair: ['0.5px', 'solid', 'rule'],
+  thin: ['1px', 'solid', 'rule'],
+  dotted: ['1px', 'dotted', 'rule'],
+  dashed: ['1px', 'dashed', 'rule'],
+  dashDot: ['1px', 'dashed', 'rule'],
+  dashDotDot: ['1px', 'dashed', 'rule'],
+  medium: ['2px', 'solid', 'ink'],
+  mediumDashed: ['2px', 'dashed', 'ink'],
+  mediumDashDot: ['2px', 'dashed', 'ink'],
+  mediumDashDotDot: ['2px', 'dashed', 'ink'],
+  slantDashDot: ['2px', 'dashed', 'ink'],
+  thick: ['3px', 'solid', 'ink'],
+  double: ['3px', 'double', 'ink']
+};
+const SIDE = { t: 'top', r: 'right', b: 'bottom', l: 'left' };
+
+// A family name reaches here from a spreadsheet file, so it is treated as
+// data: only a plain font name is ever passed through, and anything else is
+// dropped in favour of the sheet default. (Assigning to `style.fontFamily`
+// cannot escape into another declaration — the CSSOM rejects an invalid value
+// outright — but a name is content, and content gets checked here like it does
+// everywhere else in this file.)
+const SAFE_FAMILY = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
+const familyFor = (name) => (typeof name === 'string' && SAFE_FAMILY.test(name.trim())
+  ? `"${name.trim()}", var(--sheet-fallback)`
+  : null);
+
+// The CSS a single sheet cell needs, as plain property/value pairs. Pure and
+// exported so the border weights, fills and type can be asserted against a
+// real form's grid without a DOM — the shape of the data alone cannot tell you
+// whether a medium border comes out heavier than a thin one.
+//
+// A `filler` placeholder returns NOTHING. It is not a cell of the document: it
+// holds a column open so the cells to its right land in the right place, and
+// must draw no border, no background and no padding that could make its row
+// taller than the sheet prints it. That is enforced by a class here rather
+// than by writing four `border:0` declarations onto ~4,500 elements.
+export function cellStyle(cell, defaults = {}) {
+  const css = {};
+  if (!cell || cell.filler === true) return css;
+
+  for (const [key, name] of Object.entries(SIDE)) {
+    const style = cell.borders?.[key];
+    if (!style) continue;
+    const [width, line, token] = BORDER[style] ?? BORDER.thin;
+    css[`border-${name}`] = `${width} ${line} var(--${token})`;
+  }
+
+  // Shading travels as a custom property, not as an inline background: an
+  // inline background outranks every selector, and a shaded cell would then
+  // punch a hole in the out-of-scope row tint. See `.sheet.xl td` in app.css.
+  if (cell.fill) css['--cell-fill'] = cell.fill;
+  if (cell.bold) css['font-weight'] = '600';
+  if (cell.align && cell.align !== 'left') css['text-align'] = cell.align;
+  // Excel calls it `middle`; CSS calls the same thing `middle` on a table
+  // cell, and `top`/`bottom` line up too, so the sheet's own word is used
+  // as-is and anything unrecognised is left to the sheet default.
+  if (cell.valign && ['top', 'middle', 'bottom'].includes(cell.valign)) css['vertical-align'] = cell.valign;
+  // Wrapping is per cell in the source. `pre-wrap` keeps the line breaks the
+  // author typed into the cell, which collapse to spaces otherwise. Cells the
+  // sheet does not wrap are left to the table's own wrapping rather than
+  // `nowrap`: a spreadsheet lets an unwrapped cell spill across its empty
+  // neighbours, an HTML table cannot, and the alternatives are to clip the
+  // text (unacceptable on a maintenance instruction) or to let one long line
+  // stretch its column and pull every other column out of alignment.
+  if (cell.wrap) css['white-space'] = 'pre-wrap';
+  // Size and family are absent whenever the cell agrees with the sheet's own
+  // default, which the table itself carries — see grid-model.js.
+  if (typeof cell.size === 'number' && cell.size > 0) css['font-size'] = `${cell.size}pt`;
+  const family = familyFor(cell.font);
+  if (family) css['font-family'] = family;
+  return css;
+}
+
+const applyStyle = (el, css) => {
+  for (const [prop, value] of Object.entries(css)) el.style.setProperty(prop, value);
+};
+
+// How a row is laid out, given that a spreadsheet lets text SPILL and an HTML
+// table does not.
+//
+// A cell the sheet does not wrap is drawn by Excel on one line, running on
+// across the empty cells to its right for as far as it needs. A table cell
+// cannot do that: hold it to its own column and a line of prose the form
+// prints once becomes a 26-line tower, which drags the row — and the whole
+// document's vertical proportions — far away from the printed page. Measured
+// on the reference form, that alone made the preview 3,613px tall where the
+// sheet is 914px.
+//
+// So the spill is reproduced the only way a table can: the cell is given the
+// columns it spills into. It may only ever take PLACEHOLDER columns — columns
+// the sheet leaves genuinely empty, with no text, no border and no merge, so
+// nothing is displaced and nothing is covered up. A bordered box the form
+// means someone to write in is not a placeholder and is never absorbed, and
+// neither is anything with text in it. The moment a real cell is reached, the
+// run stops, exactly where the ink stops on paper.
+//
+// The row still accounts for every one of its columns afterwards — the widths
+// simply move from the placeholders into the cell that spills over them —
+// which is the invariant the whole column alignment rests on.
+export function layoutRow(cells) {
+  const out = [];
+  let absorb = 0;
+  for (let i = 0; i < cells.length; i++) {
+    const cell = cells[i];
+    if (absorb > 0 && cell.filler === true) { absorb--; continue; }
+    const cols = cell.span?.cols ?? 1;
+    if (cell.filler === true || cell.wrap || !cell.text) {
+      out.push({ cell, cols });
+      continue;
+    }
+    let extra = 0;
+    while (i + 1 + extra < cells.length && cells[i + 1 + extra].filler === true) extra++;
+    absorb = extra;
+    out.push({ cell, cols: cols + extra });
+  }
+  return out;
+}
 
 // Ring the interval this visit covers, on the option the document already
 // prints in its frequency band — the same mark a technician makes with a pen
@@ -150,7 +302,18 @@ export function renderForm(container, form, {
   }
 
   const table = document.createElement('table');
-  table.className = 'sheet';
+  // `xl` marks this table as a spreadsheet reproduction rather than one of the
+  // app's own listings (the admin screens use `.sheet` too). It is what turns
+  // OFF the blanket gridline every `.sheet` cell would otherwise get, so the
+  // borders below are the cell's own and nothing competes with them.
+  table.className = 'sheet xl';
+  // The sheet's own baseline type, set once here so ~6,500 cells do not each
+  // have to repeat it; a cell only carries a size or family where the document
+  // departs from this.
+  const defaults = grid.defaults ?? {};
+  if (typeof defaults.size === 'number' && defaults.size > 0) table.style.fontSize = `${defaults.size}pt`;
+  const defaultFamily = familyFor(defaults.font);
+  if (defaultFamily) table.style.fontFamily = defaultFamily;
   const colgroup = document.createElement('colgroup');
   for (const c of grid.columns) {
     const col = document.createElement('col');
@@ -197,13 +360,27 @@ export function renderForm(container, form, {
     // that would silently disable dimming for the very case (a frequency
     // covering zero tasks) it exists to catch.
     if (inScope && row.isTask && !inScope.has(row.index)) tr.className = 'row-out';
-    for (const cell of row.cells) {
+    // The sheet's own row height, in points, converted to CSS pixels. `height`
+    // on a table row is a MINIMUM, not a cap: a short row on paper is short
+    // here too instead of being padded out to a comfortable web row height,
+    // but a cell whose text needs more room still gets it — nothing on a
+    // maintenance record is ever cut off to hit a number.
+    if (row.height > 0) tr.style.height = `${Math.round(row.height * 4 / 3)}px`;
+    for (const { cell, cols } of layoutRow(row.cells)) {
       const td = document.createElement('td');
-      if (cell.span.cols > 1) td.colSpan = cell.span.cols;
-      if (cell.span.rows > 1) td.rowSpan = cell.span.rows;
-      td.textContent = cell.text;
-      if (cell.bold) td.style.fontWeight = '600';
-      if (cell.align && cell.align !== 'left') td.style.textAlign = cell.align;
+      const span = cell.span ?? { rows: 1, cols: 1 };
+      if (cols > 1) td.colSpan = cols;
+      if (span.rows > 1) td.rowSpan = span.rows;
+      // A placeholder holds a column open and nothing more: no text, no
+      // border, no background, and no padding that would make the row taller
+      // than the sheet prints it.
+      if (cell.filler === true) {
+        td.className = 'filler';
+        tr.append(td);
+        continue;
+      }
+      td.textContent = cell.text ?? '';
+      applyStyle(td, cellStyle(cell, defaults));
 
       const coord = `${row.index}:${cell.col}`;
       if (titleCell && row.index === titleCell.row && cell.col === titleCell.col) {

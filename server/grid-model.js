@@ -12,17 +12,84 @@ import ExcelJS from 'exceljs';
 // The columns a sheet leaves genuinely blank are filled by placeholder cells
 // carrying `filler: true`. That flag is the difference between "nothing is
 // here" and "an empty bordered box the form intends someone to write in" —
-// the latter is a real cell and is never flagged. A placeholder carries no
-// text, no bold, no borders and never spans. Real cells do not carry the
-// flag at all, so test it as `cell.filler === true`.
+// the latter is a real cell and is never flagged. A placeholder carries
+// NOTHING but its column and the flag: no text, no span, no borders, no
+// styling of any kind, because it is not a cell of the document — it exists
+// only so the cells to its right land in their true column. Real cells do
+// not carry the flag at all, so test it as `cell.filler === true`.
 //
 // Two things deliberately emit nothing. A cell a merge covers is left out —
 // its anchor carries the span, and re-emitting it would both duplicate the
 // column and (a past defect) blank the anchor's content. And a row with no
 // real cell at all emits no cells, keeping blank spacer rows out of the
 // render and the document's vertical rhythm intact.
+//
+// ---------------------------------------------------------------------------
+// STYLING: what this model carries, and why it is a lean payload
+// ---------------------------------------------------------------------------
+// The preview has to look like the printed sheet, so the document's own
+// styling has to survive the trip. Measured across the twelve controlled
+// forms, that means: TWO border weights (medium framing sections against thin
+// gridlines inside them — collapsing both to one weight flattens the entire
+// visual hierarchy), font sizes of 8/9/10/11/12/14pt, three families (Aptos
+// Narrow, Calibri, Arial), vertical alignment, per-cell text wrapping, and
+// cell shading where a form has any.
+//
+// Every one of those is emitted ONLY where it differs from what the sheet
+// does by default, because a grid is sent per form and the corpus is ~6,500
+// cells: writing `size: 10` on all of them would be most of the payload and
+// would say nothing. So:
+//   - `borders` is present only when a side actually has one, and names the
+//     Excel style ('thin'/'medium'/...) per side — never a boolean, since the
+//     weight IS the hierarchy. A side with no border is simply absent.
+//   - `size` / `font` appear only when they differ from `grid.defaults`, which
+//     carries the sheet's own most-used size and family for the renderer to
+//     set once on the table.
+//   - `fill`, `valign` and `wrap` appear only when the cell sets them.
+//   - `bold` and `align` are likewise omitted at their defaults (not bold,
+//     left) rather than written on every cell.
+// Consumers must therefore read these as optional: `cell.align || 'left'`,
+// `cell.span ?? {rows:1,cols:1}`, `if (cell.borders)`.
 const DEFAULT_COL_WIDTH = 8.43;
 const PX_PER_CHAR = 7.5;
+
+// Excel writes a cell's shading as a pattern fill. Only a fill that names an
+// explicit colour is reported, and only when that colour is not the paper the
+// sheet is already printed on:
+//   - `argb` is the unambiguous case and is passed through as #RRGGBB.
+//   - `theme: 0` (background 1) and `indexed: 65` (the system background) are
+//     white — they are how Excel writes "no shading at all", and every fill in
+//     the current twelve forms is one of those two. Reporting them would paint
+//     ~11,400 opaque white boxes that hide the out-of-scope row tint beneath
+//     them, which is the opposite of the intent.
+//   - anything else (a themed colour with a tint, say) needs the workbook's
+//     theme palette to resolve. Rather than guess a colour onto a controlled
+//     document, it is omitted — the cell renders unshaded, as it does today.
+// White is treated as "no fill" for the same reason: the sheet's paper is
+// already white, so saying so adds bytes and takes away the tint.
+function fillColour(fill) {
+  if (!fill || fill.type !== 'pattern' || !fill.pattern || fill.pattern === 'none') return null;
+  const fg = fill.fgColor;
+  if (!fg) return null;
+  if (typeof fg.argb === 'string' && /^[0-9a-f]{8}$/i.test(fg.argb)) {
+    const hex = `#${fg.argb.slice(2).toUpperCase()}`;
+    return hex === '#FFFFFF' ? null : hex;
+  }
+  return null;
+}
+
+// The sheet's own default family/size: whatever most of its real cells use.
+// Derived from the document rather than assumed, so a form set in Calibri 10
+// and one set in Aptos Narrow 10 each get their own baseline and each emits
+// per-cell overrides only where the document genuinely departs from it.
+// Ties are broken by first-seen, which is arbitrary but harmless: the default
+// and the per-cell overrides are computed from the same tally, so whichever
+// value wins, every cell still renders at the size and family it carries.
+function modal(counts, fallback) {
+  let best = fallback, seen = -1;
+  for (const [value, n] of counts) if (n > seen) { best = value; seen = n; }
+  return best;
+}
 
 // Map every cell covered by a merge to its anchor, so covered cells can be
 // skipped and the anchor can carry the span.
@@ -67,16 +134,15 @@ export async function buildGrid(path, definition = null) {
   // definition is optional so existing single-argument callers keep working.
   const taskRows = new Set((definition?.tasks ?? []).map((t) => t.row));
 
-  const side = (b) => (b?.style ? true : false);
-  const filler = (c) => ({
-    col: c,
-    span: { rows: 1, cols: 1 },
-    text: '',
-    bold: false,
-    align: 'left',
-    borders: { t: false, r: false, b: false, l: false },
-    filler: true
-  });
+  // A side's Excel border style ('thin', 'medium', 'double', ...) or null.
+  // The style string is kept verbatim rather than reduced to a weight, so the
+  // renderer decides how to draw it and this model stays a faithful record of
+  // what the document says.
+  const side = (b) => (b?.style ? String(b.style) : null);
+
+  const sizes = new Map();
+  const families = new Map();
+  const tally = (map, key) => { if (key != null) map.set(key, (map.get(key) ?? 0) + 1); };
 
   const rows = [];
   for (let r = 1; r <= ws.rowCount; r++) {
@@ -91,28 +157,61 @@ export async function buildGrid(path, definition = null) {
       const cell = row.getCell(c);
       const text = cell.value == null ? '' : String(cell.text ?? cell.value).trim();
       const b = cell.border ?? {};
-      const hasBorder = side(b.top) || side(b.right) || side(b.bottom) || side(b.left);
+      const borders = {};
+      for (const [key, source] of [['t', b.top], ['r', b.right], ['b', b.bottom], ['l', b.left]]) {
+        const style = side(source);
+        if (style) borders[key] = style;
+      }
+      const hasBorder = Object.keys(borders).length > 0;
       if (!text && !hasBorder && !spans.has(`${r}:${c}`)) {
         // Blank, unbordered, unmerged: hold the column open so everything to
         // its right keeps its place. One placeholder per column, never a run
         // collapsed under a span, so that every column of the row is
-        // addressable by its own coordinate.
-        cells.push(filler(c));
+        // addressable by its own coordinate. It carries nothing else: a
+        // placeholder is not part of the document and must not draw one.
+        cells.push({ col: c, filler: true });
         continue;
       }
       hasReal = true;
-      cells.push({
-        col: c,
-        span: spans.get(`${r}:${c}`) ?? { rows: 1, cols: 1 },
-        text,
-        bold: Boolean(cell.font?.bold),
-        align: cell.alignment?.horizontal ?? 'left',
-        borders: { t: side(b.top), r: side(b.right), b: side(b.bottom), l: side(b.left) }
-      });
+
+      const span = spans.get(`${r}:${c}`);
+      const align = cell.alignment?.horizontal;
+      const valign = cell.alignment?.vertical;
+      const size = typeof cell.font?.size === 'number' ? cell.font.size : null;
+      const family = typeof cell.font?.name === 'string' ? cell.font.name : null;
+      const fill = fillColour(cell.fill);
+      tally(sizes, size);
+      tally(families, family);
+
+      const out = { col: c, text };
+      if (span && (span.rows > 1 || span.cols > 1)) out.span = span;
+      if (cell.font?.bold) out.bold = true;
+      if (align && align !== 'left') out.align = align;
+      if (hasBorder) out.borders = borders;
+      if (fill) out.fill = fill;
+      if (valign) out.valign = valign;
+      if (cell.alignment?.wrapText) out.wrap = true;
+      if (size != null) out.size = size;
+      if (family != null) out.font = family;
+      cells.push(out);
     }
     // A row of nothing but placeholders is a blank spacer row: emit nothing,
     // as before, so the renderer keeps skipping it.
     rows.push({ index: r, height: Math.round(row.height ?? 15), isTask: taskRows.has(r), cells: hasReal ? cells : [] });
   }
-  return { columns, rows };
+
+  // Second pass: now that the sheet's own baseline is known, drop the size and
+  // family from every cell that merely agrees with it. Nothing is lost — the
+  // renderer sets the baseline once on the table — and on the current corpus
+  // this is the difference between ~6,500 redundant declarations and a few
+  // hundred meaningful ones.
+  const defaults = { size: modal(sizes, 10), font: modal(families, null) };
+  for (const row of rows) {
+    for (const cell of row.cells) {
+      if (cell.size === defaults.size) delete cell.size;
+      if (cell.font === defaults.font) delete cell.font;
+    }
+  }
+
+  return { columns, rows, defaults };
 }

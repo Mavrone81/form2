@@ -227,7 +227,52 @@ a{color:var(--ink)}
 .sheet{border-collapse:collapse;width:100%;font-size:12.5px;border:1px solid var(--ink);border-top:0}
 .sheet th{background:var(--soft);font:600 9.5px/1 var(--mono);letter-spacing:.1em;
   text-transform:uppercase;color:var(--mute);text-align:left;padding:8px 9px;border:1px solid var(--rule)}
-.sheet td{border:1px solid var(--rule);padding:6px 9px;vertical-align:top}
+.sheet td{padding:6px 9px;vertical-align:top}
+/* The app's OWN tables (the admin listings and the field mapper) keep the
+   uniform gridline they were designed with. The reproduced spreadsheet below
+   must not have it — see `.sheet.xl`. */
+.sheet:not(.xl) td{border:1px solid var(--rule)}
+
+/* ---------- .sheet.xl — a reproduction of a controlled document ----------
+   This is the ONE place in this app that renders somebody else's design
+   instead of its own (see the header comment in web/js/form-view.js). The
+   borders, weights, shading, sizes, families, alignment and wrapping all come
+   from the spreadsheet, cell by cell, and are written onto each <td> by
+   form-view.js.
+
+   So there is deliberately NO blanket cell border here. A uniform 1px rule on
+   every cell drew a box around thousands of cells the form leaves open, and
+   flattened the medium/thin contrast that frames each section of the document
+   — it fought the per-cell data and won, because it applied to cells the data
+   said had no border at all. The rule to keep: this stylesheet sets the
+   sheet's neutral ground, and the document's own styling comes from the cell.
+
+   Padding is tight because a spreadsheet's is: the row heights form-view.js
+   applies are the sheet's real ones, and 6px of vertical padding on a 20px row
+   makes every row a third taller than the printed form. */
+/* The reproduction is laid out at the SHEET's own size, not stretched to fill
+   the pane. `table-layout:fixed` makes the <col> widths (the spreadsheet's own
+   column widths) authoritative instead of advisory, and `width:max-content`
+   lets the table be as wide as those columns add up to. Squeezing it to the
+   pane instead re-wrapped every line and made the reference form 3,613px tall
+   where the sheet itself is 914px — the columns lined up and the page still
+   did not look like the page. `min-width:100%` keeps a narrow form filling the
+   pane rather than huddling on the left. Wider than the viewport is fine and
+   expected: `.table-scroll` pans it, and the page body still never scrolls
+   horizontally. */
+.sheet.xl{width:max-content;min-width:100%;table-layout:fixed;
+  --sheet-fallback:"Aptos Narrow",Calibri,Arial,Helvetica,sans-serif}
+/* Cell shading arrives as `--cell-fill` rather than as an inline background,
+   so that the out-of-scope row tint can still win over it (see `.row-out`
+   below). An inline background would outrank every selector and a shaded cell
+   would punch a hole in the tint. */
+.sheet.xl td{border:0;padding:1px 4px;vertical-align:top;
+  background:var(--cell-fill,transparent);overflow-wrap:anywhere}
+/* Placeholders hold a column open so the cells to their right land in their
+   true column. They are not part of the document: nothing is drawn for them,
+   and their padding is zero so they cannot make a row taller than the sheet
+   prints it. */
+.sheet.xl td.filler{border:0;background:none;padding:0}
 .sheet td.n{width:32px;text-align:right;color:var(--mute);font-family:var(--mono);font-size:11px}
 .sheet td.f{width:44px;font-family:var(--mono);font-size:11px;font-weight:600}
 .sheet td.status-cell{width:96px;padding:0}
@@ -280,6 +325,10 @@ a{color:var(--ink)}
    at full reading contrast — a technician must be able to read every line,
    including the tasks this visit does not cover. */
 .row-out td{background:var(--tint);color:var(--tint-ink)}
+/* ...and it still wins inside the reproduced sheet, where `.sheet.xl td`
+   carries the cell's own shading at a higher specificity. De-emphasis by
+   background tint is the rule here as everywhere: never a fade. */
+.sheet.xl tr.row-out td{background:var(--tint);color:var(--tint-ink)}
 .row-out .status-cell{position:relative}
 .row-out .status-cell input{visibility:hidden}
 .row-out .status-cell::after{content:"not in scope";position:absolute;inset:0;

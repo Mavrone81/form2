@@ -187,3 +187,76 @@ test('the tabs meet the 44px tap-target floor and are not shrunk at any breakpoi
     assert.doesNotMatch(r.body, /min-height:\s*0\b/, `"${r.selector}" must not drop below the tap-target floor`);
   }
 });
+
+test('the reproduced spreadsheet has NO blanket cell border, and the app\'s own tables still do', () => {
+  // This replaces the assumption the previous version of this file was written
+  // under: that `.sheet td{border:1px solid var(--rule)}` drew every gridline.
+  // It did — including around the ~4,500 placeholder cells that hold a column
+  // open and around every cell the form deliberately leaves open, and at ONE
+  // weight, which flattened the medium section framing into the thin interior
+  // rules. The document's borders now come from the cell (see
+  // server/grid-model.js and cellStyle() in web/js/form-view.js), so a blanket
+  // rule here would fight real data and win.
+  //
+  // The guard is not deleted, it is inverted, and it keeps the other half:
+  // `.sheet` is also worn by the admin listings and the field mapper, which
+  // are the app's own tables and must keep the uniform gridline they were
+  // designed with.
+  const tdBorderRules = rules.filter((r) => {
+    const segs = r.selector.split(',').map((s) => s.trim());
+    return segs.some((s) => /(^|\s)\.sheet[^\s]*\s+td$/.test(s)) &&
+      /(^|[;\s])border\s*:/.test(r.body);
+  });
+  assert.ok(tdBorderRules.length > 0, 'expected rules that set a border on sheet cells');
+
+  for (const r of tdBorderRules) {
+    const segs = r.selector.split(',').map((s) => s.trim()).filter((s) => /\.sheet/.test(s));
+    for (const seg of segs) {
+      const drawsOne = !/border\s*:\s*(0|none)\b/.test(r.body);
+      if (!drawsOne) continue;
+      assert.ok(
+        /:not\(\.xl\)/.test(seg) === true || /\.xl/.test(seg) === false,
+        `"${seg}" draws a border on every cell; the reproduced sheet (.sheet.xl) must take its borders from the cell`
+      );
+      assert.doesNotMatch(seg, /\.sheet\.xl\s+td$/,
+        'the reproduced sheet must not have a blanket cell border');
+    }
+  }
+
+  // The reproduction must explicitly stand its cells down to no border, so the
+  // per-cell declarations are the only thing drawing a line.
+  const xlTd = rules.find((r) => r.selector.split(',').some((s) => s.trim() === '.sheet.xl td'));
+  assert.ok(xlTd, 'expected a .sheet.xl td rule');
+  assert.match(xlTd.body, /border\s*:\s*0\b/, '.sheet.xl td must declare no border of its own');
+
+  // ...and the app's own tables must still be ruled.
+  const appTd = rules.find((r) => r.selector.split(',').some((s) => s.trim() === '.sheet:not(.xl) td'));
+  assert.ok(appTd, 'expected the app\'s own .sheet tables to keep their gridline');
+  assert.match(appTd.body, /border\s*:\s*1px/, 'the admin listings must keep their uniform gridline');
+});
+
+test('a placeholder cell draws nothing and cannot change a row\'s height', () => {
+  // Placeholders exist only to hold a column open so the cells to their right
+  // land in their true column. Anything drawn for them — a border, a
+  // background, or padding — is a mark the printed form does not have.
+  const filler = rules.find((r) => r.selector.split(',').some((s) => s.trim() === '.sheet.xl td.filler'));
+  assert.ok(filler, 'expected a .sheet.xl td.filler rule');
+  assert.match(filler.body, /border\s*:\s*0\b/, 'a placeholder must draw no border');
+  assert.match(filler.body, /background\s*:\s*none\b/, 'a placeholder must draw no background');
+  assert.match(filler.body, /padding\s*:\s*0\b/, 'a placeholder must add no padding');
+});
+
+test('cell shading never outranks the out-of-scope row tint', () => {
+  // Shading arrives as `--cell-fill`, so a shaded cell inside a row this
+  // visit does not cover still shows the tint rather than punching a hole in
+  // it. De-emphasis stays a background tint and never a fade — the rule this
+  // file has guarded since the white-on-white defect.
+  const xlTd = rules.find((r) => r.selector.split(',').some((s) => s.trim() === '.sheet.xl td'));
+  assert.ok(xlTd, 'expected a .sheet.xl td rule');
+  assert.match(xlTd.body, /background\s*:\s*var\(--cell-fill/, 'shading must come through a custom property');
+
+  const tinted = rules.find((r) => /\.sheet\.xl\s+tr\.row-out\s+td/.test(r.selector));
+  assert.ok(tinted, 'expected the row tint to be restated at a specificity that beats .sheet.xl td');
+  assert.match(tinted.body, /background\s*:\s*var\(--tint\)/, 'the out-of-scope tint must win inside the sheet');
+  assert.doesNotMatch(tinted.body, /opacity\s*:\s*0?\.[0-6]\b/, 'de-emphasis is never a fade');
+});

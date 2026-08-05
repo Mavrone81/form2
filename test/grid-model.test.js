@@ -22,6 +22,12 @@ async function gridFor(sample) {
 
 const isFiller = (cell) => cell.filler === true;
 const realCells = (row) => row.cells.filter((c) => !isFiller(c));
+// `span` is omitted whenever a cell occupies exactly one row and one column,
+// and `borders` whenever no side has one — the model states only what departs
+// from the sheet's default (see server/grid-model.js). Every consumer reads
+// them through an accessor like these two.
+const spanOf = (cell) => cell.span ?? { rows: 1, cols: 1 };
+const sidesOf = (cell) => cell.borders ?? {};
 
 // Which columns of `row` are already spoken for by a cell anchored in an
 // EARLIER row that spans down into this one. A renderer emitting cells in
@@ -38,7 +44,7 @@ function claimRow(row, carried, columnCount) {
   for (const col of carried) claim(col, 'a rowspan from an earlier row');
   const past = [];
   for (const cell of row.cells) {
-    for (let c = cell.col; c < cell.col + cell.span.cols; c++) {
+    for (let c = cell.col; c < cell.col + spanOf(cell).cols; c++) {
       if (c > columnCount) past.push(c);
       else claim(c, `the cell at col ${cell.col}`);
     }
@@ -51,10 +57,10 @@ function claimRow(row, carried, columnCount) {
 // Columns each later row inherits from the row-spanning cells of `row`.
 function spread(row, carry) {
   for (const cell of row.cells) {
-    if (cell.span.rows <= 1) continue;
-    for (let r = row.index + 1; r < row.index + cell.span.rows; r++) {
+    if (spanOf(cell).rows <= 1) continue;
+    for (let r = row.index + 1; r < row.index + spanOf(cell).rows; r++) {
       if (!carry.has(r)) carry.set(r, new Set());
-      for (let c = cell.col; c < cell.col + cell.span.cols; c++) carry.get(r).add(c);
+      for (let c = cell.col; c < cell.col + spanOf(cell).cols; c++) carry.get(r).add(c);
     }
   }
 }
@@ -65,8 +71,8 @@ test('grid carries merges, widths and structural content', { skip: fx ? false : 
   assert.ok(grid.rows.length > 20);
 
   const cells = grid.rows.flatMap((r) => r.cells);
-  const colMerged = cells.filter((c) => c.span.cols > 1);
-  const rowMerged = cells.filter((c) => c.span.rows > 1);
+  const colMerged = cells.filter((c) => spanOf(c).cols > 1);
+  const rowMerged = cells.filter((c) => spanOf(c).rows > 1);
   assert.ok(colMerged.length > 0, 'expected column-spanning merged cells');
   assert.ok(rowMerged.length > 0, 'expected row-spanning merged cells');
 
@@ -75,10 +81,13 @@ test('grid carries merges, widths and structural content', { skip: fx ? false : 
   const bold = cells.filter((c) => c.bold);
   assert.ok(bold.length > 0, 'expected at least one bold cell');
 
-  const allSidesBordered = cells.filter((c) => c.borders.t && c.borders.r && c.borders.b && c.borders.l);
+  const allSidesBordered = cells.filter((c) => {
+    const b = sidesOf(c);
+    return b.t && b.r && b.b && b.l;
+  });
   assert.ok(allSidesBordered.length > 0, 'expected at least one fully-bordered cell');
 
-  const nonEmptyText = cells.filter((c) => c.text.length > 0);
+  const nonEmptyText = cells.filter((c) => (c.text ?? '').length > 0);
   assert.ok(nonEmptyText.length > 20, 'expected a non-trivial number of text-bearing cells');
 });
 
@@ -88,8 +97,8 @@ test('no coordinate in the grid is claimed twice, including cells covered by a s
   const duplicates = [];
   for (const row of grid.rows) {
     for (const cell of row.cells) {
-      for (let r = row.index; r < row.index + cell.span.rows; r++) {
-        for (let c = cell.col; c < cell.col + cell.span.cols; c++) {
+      for (let r = row.index; r < row.index + spanOf(cell).rows; r++) {
+        for (let c = cell.col; c < cell.col + spanOf(cell).cols; c++) {
           const key = `${r}:${c}`;
           if (claimed.has(key)) duplicates.push(key);
           claimed.add(key);
@@ -160,7 +169,7 @@ test('the parts-table data rows start at column 1 and cover the same columns as 
     const header = byIndex.get(dataRows[0].index - 1);
     assert.ok(header && realCells(header).length === 5 && realCells(header)[0].col === 1,
       `${sample.id}: expected the parts-table header directly above the first data row`);
-    const total = (row) => row.cells.reduce((sum, c) => sum + c.span.cols, 0);
+    const total = (row) => row.cells.reduce((sum, c) => sum + spanOf(c).cols, 0);
 
     assert.equal(header.cells[0].col, 1, `${sample.id}: parts header should start at column 1`);
     for (const row of dataRows) {
@@ -202,20 +211,122 @@ test('placeholders are flagged, and carry no text, weight, borders or span', { s
     for (const row of grid.rows) {
       for (const cell of row.cells.filter(isFiller)) {
         fillers++;
-        assert.equal(cell.text, '', `${sample.id} ${row.index}:${cell.col}: a placeholder must carry no text`);
-        assert.equal(cell.bold, false, `${sample.id} ${row.index}:${cell.col}: a placeholder must not be bold`);
-        assert.deepEqual(cell.borders, { t: false, r: false, b: false, l: false },
-          `${sample.id} ${row.index}:${cell.col}: a placeholder must carry no borders`);
-        assert.deepEqual(cell.span, { rows: 1, cols: 1 }, `${sample.id} ${row.index}:${cell.col}: a placeholder must not span`);
+        // A placeholder is not a cell of the document: it holds a column open
+        // and states NOTHING else, so a renderer has nothing it could draw.
+        assert.deepEqual(Object.keys(cell).sort(), ['col', 'filler'],
+          `${sample.id} ${row.index}:${cell.col}: a placeholder must carry only its column and the flag`);
+        assert.equal(cell.borders, undefined, `${sample.id} ${row.index}:${cell.col}: a placeholder must carry no borders`);
+        assert.equal(cell.fill, undefined, `${sample.id} ${row.index}:${cell.col}: a placeholder must carry no fill`);
+        assert.equal(cell.span, undefined, `${sample.id} ${row.index}:${cell.col}: a placeholder must not span`);
       }
       // The distinction that matters downstream: an empty BORDERED cell is a
       // box the form means someone to write in, and is never a placeholder.
       for (const cell of realCells(row)) {
-        const bordered = cell.borders.t || cell.borders.r || cell.borders.b || cell.borders.l;
-        assert.ok(cell.text.length > 0 || bordered || cell.span.cols > 1 || cell.span.rows > 1,
+        const bordered = Object.keys(sidesOf(cell)).length > 0;
+        assert.ok(cell.text.length > 0 || bordered || spanOf(cell).cols > 1 || spanOf(cell).rows > 1,
           `${sample.id} ${row.index}:${cell.col}: a cell with no text, borders or span should have been flagged as a placeholder`);
       }
     }
   }
   assert.ok(fillers > 0, 'expected the sample forms to need placeholders');
+});
+
+// ---------------------------------------------------------------------------
+// The document's styling, and the payload discipline that keeps it affordable
+// ---------------------------------------------------------------------------
+// The preview did not look like the print partly because the model threw this
+// away: it reduced a border to a boolean, so the medium frames that separate
+// the sections of the form and the thin gridlines inside them arrived
+// indistinguishable, and it carried no size, family, fill, vertical alignment
+// or wrapping at all.
+test('a border keeps its WEIGHT per side, and a side with none says nothing', { skip: fx ? false : SKIP }, async () => {
+  const weights = new Set();
+  let framed = 0, open = 0;
+  for (const sample of samples()) {
+    const grid = await gridFor(sample);
+    for (const row of grid.rows) {
+      for (const cell of row.cells) {
+        if (!cell.borders) { open++; continue; }
+        for (const [key, style] of Object.entries(cell.borders)) {
+          assert.ok(['t', 'r', 'b', 'l'].includes(key), `${sample.id}: unexpected border side "${key}"`);
+          assert.equal(typeof style, 'string',
+            `${sample.id} ${row.index}:${cell.col}: a border side must name its Excel style, never a boolean`);
+          assert.ok(style.length > 0, `${sample.id} ${row.index}:${cell.col}: an empty style is not a border`);
+          weights.add(style);
+        }
+        if (Object.values(cell.borders).includes('medium')) framed++;
+      }
+    }
+  }
+  // The documents frame their sections in `medium` against `thin` gridlines.
+  // Both must survive, as different values — that contrast IS the hierarchy.
+  assert.ok(weights.has('thin'), 'expected thin gridlines to survive');
+  assert.ok(weights.has('medium'), 'expected medium section framing to survive');
+  assert.ok(framed > 0, 'expected cells framed with a medium border');
+  assert.ok(open > 0, 'expected cells the documents leave unbordered to carry no borders key');
+});
+
+test('size, family, fill, vertical alignment and wrapping are present where the sheet sets them and absent where it does not',
+  { skip: fx ? false : SKIP }, async () => {
+    const grid = await buildGrid(join(fx.formsDir, fx.forms[0].file));
+    const cells = grid.rows.flatMap((r) => r.cells).filter((c) => !isFiller(c));
+
+    assert.equal(typeof grid.defaults?.size, 'number', 'the grid must state the sheet\'s own default size');
+    assert.equal(typeof grid.defaults?.font, 'string', 'the grid must state the sheet\'s own default family');
+
+    // Present where the document departs from its own baseline...
+    const sized = cells.filter((c) => typeof c.size === 'number');
+    assert.ok(sized.length > 0, 'expected cells set at a size other than the sheet default');
+    assert.ok(sized.every((c) => c.size !== grid.defaults.size),
+      'a cell that merely agrees with the sheet default must not repeat it');
+    assert.ok(cells.some((c) => typeof c.font === 'string'), 'expected a cell in another family');
+    assert.ok(cells.some((c) => c.valign === 'middle' || c.valign === 'top'), 'expected vertical alignment');
+    assert.ok(cells.some((c) => c.wrap === true), 'expected wrapped cells');
+
+    // ...and absent everywhere else. `false`/`null` placeholders would defeat
+    // the whole point, so absence has to mean absence.
+    for (const cell of cells) {
+      for (const key of ['size', 'font', 'fill', 'valign', 'wrap', 'bold', 'align', 'span', 'borders']) {
+        if (key in cell) {
+          assert.notEqual(cell[key], false, `${key} must be omitted rather than written as false`);
+          assert.notEqual(cell[key], null, `${key} must be omitted rather than written as null`);
+        }
+      }
+      if ('align' in cell) assert.notEqual(cell.align, 'left', 'the default alignment must be omitted');
+      if ('bold' in cell) assert.equal(cell.bold, true, 'only bold cells say so');
+    }
+
+    // Every fill in the twelve controlled documents is white — the sheet's own
+    // paper. Reporting those would paint an opaque white box over the
+    // out-of-scope row tint, so "no shading" is reported as no shading.
+    assert.ok(cells.every((c) => c.fill === undefined || c.fill.toUpperCase() !== '#FFFFFF'),
+      'white is the paper, not a fill');
+  });
+
+test('shading is reported when a sheet genuinely has some', { skip: fx ? false : SKIP }, async () => {
+  // Built here rather than taken from a controlled document: none of the
+  // twelve shades anything, and this must still be pinned so a form that does
+  // is not silently rendered blank. No form content is used.
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'grid-fill-'));
+  try {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('s');
+    ws.getCell('A1').value = 'shaded';
+    ws.getCell('A1').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
+    ws.getCell('B1').value = 'plain';
+    ws.getCell('C1').value = 'white';
+    ws.getCell('C1').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFFF' } };
+    const path = join(dir, 'fill.xlsx');
+    await wb.xlsx.writeFile(path);
+
+    const grid = await buildGrid(path);
+    const byCol = new Map(grid.rows[0].cells.map((c) => [c.col, c]));
+    assert.equal(byCol.get(1).fill, '#D9D9D9', 'a real shade must survive');
+    assert.equal(byCol.get(2).fill, undefined, 'an unshaded cell must carry no fill');
+    assert.equal(byCol.get(3).fill, undefined, 'white is the paper, not a fill');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
