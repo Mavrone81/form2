@@ -344,3 +344,117 @@ test('the technician is shown WHY a rejected record came back — reason, who an
   assert.ok(fieldsIdx >= 0, 'expected the field-group render loop');
   assert.ok(noticeIdx < fieldsIdx, 'the rejection reason must render before the fields');
 });
+
+// --- Static guards: the Parts Required table in the right-hand panel -------
+
+const cssSrc = readFileSync(new URL('../web/css/app.css', import.meta.url), 'utf8');
+
+test('the parts fields render as one table, not as twenty separately-labelled fields', () => {
+  // Five ruled rows x four columns is twenty inputs. Rendered through the
+  // ordinary `.fld` path they would be a twenty-item vertical list with the
+  // words "Part No" repeated five times — unusable on a phone, and it would
+  // not read as the table the form prints. The panel must group them.
+  assert.match(fieldPanelSrc, /part_\(\?:\?<row>\)?\\d\+|\^part_|part_\(\\d\+\)/,
+    'expected field-panel.js to recognise parts fields by their key');
+  assert.match(fieldPanelSrc, /parts-row/, 'expected a per-row container class');
+  assert.match(fieldPanelSrc, /parts-hd|parts-head/, 'expected a single shared column-header row');
+});
+
+test('every parts input carries its own accessible name', () => {
+  // The visible column heading is shared by five inputs, so each input must
+  // name itself — otherwise a screen reader announces five identical
+  // unlabelled boxes.
+  assert.match(fieldPanelSrc, /aria-label/, 'expected an accessible name on each parts input');
+});
+
+test('Qty asks for a number pad without rejecting what a technician might type', () => {
+  // inputMode gives a phone the numeric keypad. `type="number"` would also do
+  // that, but it silently discards a value the browser cannot parse — a
+  // technician typing "2 sets" would watch it vanish — and adds spinners.
+  assert.match(fieldPanelSrc, /inputMode\s*=\s*['"]numeric['"]/, 'expected inputMode="numeric" on Qty');
+  assert.doesNotMatch(fieldPanelSrc, /\.type\s*=\s*['"]number['"]/, 'must not use type="number" for Qty');
+});
+
+test('the parts table stays inside the pane at every width — no horizontal page overflow', () => {
+  // The reproduced sheet on the LEFT gets `.table-scroll` because it is a
+  // controlled document that must not reflow. This is the app's own UI and
+  // must simply fit: the columns are laid out with a grid whose tracks can
+  // shrink, so no width can push the page sideways.
+  // Structural, not positional: it must not matter whether the two share one
+  // grouped rule or get one each, nor what order they appear in.
+  const withoutComments = cssSrc.replace(/\/\*[\s\S]*?\*\//g, ' ');
+  const leafRules = [];
+  const re = /([^{}]+)\{([^{}]*)\}/g;
+  let m;
+  while ((m = re.exec(withoutComments))) leafRules.push({ selector: m[1].trim(), body: m[2] });
+  const covering = (sel) => leafRules.filter(
+    (r) => r.selector.split(',').some((s) => s.trim() === sel));
+
+  for (const sel of ['.parts-hd', '.parts-row']) {
+    const rules = covering(sel);
+    assert.ok(rules.length > 0, `expected a rule for ${sel}`);
+    assert.ok(rules.some((r) => /display:\s*grid/.test(r.body)),
+      `${sel} must be laid out on a grid so its tracks can shrink with the pane`);
+    // A grid track's default minimum is content-based, which is exactly what
+    // pushes a pane wider than the viewport. Every track must declare a
+    // shrinkable floor.
+    const tracks = rules.find((r) => /grid-template-columns/.test(r.body));
+    if (tracks) {
+      const value = /grid-template-columns:([^;]+)/.exec(tracks.body)[1];
+      const declared = value.match(/minmax\(/g) ?? [];
+      assert.equal(declared.length, 4, `${sel} must declare all four tracks as minmax()`);
+      assert.doesNotMatch(value, /minmax\(\s*(auto|min-content|max-content)/,
+        'a content-based track minimum is what overflows a 375px screen');
+    }
+  }
+
+  for (const r of leafRules) {
+    if (!/\.parts/.test(r.selector)) continue;
+    const width = /(^|[;\s])(min-)?width:\s*(\d+)px/.exec(r.body);
+    assert.ok(!width || Number(width[3]) <= 200,
+      `"${r.selector.trim()}" pins a width wide enough to overflow a 375px screen`);
+  }
+});
+
+test('the parts inputs declare their own colour and meet the tap-target floor', () => {
+  // The user-reported white-on-white defect: a control with a background and
+  // no declared colour is invisible in dark mode. Same rule as every other
+  // control in this app.
+  const leaf = /([^{}]+)\{([^{}]*)\}/g;
+  const withoutComments = cssSrc.replace(/\/\*[\s\S]*?\*\//g, ' ');
+  let m, checked = 0;
+  while ((m = leaf.exec(withoutComments))) {
+    if (!/\.parts/.test(m[1]) || !/input/.test(m[1])) continue;
+    if (!/background(-color)?\s*:/.test(m[2])) continue;
+    checked++;
+    assert.match(m[2], /(^|[;\s])color\s*:/, `"${m[1].trim()}" sets a background but no colour`);
+  }
+  assert.ok(checked > 0, 'expected at least one .parts input rule that sets a background');
+  assert.match(withoutComments, /\.parts[^{]*input[^{]*\{[^}]*min-height:\s*44px/,
+    'parts inputs must meet the 44px tap-target floor');
+});
+
+test('the parts helpers live at module scope, declared before renderFields uses them', () => {
+  // REGRESSION GUARD, found in a real browser and not by any test here.
+  // partsGrid() and its PARTS_* constants were first written INSIDE
+  // renderFields(), below the loop that calls them. Function declarations
+  // hoist; `const` does not — so the very first render threw
+  // "Cannot access 'PARTS_ORDER' before initialization" and the right pane
+  // stopped dead after the Record section: no parts table, no tasks, no
+  // signature pad. Every static guard above still passed, because the code
+  // shapes they look for were all present.
+  const moduleScope = (name, kind) =>
+    new RegExp(`^${kind}\\s+${name}\\b`, 'm').test(fieldPanelSrc);
+  assert.ok(moduleScope('partsGrid', 'function'), 'partsGrid must be declared at module scope');
+  assert.ok(moduleScope('partsKeyOf', 'function'), 'partsKeyOf must be declared at module scope');
+
+  const renderIdx = fieldPanelSrc.search(/^export function renderFields\b/m);
+  assert.ok(renderIdx > 0, 'expected renderFields at module scope');
+  for (const decl of fieldPanelSrc.match(/^const PARTS_[A-Z_]+/gm) ?? []) {
+    const at = fieldPanelSrc.indexOf(decl);
+    assert.ok(at < renderIdx,
+      `${decl.trim()} is declared after renderFields — a const does not hoist, so the first render throws`);
+  }
+  assert.ok((fieldPanelSrc.match(/^const PARTS_[A-Z_]+/gm) ?? []).length > 0,
+    'expected the parts constants to exist, so this guard is not vacuous');
+});

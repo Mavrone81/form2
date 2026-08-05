@@ -421,3 +421,61 @@ test('a field the document has no blank for is omitted, never invented', async (
     assert.equal(cellFor.special_tools, undefined, 'no special-tools label at all, so it must be omitted');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+// --- The Parts Required table ----------------------------------------------
+
+test('every blank parts row maps its four cells to the columns the sheet prints them in (real forms)',
+  { skip: fx ? false : SKIP }, async () => {
+    for (const f of fx.forms) {
+      const def = await parseWorkbook(join(fx.formsDir, f.file));
+      const { cellFor } = cellMapFor(def);
+      const { rows, columns } = def.parts;
+
+      const partKeys = Object.keys(cellFor).filter((k) => k.startsWith('part_'));
+      assert.equal(partKeys.length, rows.length * 4, `${f.id} maps four cells per parts row`);
+
+      for (const r of rows) {
+        assert.deepEqual(cellFor[`part_${r}_no`], { row: r, col: columns.no }, `${f.id} r${r} part no`);
+        assert.deepEqual(cellFor[`part_${r}_desc`], { row: r, col: columns.desc }, `${f.id} r${r} description`);
+        assert.deepEqual(cellFor[`part_${r}_qty`], { row: r, col: columns.qty }, `${f.id} r${r} qty`);
+        assert.deepEqual(cellFor[`part_${r}_remarks`], { row: r, col: columns.remarks }, `${f.id} r${r} remarks`);
+      }
+    }
+  });
+
+test('the reference form maps its parts table to the exact cells the document prints',
+  { skip: fx ? false : SKIP }, async () => {
+    // Pinned against one real document rather than only against the parser's
+    // own report, so a change of column detection cannot move every value four
+    // columns left and still agree with itself.
+    const ref = fx.forms.find((f) => f.id === 'F01') ?? fx.forms[0];
+    const def = await parseWorkbook(join(fx.formsDir, ref.file));
+    assert.deepEqual(def.parts.columns, { no: 4, desc: 7, qty: 12, remarks: 13 });
+    assert.equal(def.parts.rows.length, 5, 'the reference form prints five ruled parts rows');
+
+    const { cellFor } = cellMapFor(def);
+    const first = def.parts.rows[0];
+    assert.deepEqual(cellFor[`part_${first}_no`], { row: first, col: 4 });
+    assert.deepEqual(cellFor[`part_${first}_qty`], { row: first, col: 12 });
+    assert.equal(Object.keys(cellFor).filter((k) => k.startsWith('part_')).length, 20);
+  });
+
+test('a form with no parts table maps no parts cells and does not throw', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cellmap-'));
+  try {
+    const path = await writeSyntheticWorkbook(join(dir, 'no-parts.xlsx'));
+    const { cellFor } = cellMapFor(await parseWorkbook(path));
+    assert.deepEqual(Object.keys(cellFor).filter((k) => k.startsWith('part_')), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('cellMapFor tolerates a definition with a malformed parts table', () => {
+  // Pure-function guard: a parts table whose rows or columns are not integers
+  // must produce no coordinates rather than {row: undefined, col: NaN}.
+  const { cellFor } = cellMapFor({
+    tasks: [], cells: {},
+    parts: { headerRow: 3, columns: { no: 'D', desc: null, qty: 12, remarks: 13 }, rows: [4, 'five', null] }
+  });
+  assert.deepEqual(Object.keys(cellFor).filter((k) => k.startsWith('part_')), ['part_4_qty', 'part_4_remarks']);
+  assert.deepEqual(cellMapFor({ parts: null }).cellFor, {});
+});

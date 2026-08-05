@@ -248,3 +248,81 @@ test('a record carrying rejection history still passes veraPDF as PDF/A-2U',
     assert.match(out, /PASS/, `veraPDF reported: ${out}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+// --- The Parts Required table on the archived record -----------------------
+// A parts snapshot the way scanner.js emits it: four fields per ruled row,
+// keyed by the sheet row. Two rows here — the first used, the second left
+// blank, which is the ordinary case on a maintenance visit.
+const PARTS_SNAPSHOT = [
+  ...FIXTURE.snapshot,
+  { field_key: 'part_11_no', label: 'Part No', section: 'Parts required', kind: 'text' },
+  { field_key: 'part_11_desc', label: 'Description', section: 'Parts required', kind: 'text' },
+  { field_key: 'part_11_qty', label: 'Qty', section: 'Parts required', kind: 'text' },
+  { field_key: 'part_11_remarks', label: 'Remarks', section: 'Parts required', kind: 'text' },
+  { field_key: 'part_12_no', label: 'Part No', section: 'Parts required', kind: 'text' },
+  { field_key: 'part_12_desc', label: 'Description', section: 'Parts required', kind: 'text' },
+  { field_key: 'part_12_qty', label: 'Qty', section: 'Parts required', kind: 'text' },
+  { field_key: 'part_12_remarks', label: 'Remarks', section: 'Parts required', kind: 'text' }
+];
+const PARTS_VALUES = [
+  ...FIXTURE.values,
+  { field_key: 'part_11_no', value: 'WX-4417-A' },
+  { field_key: 'part_11_desc', value: 'Drive belt' },
+  { field_key: 'part_11_qty', value: '2' },
+  { field_key: 'part_11_remarks', value: 'Worn' }
+];
+
+test('values entered in the parts table appear in the generated record',
+  { skip: hasPdftotext ? false : 'pdftotext not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdf-parts-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    writeFileSync(file, await renderRecordPdf({ ...FIXTURE, snapshot: PARTS_SNAPSHOT, values: PARTS_VALUES }));
+    const text = execFileSync('pdftotext', [file, '-'], { encoding: 'utf8' }).replace(/\s+/g, ' ');
+    assert.match(text, /Parts required/i, 'the parts section is named on the record');
+    assert.match(text, /WX-4417-A/, 'the part number is on the archived record');
+    assert.match(text, /Drive belt/, 'the description is on the archived record');
+    assert.match(text, /Qty: 2/, 'the quantity is on the archived record');
+    assert.match(text, /Worn/, 'the parts remark is on the archived record');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a parts row nobody filled in prints nothing at all',
+  { skip: hasPdftotext ? false : 'pdftotext not installed' }, async () => {
+  // Most visits replace no parts. Printing four empty labelled lines per
+  // unused row would make every clean record look half-finished.
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdf-parts-blank-'));
+  try {
+    const used = join(dir, 'used.pdf');
+    writeFileSync(used, await renderRecordPdf({ ...FIXTURE, snapshot: PARTS_SNAPSHOT, values: PARTS_VALUES }));
+    const usedText = execFileSync('pdftotext', [used, '-'], { encoding: 'utf8' }).replace(/\s+/g, ' ');
+    // Exactly one "Part No:" line — row 11's. Row 12 is blank and prints none.
+    assert.equal((usedText.match(/Part No:/g) ?? []).length, 1, 'only the used row prints');
+
+    const none = join(dir, 'none.pdf');
+    writeFileSync(none, await renderRecordPdf({ ...FIXTURE, snapshot: PARTS_SNAPSHOT, values: FIXTURE.values }));
+    const noneText = execFileSync('pdftotext', [none, '-'], { encoding: 'utf8' }).replace(/\s+/g, ' ');
+    assert.doesNotMatch(noneText, /Part No:/, 'a record with no parts prints no parts lines');
+    assert.doesNotMatch(noneText, /Parts required/i, 'and no empty Parts required heading');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a record carrying parts values still passes veraPDF as PDF/A-2U',
+  { skip: hasVera ? false : 'veraPDF not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdfa-parts-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    writeFileSync(file, await renderRecordPdf({ ...FIXTURE, snapshot: PARTS_SNAPSHOT, values: PARTS_VALUES }));
+    const out = execFileSync('verapdf', ['-f', '2u', '--format', 'text', file], { encoding: 'utf8' });
+    assert.match(out, /PASS/, `veraPDF reported: ${out}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -120,7 +120,18 @@ const MIGRATIONS = [
   // the record was made from, and say so on the document if it is not.
   { table: 'submissions', column: 'doc_number', ddl: "alter table submissions add column doc_number text not null default ''" },
   { table: 'submissions', column: 'revision', ddl: "alter table submissions add column revision text not null default ''" },
-  { table: 'submissions', column: 'content_hash', ddl: "alter table submissions add column content_hash text not null default ''" }
+  { table: 'submissions', column: 'content_hash', ddl: "alter table submissions add column content_hash text not null default ''" },
+  // Which generation of the field extractor last wrote this form's parsed
+  // fields. A rescan skips a file whose bytes have not changed, which is right
+  // for the file but wrong for the FIELDS: teach the parser to extract
+  // something new — the Parts Required table was the first case — and every
+  // already-catalogued form would keep its old field list forever, because no
+  // source document changed. This is deliberately NOT folded into
+  // content_hash: that value is copied onto each submission and is what tells
+  // a reader whether the source document itself has changed since the record
+  // was signed. Moving it for an app-side reason would print that warning
+  // across every existing record, which would be untrue.
+  { table: 'form_catalog', column: 'fields_version', ddl: "alter table form_catalog add column fields_version integer not null default 0" }
 ];
 
 function applyMigrations(db) {

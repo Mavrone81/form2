@@ -134,6 +134,100 @@ function frequencyBand(ws, beforeRow, covered) {
   return [];
 }
 
+// The Parts Required table: the small ruled grid a technician writes any
+// replaced parts into. Four columns on every one of the controlled documents —
+// Part No, Description, Qty, Remarks — with a handful of empty boxes beneath
+// them.
+//
+// The four headings are matched on the heading cell's own text, punctuation and
+// spacing removed, because one of the documents prints its Description heading
+// with a stray space inside the word (a wrapped cell saved back by Excel).
+// Matching on the printed heading is the whole point: the header row moves
+// between documents and so could the columns, and a fixed offset from the
+// "Parts Required" label would quietly write a part number into whatever
+// column happened to sit there.
+const PARTS_COLUMNS = [
+  { key: 'no', match: (f) => f === 'partno' || f === 'partnumber' || f === 'partnos' },
+  { key: 'desc', match: (f) => f === 'desc' || f.startsWith('description') },
+  { key: 'qty', match: (f) => f === 'qty' || f === 'quantity' },
+  { key: 'remarks', match: (f) => f === 'remark' || f === 'remarks' }
+];
+
+// A ruled box: a cell the document draws a border around, which on these forms
+// is what says "an entry goes HERE". It is the parts table's equivalent of the
+// run of underscores isPrintedBlank() looks for elsewhere, and it is what
+// separates the table's real rows from the unruled spacer row printed beneath
+// them — a row that looks equally empty in the cell values and that the form
+// draws nothing for.
+const isRuledBox = (cell) => {
+  const b = cell?.border;
+  return !!(b && (b.top?.style || b.right?.style || b.bottom?.style || b.left?.style));
+};
+
+// The four column positions, read from one candidate header row, or null.
+//
+// Fails CLOSED, exactly as the task header does: all four headings must be
+// present and in ascending order. A document whose parts table this does not
+// recognise yields no parts fields at all, which is strictly better than four
+// fields aimed at columns that were guessed.
+function partsHeaderColumns(ws, r, covered) {
+  const row = ws.getRow(r);
+  const found = new Map();
+  for (let c = 1; c <= (row.cellCount || 0); c++) {
+    if (covered.has(`${r}:${c}`)) continue;
+    const f = flat(txt(row.getCell(c)));
+    if (!f) continue;
+    for (const col of PARTS_COLUMNS) {
+      if (!found.has(col.key) && col.match(f)) { found.set(col.key, c); break; }
+    }
+  }
+  if (found.size !== PARTS_COLUMNS.length) return null;
+  const cols = PARTS_COLUMNS.map((c) => found.get(c.key));
+  for (let i = 1; i < cols.length; i++) if (!(cols[i - 1] < cols[i])) return null;
+  return Object.fromEntries(PARTS_COLUMNS.map((c, i) => [c.key, cols[i]]));
+}
+
+// The sheet rows of the table's empty boxes, top to bottom.
+//
+// A row qualifies only while all four of its column cells are renderable (not
+// swallowed by a merge — see mergeMap), ruled, and empty. The run stops at the
+// first row that is not, which is what keeps the unruled spacer row beneath the
+// table, and anything printed below it, out of the result.
+function partsBlankRows(ws, headerRow, columns, taskHeaderRow, covered) {
+  const cols = Object.values(columns);
+  const limit = headerRow < taskHeaderRow ? taskHeaderRow : ws.rowCount + 1;
+  const rows = [];
+  for (let r = headerRow + 1; r < limit; r++) {
+    const row = ws.getRow(r);
+    const usable = cols.every((c) => {
+      const cell = row.getCell(c);
+      return !covered.has(`${r}:${c}`) && isRuledBox(cell) && !txt(cell);
+    });
+    if (!usable) break;
+    rows.push(r);
+  }
+  return rows;
+}
+
+// The parts table as structure rather than as a count: which row carries the
+// headings, which column each heading sits in, and the sheet row of every empty
+// box beneath them. Enough for a caller to name a field per cell and to place
+// what is typed into it at an exact coordinate.
+//
+// On the twelve controlled documents the headings share the anchor's own row,
+// but a couple of rows below it are also considered so that the position is
+// read from the document rather than assumed.
+function partsTable(ws, anchor, taskHeaderRow, covered) {
+  if (!anchor) return null;
+  const last = Math.min(anchor.row + 2, ws.rowCount);
+  for (let r = anchor.row; r <= last; r++) {
+    const columns = partsHeaderColumns(ws, r, covered);
+    if (!columns) continue;
+    return { headerRow: r, columns, rows: partsBlankRows(ws, r, columns, taskHeaderRow, covered) };
+  }
+  return null;
+}
+
 function rightOf(ws, row, col) {
   for (let c = col + 1; c <= col + 12; c++) {
     const v = txt(ws.getRow(row).getCell(c));
@@ -207,14 +301,13 @@ export async function parseWorkbook(path) {
     });
   }
 
+  // Merge coverage is needed by both the parts table below and the cell map
+  // further down, and there is one definition of it (see mergeMap) so the two
+  // can never disagree about which coordinates buildGrid actually renders.
+  const { covered } = mergeMap(ws);
+
   const partsAnchor = findCell(ws, (v) => v.startsWith('parts required'));
-  let partsRows = 0;
-  if (partsAnchor) {
-    for (let r = partsAnchor.row + 1; r < header.r; r++) {
-      if (txt(ws.getRow(r).getCell(partsAnchor.col + 3))) break;
-      partsRows++;
-    }
-  }
+  const parts = partsTable(ws, partsAnchor, header.r, covered);
 
   const ppeAnchor = findCell(ws, (v) => v.startsWith('ppe required'));
   const ppe = [];
@@ -235,7 +328,6 @@ export async function parseWorkbook(path) {
   // exact (row, col) the grid genuinely renders, or null — never a guess.
   // The client writes values only into the cells named here, so a null is a
   // field that stays in the right-hand panel and off the preview.
-  const { covered } = mergeMap(ws);
   const cells = {
     title: titleAnchor ? { row: titleAnchor.row + 1, col: titleAnchor.col } : null,
     special_tools: labelledBlank(ws, 'special tool', covered),
@@ -255,7 +347,7 @@ export async function parseWorkbook(path) {
     statusColumn: header.status ? colLetter(header.status) : null,
     tasks,
     cells,
-    partsRows,
+    parts,
     sections: {
       safety: sectionText('safety'),
       procedure: sectionText('procedure'),

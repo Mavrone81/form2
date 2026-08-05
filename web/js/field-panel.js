@@ -21,6 +21,131 @@ export function teardownFieldPanel() {
   teardownActivePad();
 }
 
+
+// One box of the Parts Required table, or null. Mirrors parsePartsKey() in
+// server/cell-map.js — the server and the browser share no module (web/ is
+// served as static files), so the convention is restated here the same way
+// `sig_` already is in form-view.js, and both are covered by tests.
+function partsKeyOf(fieldKey) {
+  const m = /^part_(\d+)_(no|desc|qty|remarks)$/.exec(String(fieldKey ?? ''));
+  return m ? { row: Number(m[1]), column: m[2] } : null;
+}
+
+// ------------------------------------------------------------------------
+// The Parts Required table
+// ------------------------------------------------------------------------
+// Five ruled rows by four columns is twenty inputs. Through the ordinary
+// `.fld` path that is a twenty-item vertical list with "Part No" written
+// down it five times — roughly 700px of mostly-empty inputs wedged between
+// the task list and the signature pad on a phone, and it does not read as
+// the table the document prints.
+//
+// So it is laid out as the table it is: ONE row of column headings and one
+// compact row of inputs per parts row, on a CSS grid whose tracks shrink
+// with the pane.
+//
+// WHY A GRID THAT SHRINKS RATHER THAN A `.table-scroll` THAT PANS:
+// `.table-scroll` is right for the reproduced sheet on the left, which is a
+// controlled document and must not reflow. It is wrong here. Scrolling a
+// form sideways takes the column headings off screen exactly while you are
+// typing into a column, so you lose which box you are filling — and it
+// reintroduces sideways movement on the smallest screen this app supports.
+// Narrow inputs cost nothing by comparison: the value is stored in full,
+// scrolls within its own box, and is rendered at full width in its real
+// cell on the left-hand preview as it is typed.
+//
+// WHY NOT STACK INTO PER-ROW GROUPS ON NARROW SCREENS: because a parts row
+// is empty on most visits. Stacking turns a section that is usually blank
+// into the tallest thing on the page, on the device where height is
+// scarcest. Compactness IS the mobile accommodation here.
+//
+// The shared heading is what names each column visually, so every input
+// carries its own aria-label — otherwise a screen reader meets twenty
+// identically-unlabelled boxes.
+const PARTS_ORDER = ['no', 'desc', 'qty', 'remarks'];
+const PARTS_FALLBACK = { no: 'Part No', desc: 'Description', qty: 'Qty', remarks: 'Remarks' };
+
+function partsGrid(fields, values, isLocked, change, preview) {
+  const rows = new Map();
+  for (const f of fields) {
+    const part = partsKeyOf(f.field_key);
+    if (!rows.has(part.row)) rows.set(part.row, new Map());
+    rows.get(part.row).set(part.column, f);
+  }
+
+  const wrap = document.createElement('div');
+  wrap.className = 'parts';
+
+  // Headings come from the fields the server sent, so the printed column
+  // names and the ones shown here cannot drift apart.
+  const heading = (column) => {
+    for (const row of rows.values()) {
+      const f = row.get(column);
+      if (f?.label) return f.label;
+    }
+    return PARTS_FALLBACK[column];
+  };
+
+  // A read-only record shows only the rows something was actually written
+  // in. Five rows of em-dashes would state that five parts were considered
+  // and rejected, which is not what a blank row means.
+  let entries = [...rows.entries()];
+  if (isLocked) {
+    entries = entries.filter(([, row]) =>
+      PARTS_ORDER.some((c) => String(values.get(row.get(c)?.field_key) ?? '').trim()));
+    if (!entries.length) {
+      const none = document.createElement('p');
+      none.className = 'parts-none';
+      none.textContent = 'No parts recorded.';
+      wrap.append(none);
+      return wrap;
+    }
+  }
+
+  const head = document.createElement('div');
+  head.className = 'parts-hd';
+  head.setAttribute('aria-hidden', 'true');
+  for (const column of PARTS_ORDER) {
+    const cell = document.createElement('span');
+    cell.textContent = heading(column);
+    head.append(cell);
+  }
+  wrap.append(head);
+
+  entries.forEach(([, row], i) => {
+    const tr = document.createElement('div');
+    tr.className = 'parts-row';
+    for (const column of PARTS_ORDER) {
+      const f = row.get(column);
+      if (!f) { tr.append(document.createElement('span')); continue; }
+      const value = values.get(f.field_key) ?? '';
+      // The heading is shared by every row, so each control names itself.
+      const name = `${heading(column)}, part ${i + 1}`;
+      if (isLocked) {
+        const p = document.createElement('p');
+        p.className = 'parts-ro';
+        p.textContent = value || '—';
+        tr.append(p);
+        continue;
+      }
+      const input = document.createElement('input');
+      input.id = `f-${f.field_key}`;
+      input.value = value;
+      input.setAttribute('aria-label', name);
+      // Quantity gets the phone's number pad without `type="number"`, which
+      // silently discards anything it cannot parse — a technician typing
+      // "2 sets" would watch the value disappear — and adds spinners a
+      // 44px-tall box has no room for.
+      if (column === 'qty') input.inputMode = 'numeric';
+      if (preview) input.addEventListener('input', () => preview(f.field_key, input.value));
+      input.addEventListener('change', () => change(f.field_key, input.value));
+      tr.append(input);
+    }
+    wrap.append(tr);
+  });
+  return wrap;
+}
+
 // `locked` and `canSign` are deliberately separate flags — a deviation from
 // the brief, which used a single `locked` to gate both the general record
 // fields (machine_id/task/remarks) AND signature-pad availability via
@@ -111,7 +236,14 @@ export function renderFields(container, { snapshot, values, signatures, frequenc
 
   for (const [name, fields] of groups) {
     const sec = section(name);
+    // The Parts Required table is rendered as a table, not as N separate
+    // fields — see partsGrid() below for why. Anything else in the same
+    // section still renders through the ordinary path underneath it.
+    const partFields = fields.filter((f) => partsKeyOf(f.field_key));
+    if (partFields.length) sec.append(partsGrid(partFields, byKey, locked, onChange, onPreview));
+
     for (const f of fields) {
+      if (partsKeyOf(f.field_key)) continue;
       if (f.kind === 'signature') {
         const stage = f.field_key.replace('sig_', '');
         const wrap = document.createElement('div');

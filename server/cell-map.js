@@ -7,7 +7,8 @@
 // preview and the archived PDF.
 //
 // The field-key convention it consumes is the one server/scanner.js emits:
-// `task_<sheetRow>` for a task's status, plus the fixed `special_tools`,
+// `task_<sheetRow>` for a task's status, `part_<sheetRow>_<no|desc|qty|remarks>`
+// for one box of the Parts Required table, plus the fixed `special_tools`,
 // `remarks` and `sig_<stage>` keys. A key is present in the result ONLY when
 // its cell is determinate. Two of the twelve controlled documents have no
 // Status column at all, so their task statuses have nowhere on the sheet to
@@ -15,6 +16,15 @@
 // column, which would print a technician's "OK" against the wrong heading.
 
 import { findIntervalCodes } from './intervals.js';
+
+// One box of the Parts Required table, or null. Exported so anything that has
+// to reason about a parts row as a ROW — the archived record skips a row nobody
+// filled in — asks this rather than carrying its own copy of the key shape.
+const PARTS_KEY = /^part_(\d+)_(no|desc|qty|remarks)$/;
+export function parsePartsKey(fieldKey) {
+  const m = PARTS_KEY.exec(String(fieldKey ?? ''));
+  return m ? { row: Number(m[1]), column: m[2] } : null;
+}
 
 // Column letter to 1-based index: A -> 1, M -> 13, AA -> 27. Returns null for
 // anything that is not a column letter (including the null the parser reports
@@ -91,6 +101,19 @@ export function cellMapFor(definition) {
   if (statusCol) {
     for (const t of definition?.tasks ?? []) {
       if (Number.isInteger(t?.row)) cellFor[`task_${t.row}`] = { row: t.row, col: statusCol };
+    }
+  }
+
+  // Each empty box of the Parts Required table, keyed by its sheet row and its
+  // column's name — the same `<thing>_<sheetRow>` shape as task_<row>, so a
+  // field name resolves to a coordinate by arithmetic rather than by a lookup
+  // table. Both halves are checked for being real integers: a definition whose
+  // parts table is absent or malformed must contribute no coordinates at all
+  // rather than a {row: undefined, col: NaN} that no cell could ever match.
+  for (const row of definition?.parts?.rows ?? []) {
+    if (!Number.isInteger(row)) continue;
+    for (const [name, col] of Object.entries(definition.parts.columns ?? {})) {
+      if (Number.isInteger(col)) cellFor[`part_${row}_${name}`] = { row, col };
     }
   }
 

@@ -1,6 +1,7 @@
 import PDFDocument from 'pdfkit';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { parsePartsKey } from './cell-map.js';
 
 const asset = (p) => fileURLToPath(new URL(`../assets/${p}`, import.meta.url));
 const REGULAR = asset('fonts/DejaVuSans.ttf');
@@ -299,10 +300,30 @@ function drawCellBorders(doc, borders, x, y, w, h) {
   if (borders.r) doc.moveTo(x + w, y).lineTo(x + w, y + h).stroke();
 }
 
+// A parts row nobody wrote anything in is not an omission — most maintenance
+// visits replace no parts at all — so it prints nothing rather than four empty
+// labelled lines. A row with ANY of its four boxes filled prints all four, so
+// it still reads as a row of the table. Rows are judged whole: a part number
+// with no quantity beside it says something, and dropping the empty box would
+// hide that.
+function usedPartsRows(snapshot, byKey) {
+  const used = new Set();
+  for (const field of snapshot) {
+    const part = parsePartsKey(field.field_key);
+    if (part && String(byKey.get(field.field_key) ?? '').trim()) used.add(part.row);
+  }
+  return used;
+}
+
 function drawValues(doc, snapshot, values) {
   if (!snapshot?.length) return;
   const byKey = new Map((values ?? []).map((v) => [v.field_key, v.value]));
-  const textFields = snapshot.filter((f) => f.kind !== 'signature');
+  const used = usedPartsRows(snapshot, byKey);
+  const textFields = snapshot.filter((f) => {
+    if (f.kind === 'signature') return false;
+    const part = parsePartsKey(f.field_key);
+    return part ? used.has(part.row) : true;
+  });
   if (!textFields.length) return;
 
   ensureSpace(doc, 20);

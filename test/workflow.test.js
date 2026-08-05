@@ -474,3 +474,33 @@ test('rejecting a record that does not exist is a NOT_FOUND, not a crash', () =>
     assert.fail('expected a throw');
   } catch (err) { assert.equal(err.code, 'NOT_FOUND'); }
 });
+
+// --- The Parts Required table: empty rows are the normal case ---------------
+// Most maintenance visits replace no parts at all. A blank parts row is not an
+// omission, so it must never be counted as unfilled work and must never stand
+// between a technician and a signature.
+
+test('blank parts rows do not count towards completeness', () => {
+  const { db, users, sub } = setup();
+  saveFields(db, sub.id, { task_2: 'a', task_3: 'b', task_4: 'c', task_5: 'd' }, users.tech);
+  assert.deepEqual(completenessFor(db, sub.id, TASKS, 'Y'), { inScope: 4, filled: 4, missing: [] },
+    'a record with every task done and no parts recorded is complete');
+});
+
+test('a parts row filled in does not change the completeness count either', () => {
+  const { db, users, sub } = setup();
+  saveFields(db, sub.id, { task_2: 'a', task_3: 'b', task_4: 'c', task_5: 'd' }, users.tech);
+  const before = completenessFor(db, sub.id, TASKS, 'Y');
+  saveFields(db, sub.id, { part_11_no: 'WX-1', part_11_qty: '2' }, users.tech);
+  assert.deepEqual(completenessFor(db, sub.id, TASKS, 'Y'), before,
+    'parts are recorded work, not outstanding work — the count is about tasks');
+});
+
+test('empty parts rows do not block signing, at any stage', () => {
+  const { db, users, sub } = setup();
+  // Nothing recorded in the parts table at all — the ordinary case.
+  saveFields(db, sub.id, { task_5: 'OK' }, users.tech);
+  assert.equal(signAndAdvance(db, { submissionId: sub.id, user: users.tech, signaturePng: PNG }).state, 'pending_lead');
+  assert.equal(signAndAdvance(db, { submissionId: sub.id, user: users.lead, signaturePng: PNG }).state, 'pending_engineer');
+  assert.equal(signAndAdvance(db, { submissionId: sub.id, user: users.eng, signaturePng: PNG }).state, 'approved');
+});
