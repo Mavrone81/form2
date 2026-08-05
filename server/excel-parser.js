@@ -1,5 +1,5 @@
 import ExcelJS from 'exceljs';
-import { ORDER } from './intervals.js';
+import { ORDER, findIntervalCodes } from './intervals.js';
 import { mergeMap } from './grid-model.js';
 
 const txt = (cell) => (cell?.value == null ? '' : String(cell.text ?? cell.value).trim());
@@ -102,6 +102,36 @@ function signatureBlank(ws, label, covered) {
     }
   }
   return null;
+}
+
+// The frequency band: the printed strip of interval options above the task
+// table, one of which a technician RINGS on paper to say which service this
+// visit is. Returned as the cells that carry an option code, with the same
+// trimmed text buildGrid renders, so a caller can point inside one of them.
+//
+// Located by scanning the rows above the task header for the parenthesised
+// codes themselves — never by row or column number, which move between
+// documents, and never by the surrounding prose, which differs too. The first
+// row above the header that carries any code is the band; a later mention (a
+// remark that says a yearly service includes the 3M work, say) is not.
+//
+// Two shapes exist in the twelve controlled documents and both come out of
+// here identically: one prints each option in a cell of its own, the other
+// prints them all inside a single wide cell. Merge-covered coordinates are
+// skipped for the same reason as everywhere else here — buildGrid never
+// renders them, so nothing could be shown at one.
+function frequencyBand(ws, beforeRow, covered) {
+  for (let r = 1; r < beforeRow; r++) {
+    const row = ws.getRow(r);
+    const found = [];
+    for (let c = 1; c <= (row.cellCount || 0); c++) {
+      if (covered.has(`${r}:${c}`)) continue;
+      const text = txt(row.getCell(c));
+      if (text && findIntervalCodes(text).length) found.push({ row: r, col: c, text });
+    }
+    if (found.length) return found;
+  }
+  return [];
 }
 
 function rightOf(ws, row, col) {
@@ -212,7 +242,8 @@ export async function parseWorkbook(path) {
     remarks: labelledBlank(ws, 'remark', covered),
     signatures: Object.fromEntries(
       SIGNATURE_BLOCKS.map((s) => [s.key, signatureBlank(ws, s.label, covered)])
-    )
+    ),
+    frequencyBand: frequencyBand(ws, header.r, covered)
   };
 
   return {

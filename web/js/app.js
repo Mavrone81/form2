@@ -1,5 +1,5 @@
 import { api } from './api.js';
-import { renderForm, updatePreviewField } from './form-view.js';
+import { renderForm, updatePreviewField, updatePreviewInterval } from './form-view.js';
 import { renderFields, teardownFieldPanel } from './field-panel.js';
 
 const $ = (s) => document.querySelector(s);
@@ -535,7 +535,12 @@ async function paint() {
   renderForm($('#pane-left'), form, {
     grid, inScopeRows: frequency ? spec.inScope : null,
     values: detail.values, cellFor: spec.cellFor, titleCell: spec.titleCell,
-    machineId, signatures: detail.signatures
+    machineId, signatures: detail.signatures,
+    // Which printed option of the frequency band this visit covers, ringed on
+    // the sheet the way it is ringed on paper. Read straight from the record's
+    // own interval, so an approved record shows the interval that was
+    // recorded and a draft shows what is selected now.
+    intervalCells: spec.intervalCells, selectedInterval: frequency
   });
 
   const saveError = document.createElement('p');
@@ -609,6 +614,13 @@ async function paint() {
           return;
         }
       }
+      // The ring moves the moment the selection is settled, straight into the
+      // sheet already on screen — one lookup and two text nodes, no request
+      // and no rebuild of the 71-row grid (see updatePreviewInterval). The
+      // repaint below still follows, because the row dimming and the
+      // completeness count are computed by the server for the new interval;
+      // the mark itself does not wait for it.
+      updatePreviewInterval($('#pane-left'), f);
       frequency = f;
       await paint();
     }

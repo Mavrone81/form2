@@ -256,6 +256,26 @@ a{color:var(--ink)}
   border-bottom:1.5px solid var(--ink);padding-bottom:1px;
   white-space:pre-wrap;overflow-wrap:anywhere}
 
+/* The interval this visit covers, ringed in the document's own frequency band
+   exactly as a technician rings it in pen on the paper form.
+   An OUTLINE, never a fill and never a colour change: the words inside keep
+   the full --ink contrast they were printed with, because emphasis in this
+   design is never bought by fading or recolouring text. The ring is drawn in
+   --ink, the same monochrome family as everything else on the sheet, so it
+   introduces no hue and does not spend the single state accent (--stamp /
+   --ok, which mean "unapproved" and "approved" and nothing else).
+   `display:inline` is deliberate and load-bearing on two axes. Vertically, an
+   inline box's padding and border do not grow its line box, so the ring is
+   drawn around the words without making the band row taller. Horizontally,
+   the padding that gives the ring its width is cancelled by an equal negative
+   margin, so the option occupies exactly the width it did unringed — the band
+   is one of the widest rows on the sheet and must not be pushed wider. The
+   font is untouched for the same reason: a heavier weight would re-wrap it.
+   nowrap keeps an option from breaking across two lines, where half a ring
+   would read as damage rather than a mark. */
+.sheet .interval-mark{display:inline;border:1.5px solid var(--ink);border-radius:50%;
+  padding:.3em .55em;margin:0 -.55em;white-space:nowrap;color:var(--ink)}
+
 /* Out of scope: tint the row, never fade the words. Instruction and Freq stay
    at full reading contrast — a technician must be able to read every line,
    including the tasks this visit does not cover. */

@@ -14,6 +14,8 @@
 // go: they are omitted here rather than being placed in a neighbouring
 // column, which would print a technician's "OK" against the wrong heading.
 
+import { findIntervalCodes } from './intervals.js';
+
 // Column letter to 1-based index: A -> 1, M -> 13, AA -> 27. Returns null for
 // anything that is not a column letter (including the null the parser reports
 // for a form with no Status column), so callers can test it as a single
@@ -22,6 +24,61 @@ export function columnNumber(letter) {
   const s = String(letter ?? '').toUpperCase();
   if (!/^[A-Z]+$/.test(s)) return null;
   return [...s].reduce((a, ch) => a * 26 + (ch.charCodeAt(0) - 64), 0);
+}
+
+// Where one option's own words begin inside a cell that prints several.
+//
+// The options are separated by a run of whitespace (these sheets pad them
+// apart with long space runs) while the words WITHIN an option are separated
+// by single spaces, so the start is: after the last gap of two or more
+// whitespace characters between the previous option's code and this one;
+// failing that, straight after the previous option's code; failing that, the
+// start of the cell. Any whitespace still leading is then stepped over so the
+// marked run begins on a word.
+//
+// Deriving the start from the gap rather than from the wording is what makes
+// this work on documents whose prose differs, and on a cell that opens with a
+// caption before the first option.
+function optionStart(text, from, codeStart) {
+  let start = from;
+  for (const gap of text.slice(from, codeStart).matchAll(/\s{2,}/g)) {
+    start = from + gap.index + gap[0].length;
+  }
+  while (start < codeStart && /\s/.test(text[start])) start += 1;
+  return start;
+}
+
+// Which option of the printed frequency band each interval is, so the preview
+// can ring the one this visit covers exactly as a technician would on paper.
+//
+// Keyed by interval code; each entry names the cell that carries the option
+// AND the character range of the option inside that cell's rendered text.
+// A form whose band prints each option in its own cell yields a range
+// covering the whole of that cell's text, so there is one shape for callers
+// to handle rather than two. `text` is the option as printed, carried along
+// so a client can confirm the range still delimits what it thinks it does
+// before drawing anything over a controlled document's text.
+//
+// An interval this form does not offer is simply absent — never a guessed
+// position. That covers both an option the band does not print at all (one of
+// the twelve has no yearly option) and a code printed in the band that this
+// document has no tasks for.
+export function intervalMarksFor(definition) {
+  const offered = new Set(definition?.frequencies ?? []);
+  const marks = {};
+  for (const cell of definition?.cells?.frequencyBand ?? []) {
+    const text = String(cell?.text ?? '');
+    const codes = findIntervalCodes(text);
+    codes.forEach((code, i) => {
+      if (!offered.has(code.code) || marks[code.code]) return;
+      const start = optionStart(text, i ? codes[i - 1].end : 0, code.start);
+      marks[code.code] = {
+        row: cell.row, col: cell.col,
+        start, end: code.end, text: text.slice(start, code.end)
+      };
+    });
+  }
+  return marks;
 }
 
 export function cellMapFor(definition) {
@@ -47,6 +104,12 @@ export function cellMapFor(definition) {
 
   // The title cell is NOT a destination for a value — the machine ID fills a
   // blank inside the printed title rather than replacing it — so it travels
-  // separately and can never be treated as an ordinary write target.
-  return { cellFor, titleCell: cells.title ?? null };
+  // separately and can never be treated as an ordinary write target. The same
+  // is true of the frequency band: the selected interval is marked on an
+  // option the document already prints, never written into an empty cell.
+  return {
+    cellFor,
+    titleCell: cells.title ?? null,
+    intervalCells: intervalMarksFor(definition)
+  };
 }

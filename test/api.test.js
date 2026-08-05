@@ -573,6 +573,51 @@ test('GET /forms/:id/fields says which cell each task status belongs in', async 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('GET /forms/:id/fields says which printed option of the frequency band each interval is', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cellfor-'));
+  try {
+    // A band above the task table, all its options in one cell — the shape
+    // eleven of the twelve real documents have. Invented wording: the payload
+    // must be usable without the client knowing any of it.
+    const band = 'Monthly (1M)     Quarterly (3M)     Annual (Y)';
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Sheet1');
+    ws.getRow(1).getCell(2).value = band;
+    ws.getRow(3).getCell(1).value = 'No';
+    ws.getRow(3).getCell(2).value = 'Freq.';
+    ws.getRow(3).getCell(3).value = 'Instruction';
+    ws.getRow(3).getCell(4).value = 'Status';
+    [['1M', 'Widget check A'], ['3M', 'Widget check B']].forEach(([freq, instruction], i) => {
+      const row = ws.getRow(i + 4);
+      row.getCell(1).value = i + 1;
+      row.getCell(2).value = freq;
+      row.getCell(3).value = instruction;
+    });
+    await wb.xlsx.writeFile(join(dir, 'form.xlsx'));
+
+    const { db, server, call } = await boot();
+    try {
+      await scanFolder(db, dir);
+      const form = db.prepare("select * from form_catalog where file_name='form.xlsx'").get();
+      await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+
+      const res = await call('GET', `/api/forms/${form.id}/fields?frequency=3M`);
+      assert.equal(res.status, 200);
+      const marks = res.body.intervalCells;
+      assert.ok(marks, 'the payload must carry the frequency-band positions');
+      // The client rings exactly what this range delimits, so the range has to
+      // slice the band text back to the option itself.
+      assert.deepEqual(
+        { row: marks['3M'].row, col: marks['3M'].col }, { row: 1, col: 2 });
+      assert.equal(band.slice(marks['3M'].start, marks['3M'].end), 'Quarterly (3M)');
+      assert.equal(band.slice(marks['1M'].start, marks['1M'].end), 'Monthly (1M)');
+      // The band prints a yearly option this form has no tasks for; it can
+      // never be the record's interval, so no position is reported for it.
+      assert.equal(marks.Y, undefined);
+    } finally { server.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('a form with no status column omits task statuses and still returns a valid payload', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cellfor-'));
   try {

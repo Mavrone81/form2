@@ -69,6 +69,57 @@ function paintCell(td, printed, value) {
 
 const at = (cell) => `${cell.row}:${cell.col}`;
 
+// Ring the interval this visit covers, on the option the document already
+// prints in its frequency band — the same mark a technician makes with a pen
+// on the paper form.
+//
+// Exactly ONE option is ever ringed: whatever was ringed before is put back
+// to its printed text first, so selecting another interval moves the mark
+// rather than adding a second one.
+//
+// Two band shapes exist across the controlled documents — one option per
+// cell, or every option inside one wide cell — and the server hands both over
+// as a cell plus a character range (see server/cell-map.js), so there is one
+// path here. The range is checked against the text this cell actually renders
+// before anything is drawn: if it does not delimit the option the server
+// named, the band is left exactly as printed rather than ringing the wrong
+// words on a controlled document.
+//
+// textContent and createElement only. The band is spreadsheet text like every
+// other cell here and is never treated as markup.
+function markInterval(state, interval) {
+  const previous = state.marked;
+  if (previous) {
+    const td = state.cells.get(previous);
+    if (td) td.textContent = state.printed.get(previous) ?? '';
+    state.marked = null;
+  }
+
+  const mark = state.intervalCells[interval];
+  if (!mark) return false;
+  const coord = at(mark);
+  const td = state.cells.get(coord);
+  if (!td) return false;
+
+  const printed = state.printed.get(coord) ?? '';
+  const { start, end } = mark;
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return false;
+  if (start < 0 || end > printed.length || start >= end) return false;
+  if (printed.slice(start, end) !== mark.text) return false;
+
+  const ring = document.createElement('span');
+  ring.className = 'interval-mark';
+  ring.textContent = printed.slice(start, end);
+
+  const parts = [];
+  if (start > 0) parts.push(document.createTextNode(printed.slice(0, start)));
+  parts.push(ring);
+  if (end < printed.length) parts.push(document.createTextNode(printed.slice(end)));
+  td.replaceChildren(...parts);
+  state.marked = coord;
+  return true;
+}
+
 // Attribution for a signed stage, shown in the sheet's own signature blank.
 // Name and timestamp, never the image: the stored PNG is a wide, shallow
 // stroke and a table cell would squash it out of recognition — a distorted
@@ -81,7 +132,8 @@ function signatureText(signature) {
 }
 
 export function renderForm(container, form, {
-  grid, inScopeRows, values, cellFor, titleCell, machineId, signatures
+  grid, inScopeRows, values, cellFor, titleCell, machineId, signatures,
+  intervalCells, selectedInterval
 } = {}) {
   container.replaceChildren();
   // Any preview state from a previously rendered form is stale the moment
@@ -125,7 +177,13 @@ export function renderForm(container, form, {
   // coordinate, that cell's own printed text (to restore when a value is
   // cleared), and the title cell. Kept on the container, as the field panel
   // already keeps its signature pads.
-  const state = { cellFor: map, cells: new Map(), printed: new Map(), titleTd: null, titlePrinted: '' };
+  // `intervalCells` and `marked` are the same idea for the frequency band:
+  // where each interval's printed option lives, and which one currently
+  // carries the ring, so a later change can move it in place.
+  const state = {
+    cellFor: map, cells: new Map(), printed: new Map(), titleTd: null, titlePrinted: '',
+    intervalCells: intervalCells ?? {}, marked: null
+  };
 
   const inScope = inScopeRows ? new Set(inScopeRows) : null;
   const body = document.createElement('tbody');
@@ -163,6 +221,11 @@ export function renderForm(container, form, {
   }
   table.append(body);
   container.preview = state;
+  // Drawn after the sheet exists, through the very same path a later change
+  // of interval uses — one mechanism, so what a reload shows and what a click
+  // shows can never diverge. A read-only record takes this path too: it rings
+  // the interval that was recorded, with nothing editable anywhere.
+  markInterval(state, selectedInterval);
   // The task grid is a spreadsheet reproduction — it must never reflow/stack
   // on narrow screens (that would destroy its meaning). Instead it gets its
   // own horizontal scroll container, so the table can pan sideways while the
@@ -204,4 +267,18 @@ export function updatePreviewField(container, key, value) {
   if (!td) return false;
   paintCell(td, state.printed.get(coord) ?? '', value);
   return true;
+}
+
+// Move the ring to another interval in the already-rendered sheet.
+//
+// Same reasoning as updatePreviewField above: this is one lookup and two text
+// nodes, so changing the interval never rebuilds the 71-row grid. Returns
+// false when this form prints no such option (the band of one of the twelve
+// has no yearly option) — the previous ring is still cleared, because the
+// selected interval genuinely is not marked on this sheet, and leaving the
+// old one drawn would state something untrue about the record.
+export function updatePreviewInterval(container, interval) {
+  const state = container?.preview;
+  if (!state) return false;
+  return markInterval(state, interval);
 }

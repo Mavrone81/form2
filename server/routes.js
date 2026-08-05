@@ -128,7 +128,10 @@ export function makeRoutes(db) {
     // no Status column) is simply absent, and the client renders only what it
     // is told. Both default to an empty/absent map so a pdf form, or one that
     // is not `ready`, still returns a valid payload.
-    let cellFor = {}, titleCell = null;
+    // ...and which printed option of the frequency band each interval is, so
+    // the preview can ring the selected one the way a technician rings it on
+    // paper. Absent for an interval the form does not offer.
+    let cellFor = {}, titleCell = null, intervalCells = {};
     if (form.file_type === 'xlsx' && form.state === 'ready') {
       let def;
       try {
@@ -137,11 +140,11 @@ export function makeRoutes(db) {
         return unreadableForm(res, form.id, err);
       }
       tasks = def.tasks; frequencies = def.frequencies;
-      ({ cellFor, titleCell } = cellMapFor(def));
+      ({ cellFor, titleCell, intervalCells } = cellMapFor(def));
     }
     const selected = String(req.query.frequency ?? '');
     const response = {
-      form, fields, frequencies, tasks, cellFor, titleCell,
+      form, fields, frequencies, tasks, cellFor, titleCell, intervalCells,
       inScope: (selected ? tasksInScope(tasks, selected) : tasks).map((t) => t.row),
       summary: selected ? scopeSummary(tasks, selected) : null
     };

@@ -29,7 +29,8 @@ test('renderForm receives the record\'s values and where they belong, not just t
   // It must take the entered values AND the server-computed cell map.
   const signature = /export function renderForm\(container,\s*form,\s*\{([\s\S]*?)\}\s*=\s*\{\}\s*\)/.exec(src);
   assert.ok(signature, 'expected renderForm to destructure a named options object');
-  for (const opt of ['grid', 'inScopeRows', 'values', 'cellFor', 'titleCell', 'machineId', 'signatures']) {
+  for (const opt of ['grid', 'inScopeRows', 'values', 'cellFor', 'titleCell', 'machineId', 'signatures',
+    'intervalCells', 'selectedInterval']) {
     assert.match(signature[1], new RegExp(`\\b${opt}\\b`), `renderForm must accept \`${opt}\``);
   }
 });
@@ -53,6 +54,45 @@ test('a single field update never re-renders the grid', () => {
   assert.ok(update, 'expected an exported single-cell update function');
   assert.doesNotMatch(update[0], /renderForm\(/, 'the live update must not re-render the whole form');
   assert.match(update[0], /paintCell\(/, 'the live update must go through the same cell painter');
+});
+
+test('the ringed interval is built from nodes, never from markup', () => {
+  // The band that gets split into "before / the ringed option / after" is
+  // spreadsheet text like every other cell on this sheet. Splitting a string
+  // into parts is exactly where a renderer is tempted to reach for markup, so
+  // this pins the one path that does it: elements and text nodes only, and
+  // none of the four unsafe DOM APIs anywhere in it.
+  const mark = /function markInterval\([\s\S]*?\n\}/.exec(src);
+  assert.ok(mark, 'expected a helper that rings one option of the frequency band');
+  assert.doesNotMatch(mark[0], /\.innerHTML\b/, 'must never use innerHTML');
+  assert.doesNotMatch(mark[0], /insertAdjacentHTML/, 'must never use insertAdjacentHTML');
+  assert.doesNotMatch(mark[0], /\.outerHTML\b/, 'must never use outerHTML');
+  assert.doesNotMatch(mark[0], /document\.write\(/, 'must never use document.write');
+  assert.match(mark[0], /createElement\(/, 'the ring itself must be a created element');
+  assert.match(mark[0], /\.textContent\s*=/, 'the ringed run must be set as text');
+});
+
+test('only one option can be ringed, and the range is checked before anything is drawn', () => {
+  const mark = /function markInterval\([\s\S]*?\n\}/.exec(src);
+  assert.ok(mark, 'expected the frequency-band marker');
+  // Whatever was ringed before is restored to its printed text first, so a
+  // second selection moves the mark instead of adding another one.
+  assert.match(mark[0], /state\.marked/, 'the marker must track which option currently carries the ring');
+  assert.match(mark[0], /textContent\s*=\s*state\.printed\.get/,
+    'the previously ringed cell must be put back to its printed text');
+  // ...and the server's range must still delimit the server's option in the
+  // text this cell actually renders, or nothing is drawn over it.
+  assert.match(mark[0], /printed\.slice\(start,\s*end\)\s*!==\s*mark\.text/,
+    'the reported range must be verified against the rendered text before drawing');
+});
+
+test('changing the interval never re-renders the grid', () => {
+  // Same rule as a single field update: moving the ring is a lookup and a few
+  // text nodes, not a rebuild of a 71-row sheet.
+  const update = /export function updatePreviewInterval\([\s\S]*?\n\}/.exec(src);
+  assert.ok(update, 'expected an exported single-cell interval update function');
+  assert.doesNotMatch(update[0], /renderForm\(/, 'moving the ring must not re-render the whole form');
+  assert.match(update[0], /markInterval\(/, 'it must go through the same marker the first render uses');
 });
 
 test('nothing in the left pane is an editable control', () => {

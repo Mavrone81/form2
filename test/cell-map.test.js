@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import ExcelJS from 'exceljs';
 import { parseWorkbook } from '../server/excel-parser.js';
 import { buildGrid } from '../server/grid-model.js';
-import { cellMapFor, columnNumber } from '../server/cell-map.js';
+import { cellMapFor, columnNumber, intervalMarksFor } from '../server/cell-map.js';
+import { ORDER, findIntervalCodes } from '../server/intervals.js';
 import { loadFixtures, SKIP } from './helpers/fixtures.js';
 
 const fx = loadFixtures();
@@ -142,6 +143,259 @@ test('a form with a status column maps each task to it (synthetic)', async () =>
     assert.deepEqual(cellFor.task_7, { row: 7, col: 4 });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+// --- The frequency band: which printed option this visit's interval is ------
+//
+// On paper the technician RINGS one option of the band printed above the task
+// table, so the preview has to know which run of characters to ring. All the
+// prose below is invented: the wording differs between real documents, which
+// is precisely why nothing here may match on it.
+
+// Synthetic workbook with a frequency band above the task table. `band` is a
+// list of [column, text] pairs on one row, which covers both real shapes —
+// one option per cell, or every option inside a single wide cell.
+async function writeBandWorkbook(path, { band, freqs = ['1M', '3M', '6M', 'Y'], bandRow = 3 } = {}) {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Sheet1');
+  ws.getRow(1).getCell(1).value = 'Document Title:';
+  ws.getRow(2).getCell(1).value = 'Widget Maintenance Record WX____';
+  for (const [col, text] of band) ws.getRow(bandRow).getCell(col).value = text;
+  const headerRow = bandRow + 2;
+  ws.getRow(headerRow).getCell(1).value = 'No';
+  ws.getRow(headerRow).getCell(2).value = 'Freq.';
+  ws.getRow(headerRow).getCell(3).value = 'Instruction';
+  ws.getRow(headerRow).getCell(4).value = 'Status';
+  freqs.forEach((freq, i) => {
+    const row = ws.getRow(headerRow + 1 + i);
+    row.getCell(1).value = i + 1;
+    row.getCell(2).value = freq;
+    row.getCell(3).value = `Check the widget assembly, step ${i + 1}`;
+  });
+  await wb.xlsx.writeFile(path);
+  return path;
+}
+
+const inTempDir = async (fn) => {
+  const dir = await mkdtemp(join(tmpdir(), 'cellmap-'));
+  try { return await fn(dir); } finally { await rm(dir, { recursive: true, force: true }); }
+};
+
+test('a band that prints each option in its own cell resolves to that whole cell (synthetic)', async () => {
+  await inTempDir(async (dir) => {
+    const path = await writeBandWorkbook(join(dir, 'separate.xlsx'), {
+      band: [[4, 'Quarterly (3M)'], [8, 'Half-yearly (6M)'], [12, 'Annual (Y)']],
+      freqs: ['3M', '6M', 'Y']
+    });
+    const def = await parseWorkbook(path);
+    const { intervalCells } = cellMapFor(def);
+
+    // Each interval is a DIFFERENT cell, and the whole of that cell is the
+    // option — there is nothing else printed in it to leave outside the ring.
+    assert.deepEqual(intervalCells['3M'], { row: 3, col: 4, start: 0, end: 14, text: 'Quarterly (3M)' });
+    assert.deepEqual(intervalCells['6M'], { row: 3, col: 8, start: 0, end: 16, text: 'Half-yearly (6M)' });
+    assert.deepEqual(intervalCells.Y, { row: 3, col: 12, start: 0, end: 10, text: 'Annual (Y)' });
+    // Selecting another interval must move the mark to another cell.
+    assert.notEqual(intervalCells['3M'].col, intervalCells['6M'].col);
+    assert.notEqual(intervalCells['6M'].col, intervalCells.Y.col);
+  });
+});
+
+test('a band that prints every option in one cell resolves to a range inside it (synthetic)', async () => {
+  await inTempDir(async (dir) => {
+    const text = 'Monthly (1M)     Quarterly (3M)     Half-yearly (6M)     Annual (Y)';
+    const path = await writeBandWorkbook(join(dir, 'merged.xlsx'), { band: [[3, text]] });
+    const def = await parseWorkbook(path);
+    const { intervalCells } = cellMapFor(def);
+
+    // Every interval is the SAME cell...
+    for (const code of ORDER) assert.deepEqual(
+      { row: intervalCells[code].row, col: intervalCells[code].col }, { row: 3, col: 3 }, code
+    );
+    // ...and the range is what tells them apart. Slicing the cell's own text
+    // with the range must yield exactly that option and nothing of its
+    // neighbours — this is the assertion, not the reported text.
+    assert.equal(text.slice(intervalCells['1M'].start, intervalCells['1M'].end), 'Monthly (1M)');
+    assert.equal(text.slice(intervalCells['3M'].start, intervalCells['3M'].end), 'Quarterly (3M)');
+    assert.equal(text.slice(intervalCells['6M'].start, intervalCells['6M'].end), 'Half-yearly (6M)');
+    assert.equal(text.slice(intervalCells.Y.start, intervalCells.Y.end), 'Annual (Y)');
+    // The ranges are disjoint, so no two options can ever be ringed together.
+    const ranges = ORDER.map((c) => intervalCells[c]).sort((a, b) => a.start - b.start);
+    for (let i = 1; i < ranges.length; i += 1) assert.ok(ranges[i - 1].end <= ranges[i].start);
+  });
+});
+
+test('a caption printed before the first option is left outside the ring (synthetic)', async () => {
+  // An option is separated from what precedes it by a GAP, not by being first
+  // in the cell. A cell that opens with a caption must ring the option only —
+  // ringing the caption too would put a ring round words the technician is
+  // not choosing.
+  await inTempDir(async (dir) => {
+    const text = 'Frequency:     Monthly (1M)     Quarterly (3M)';
+    const path = await writeBandWorkbook(join(dir, 'caption.xlsx'), {
+      band: [[3, text]], freqs: ['1M', '3M']
+    });
+    const { intervalCells } = cellMapFor(await parseWorkbook(path));
+    assert.equal(text.slice(intervalCells['1M'].start, intervalCells['1M'].end), 'Monthly (1M)');
+    assert.equal(text.slice(intervalCells['3M'].start, intervalCells['3M'].end), 'Quarterly (3M)');
+  });
+});
+
+test('the match is on the parenthesised code, never on the wording (synthetic)', async () => {
+  // Two documents, the same interval, different prose. Both must resolve, and
+  // each must ring its OWN wording.
+  await inTempDir(async (dir) => {
+    const variants = [
+      'Monthly (1M)     Quarterly (3M)     Half-yearly (6M)',
+      'Monthly (1M)     Trimestral (3M)     Semestral (6M)'
+    ];
+    const marked = [];
+    for (const [i, text] of variants.entries()) {
+      const path = await writeBandWorkbook(join(dir, `prose-${i}.xlsx`), {
+        band: [[3, text]], freqs: ['1M', '3M', '6M']
+      });
+      const { intervalCells } = cellMapFor(await parseWorkbook(path));
+      assert.ok(intervalCells['3M'], 'the three-monthly option must resolve whatever it is called');
+      marked.push(text.slice(intervalCells['3M'].start, intervalCells['3M'].end));
+    }
+    assert.deepEqual(marked, ['Quarterly (3M)', 'Trimestral (3M)']);
+    assert.notEqual(marked[0], marked[1], 'the wording genuinely differs between the two');
+  });
+});
+
+test('an interval the form does not offer resolves to nothing, and does not throw (synthetic)', async () => {
+  await inTempDir(async (dir) => {
+    // (a) The band simply does not print a yearly option — the shape one of
+    // the twelve real documents has.
+    const noYearly = await writeBandWorkbook(join(dir, 'no-yearly.xlsx'), {
+      band: [[3, 'Monthly (1M)     Quarterly (3M)     Half-yearly (6M)']],
+      freqs: ['1M', '3M', '6M']
+    });
+    const a = cellMapFor(await parseWorkbook(noYearly)).intervalCells;
+    assert.equal(a.Y, undefined, 'no yearly option is printed, so there is no position to report');
+    assert.ok(a['6M'], 'the options that ARE printed still resolve');
+
+    // (b) The band prints an option this document has no tasks for. Still
+    // nothing: the record can never be scoped to it.
+    const notOffered = await writeBandWorkbook(join(dir, 'not-offered.xlsx'), {
+      band: [[3, 'Monthly (1M)     Quarterly (3M)     Annual (Y)']],
+      freqs: ['1M', '3M']
+    });
+    const b = cellMapFor(await parseWorkbook(notOffered)).intervalCells;
+    assert.equal(b.Y, undefined);
+    assert.ok(b['1M'] && b['3M']);
+
+    // (c) A form with no band at all, and a definition with nothing in it,
+    // are both answered with an empty map rather than an exception.
+    const noBand = await writeSyntheticWorkbook(join(dir, 'no-band.xlsx'));
+    assert.deepEqual(cellMapFor(await parseWorkbook(noBand)).intervalCells, {});
+    assert.deepEqual(intervalMarksFor(undefined), {});
+    assert.deepEqual(intervalMarksFor({}), {});
+    assert.deepEqual(intervalMarksFor({ frequencies: ['Y'], cells: {} }), {});
+  });
+});
+
+test('the band is found by its codes, not by a fixed row or column (synthetic)', async () => {
+  // Positions shift between documents, so nothing here may assume row 4 or
+  // column 3 — and an earlier row that mentions no code must not be mistaken
+  // for the band.
+  await inTempDir(async (dir) => {
+    const path = await writeBandWorkbook(join(dir, 'shifted.xlsx'), {
+      band: [[7, 'Monthly (1M)     Quarterly (3M)']], freqs: ['1M', '3M'], bandRow: 9
+    });
+    const { intervalCells } = cellMapFor(await parseWorkbook(path));
+    assert.deepEqual(
+      { row: intervalCells['3M'].row, col: intervalCells['3M'].col }, { row: 9, col: 7 }
+    );
+  });
+});
+
+// --- The same, against the real controlled documents -----------------------
+
+test('every interval a real form offers is ringed on a cell the grid renders, at a range that slices to that option',
+  { skip: fx ? false : SKIP }, async () => {
+    let separateCellForms = 0, mergedCellForms = 0, bandsShortOfAnOption = 0, printedButNotOffered = 0;
+
+    for (const f of fx.forms) {
+      const path = join(fx.formsDir, f.file);
+      const def = await parseWorkbook(path);
+      const { intervalCells } = cellMapFor(def);
+      const grid = await buildGrid(path, def);
+      const rendered = new Map();
+      for (const row of grid.rows) for (const cell of row.cells) rendered.set(`${row.index}:${cell.col}`, cell.text);
+
+      // What this document's band actually prints, read from the definition
+      // rather than assumed, so the two "nothing to report" cases below are
+      // measured against the real sheet.
+      const printed = new Set(
+        (def.cells.frequencyBand ?? []).flatMap((c) => findIntervalCodes(c.text).map((m) => m.code))
+      );
+      if (printed.size < ORDER.length) bandsShortOfAnOption += 1;
+      for (const code of ORDER) {
+        if (printed.has(code) && !def.frequencies.includes(code)) {
+          printedButNotOffered += 1;
+          assert.equal(intervalCells[code], undefined,
+            `${f.id} prints ${code} but has no tasks for it, so it must not be markable`);
+        }
+        if (!printed.has(code)) assert.equal(intervalCells[code], undefined,
+          `${f.id} does not print ${code}, so no position may be invented for it`);
+      }
+
+      const cells = new Set();
+      for (const code of ORDER) {
+        const mark = intervalCells[code];
+        if (!mark) continue;
+        assert.ok(def.frequencies.includes(code), `${f.id} must not mark an interval it does not offer`);
+        const coord = `${mark.row}:${mark.col}`;
+        // The cell must be one the preview actually draws, or there would be
+        // nowhere on screen for the ring to go.
+        assert.ok(rendered.has(coord), `${f.id} ${code} -> ${coord} is not a rendered cell`);
+        // THE assertion: slicing the text the grid renders with the reported
+        // range yields exactly the option, ending in that option's own code.
+        const sliced = rendered.get(coord).slice(mark.start, mark.end);
+        assert.equal(sliced, mark.text, `${f.id} ${code} range must delimit the reported option`);
+        assert.match(sliced, new RegExp(`\\(${code}\\)$`), `${f.id} ${code} range must end at its own code`);
+        assert.doesNotMatch(sliced.slice(0, -`(${code})`.length), /\((?:1M|3M|6M|Y)\)/,
+          `${f.id} ${code} range must not swallow a neighbouring option`);
+        cells.add(coord);
+      }
+
+      // Both real shapes must be exercised by this loop, and each form is one
+      // or the other: every option in one cell, or each in a cell of its own.
+      const marked = ORDER.filter((c) => intervalCells[c]);
+      if (marked.length > 1 && cells.size === 1) mergedCellForms += 1;
+      if (marked.length > 1 && cells.size === marked.length) {
+        separateCellForms += 1;
+        // Whole-cell shape: nothing else is printed in the cell, so the range
+        // covers all of it.
+        for (const code of marked) {
+          const mark = intervalCells[code];
+          assert.equal(mark.start, 0, `${f.id} ${code} starts at the cell`);
+          assert.equal(mark.end, rendered.get(`${mark.row}:${mark.col}`).length, `${f.id} ${code} ends at the cell`);
+        }
+      }
+    }
+
+    assert.ok(mergedCellForms > 0, 'expected forms whose band is one merged cell');
+    assert.ok(separateCellForms > 0, 'expected a form whose band is separate cells');
+    assert.ok(bandsShortOfAnOption > 0, 'expected a band that does not print all four options');
+    assert.ok(printedButNotOffered > 0, 'expected a band printing an option its form has no tasks for');
+  });
+
+test('a real form resolves an interval by its code even though the wording differs between documents',
+  { skip: fx ? false : SKIP }, async () => {
+    // Same code, more than one prose form across the twelve. If matching were
+    // on the wording, one of these groups would come back empty.
+    const wordings = new Map();
+    for (const f of fx.forms) {
+      const { intervalCells } = cellMapFor(await parseWorkbook(join(fx.formsDir, f.file)));
+      const mark = intervalCells['3M'];
+      if (!mark) continue;
+      assert.match(mark.text, /\(3M\)$/);
+      wordings.set(mark.text, (wordings.get(mark.text) ?? 0) + 1);
+    }
+    assert.ok(wordings.size >= 2,
+      'expected at least two different wordings for the same code, all resolved');
+  });
 
 test('a field the document has no blank for is omitted, never invented', async () => {
   // Only cells the sheet genuinely prints a blank for may appear. A label
