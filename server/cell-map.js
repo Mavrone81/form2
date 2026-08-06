@@ -15,7 +15,7 @@
 // go: they are omitted here rather than being placed in a neighbouring
 // column, which would print a technician's "OK" against the wrong heading.
 
-import { findIntervalCodes } from './intervals.js';
+import { findIntervalCodes, ORDER, covers } from './intervals.js';
 
 // One box of the Parts Required table, or null. Exported so anything that has
 // to reason about a parts row as a ROW — the archived record skips a row nobody
@@ -58,8 +58,9 @@ function optionStart(text, from, codeStart) {
   return start;
 }
 
-// Which option of the printed frequency band each interval is, so the preview
-// can ring the one this visit covers exactly as a technician would on paper.
+// Which option of the printed frequency band each interval is, so both
+// renderers can draw the band's CHECKBOXES exactly where the form prints them
+// and tick the ones this visit covers, as a technician does in pen on paper.
 //
 // Keyed by interval code; each entry names the cell that carries the option
 // AND the character range of the option inside that cell's rendered text.
@@ -69,22 +70,32 @@ function optionStart(text, from, codeStart) {
 // so a client can confirm the range still delimits what it thinks it does
 // before drawing anything over a controlled document's text.
 //
-// An interval this form does not offer is simply absent — never a guessed
-// position. That covers both an option the band does not print at all (one of
-// the twelve has no yearly option) and a code printed in the band that this
-// document has no tasks for.
+// EVERY option the band PRINTS is reported, whether or not this document has
+// tasks at that interval, because the printed form draws a box for every one
+// of them — they are rectangle shapes anchored on the band's row in the sheet's
+// drawing XML, four of them on documents whose task list only reaches 3M — and
+// the completed records the customer keeps show all four boxes with the covered
+// ones ticked. An option the band does not print at all (one of the twelve has
+// no yearly option) is still simply absent: a position is never guessed.
+//
+// `tickedBy` is which selected intervals put a tick in this box, and it is
+// stated here so the two renderers can never disagree about it. Interval scope
+// is CUMULATIVE (see server/intervals.js — several of these forms say in their
+// own remarks that a yearly service requires the 3M and 6M work at the same
+// time), so a six-monthly visit ticks 1M, 3M and 6M. Every completed record
+// supplied by the customer shows exactly that.
 export function intervalMarksFor(definition) {
-  const offered = new Set(definition?.frequencies ?? []);
   const marks = {};
   for (const cell of definition?.cells?.frequencyBand ?? []) {
     const text = String(cell?.text ?? '');
     const codes = findIntervalCodes(text);
     codes.forEach((code, i) => {
-      if (!offered.has(code.code) || marks[code.code]) return;
+      if (marks[code.code]) return;
       const start = optionStart(text, i ? codes[i - 1].end : 0, code.start);
       marks[code.code] = {
         row: cell.row, col: cell.col,
-        start, end: code.end, text: text.slice(start, code.end)
+        start, end: code.end, text: text.slice(start, code.end),
+        tickedBy: ORDER.filter((selected) => covers(selected, code.code))
       };
     });
   }
@@ -128,8 +139,8 @@ export function cellMapFor(definition) {
   // The title cell is NOT a destination for a value — the machine ID fills a
   // blank inside the printed title rather than replacing it — so it travels
   // separately and can never be treated as an ordinary write target. The same
-  // is true of the frequency band: the selected interval is marked on an
-  // option the document already prints, never written into an empty cell.
+  // is true of the frequency band: its boxes are ticked beside options the
+  // document already prints, never written into an empty cell.
   return {
     cellFor,
     titleCell: cells.title ?? null,

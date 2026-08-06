@@ -38,7 +38,7 @@
 //
 // `fillTitleBlank` is re-exported so callers (and its tests) can keep taking
 // it from the renderer they use.
-import { layoutRow, borderPen, fillTitleBlank } from './sheet-layout.js';
+import { layoutRow, borderPen, fillTitleBlank, imageBox, checkboxMetrics } from './sheet-layout.js';
 export { layoutRow, borderPen, fillTitleBlank };
 
 // What an entered value looks like inside the reproduced sheet: the value
@@ -134,55 +134,123 @@ const applyStyle = (el, css) => {
   for (const [prop, value] of Object.entries(css)) el.style.setProperty(prop, value);
 };
 
-// Ring the interval this visit covers, on the option the document already
-// prints in its frequency band — the same mark a technician makes with a pen
-// on the paper form.
+// The frequency band's CHECKBOXES — a box before every option the form prints,
+// with the ones this visit covers ticked, which is the mark the technician
+// makes in pen on the paper form.
 //
-// Exactly ONE option is ever ringed: whatever was ringed before is put back
-// to its printed text first, so selecting another interval moves the mark
-// rather than adding a second one.
+// The boxes are not text: on the sheet they are rectangle shapes anchored on
+// the band's row, so nothing in the grid model carries them and both renderers
+// have to draw them. The geometry is shared with the archived PDF (see
+// checkboxMetrics in sheet-layout.js) so the two drawings agree.
 //
-// Two band shapes exist across the controlled documents — one option per
-// cell, or every option inside one wide cell — and the server hands both over
-// as a cell plus a character range (see server/cell-map.js), so there is one
-// path here. The range is checked against the text this cell actually renders
-// before anything is drawn: if it does not delimit the option the server
-// named, the band is left exactly as printed rather than ringing the wrong
-// words on a controlled document.
+// The box sits in the whitespace the sheet already leaves BEFORE the option:
+// its horizontal advance is cancelled by an equal negative margin in the CSS,
+// so the option's own words stay exactly where the document prints them. The
+// band is one of the widest rows on the sheet and must not be pushed wider by
+// a mark being added to it.
 //
-// textContent and createElement only. The band is spreadsheet text like every
-// other cell here and is never treated as markup.
-function markInterval(state, interval) {
-  const previous = state.marked;
-  if (previous) {
-    const td = state.cells.get(previous);
-    if (td) td.textContent = state.printed.get(previous) ?? '';
-    state.marked = null;
+// Two band shapes exist across the controlled documents — one option per cell,
+// or every option inside one wide cell — and the server hands both over as a
+// cell plus a character range (see server/cell-map.js), so there is one path
+// here. The range is checked against the text this cell actually renders before
+// anything is drawn: if it does not delimit the option the server named, that
+// option is left exactly as printed rather than a box being planted over the
+// wrong words on a controlled document.
+//
+// textContent, createElement and createElementNS only. The band is spreadsheet
+// text like every other cell here and is never treated as markup.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+// The check, drawn from the shared polyline in a unit square, so the preview's
+// tick and the PDF's are the same shape at any size.
+const UNIT = checkboxMetrics(1);
+
+function checkbox() {
+  const box = document.createElement('span');
+  box.className = 'checkbox';
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${UNIT.size} ${UNIT.size}`);
+  svg.setAttribute('aria-hidden', 'true');
+  const tick = document.createElementNS(SVG_NS, 'polyline');
+  tick.setAttribute('points', UNIT.tick.map(([x, y]) => `${x},${y}`).join(' '));
+  svg.append(tick);
+  box.append(svg);
+  return box;
+}
+
+// Rebuild each band cell as: printed text, a box before each option, printed
+// text. Done once per render; changing the interval afterwards only toggles a
+// class on boxes that already exist.
+function buildBand(state) {
+  const byCell = new Map();
+  for (const [code, option] of Object.entries(state.intervalCells)) {
+    if (!option) continue;
+    const coord = at(option);
+    const printed = state.printed.get(coord);
+    const { start, end } = option;
+    if (printed === undefined) continue;
+    if (!Number.isInteger(start) || !Number.isInteger(end)) continue;
+    if (start < 0 || end > printed.length || start >= end) continue;
+    if (printed.slice(start, end) !== option.text) continue;
+    if (!byCell.has(coord)) byCell.set(coord, []);
+    byCell.get(coord).push({ code, option });
   }
 
-  const mark = state.intervalCells[interval];
-  if (!mark) return false;
-  const coord = at(mark);
-  const td = state.cells.get(coord);
-  if (!td) return false;
+  for (const [coord, options] of byCell) {
+    const td = state.cells.get(coord);
+    if (!td) continue;
+    const printed = state.printed.get(coord) ?? '';
+    options.sort((a, b) => a.option.start - b.option.start);
+    const parts = [];
+    let cursor = 0;
+    for (const { code, option } of options) {
+      if (option.start > cursor) parts.push(document.createTextNode(printed.slice(cursor, option.start)));
+      const box = checkbox();
+      state.boxes.set(code, box);
+      parts.push(box);
+      parts.push(document.createTextNode(printed.slice(option.start, option.end)));
+      cursor = option.end;
+    }
+    if (cursor < printed.length) parts.push(document.createTextNode(printed.slice(cursor)));
+    td.replaceChildren(...parts);
+  }
+}
 
-  const printed = state.printed.get(coord) ?? '';
-  const { start, end } = mark;
-  if (!Number.isInteger(start) || !Number.isInteger(end)) return false;
-  if (start < 0 || end > printed.length || start >= end) return false;
-  if (printed.slice(start, end) !== mark.text) return false;
+// Tick the boxes this visit's interval covers, and clear every other one.
+// Coverage is cumulative and comes from the server with the band (`tickedBy`),
+// so the preview and the archived record can never disagree about which boxes
+// a six-monthly visit ticks. Returns whether anything is ticked at all.
+function markInterval(state, interval) {
+  let marked = 0;
+  for (const [code, box] of state.boxes) {
+    const on = (state.intervalCells[code]?.tickedBy ?? []).includes(interval);
+    box.classList.toggle('on', on);
+    if (on) marked += 1;
+  }
+  state.marked = marked;
+  return marked > 0;
+}
 
-  const ring = document.createElement('span');
-  ring.className = 'interval-mark';
-  ring.textContent = printed.slice(start, end);
-
-  const parts = [];
-  if (start > 0) parts.push(document.createTextNode(printed.slice(0, start)));
-  parts.push(ring);
-  if (end < printed.length) parts.push(document.createTextNode(printed.slice(end)));
-  td.replaceChildren(...parts);
-  state.marked = coord;
-  return true;
+// The company logo, in the header box the form anchors it to. `object-fit`
+// keeps its aspect ratio inside that box, so it can never come out stretched;
+// the box itself comes from the shared geometry the archived PDF uses.
+//
+// It is positioned over the table rather than put inside a cell: the sheet
+// anchors it to a RECTANGLE that need not line up with any one cell's edges,
+// and an <img> inside a <td> would be sized by that cell instead.
+function bandLogo(grid, table) {
+  const box = imageBox(grid);
+  if (!box || !grid.image?.data || !grid.image?.mime) return null;
+  const img = document.createElement('img');
+  img.className = 'sheet-logo';
+  img.alt = '';
+  img.src = `data:${grid.image.mime};base64,${grid.image.data}`;
+  img.style.left = `${box.x}px`;
+  img.style.width = `${box.width}px`;
+  // Column widths are already in CSS pixels; row heights are in points, the
+  // same conversion the rows themselves get below.
+  img.style.top = `${Math.round(box.y * 4 / 3)}px`;
+  img.style.height = `${Math.round(box.height * 4 / 3)}px`;
+  return img;
 }
 
 // Attribution for a signed stage, shown in the sheet's own signature blank.
@@ -253,12 +321,12 @@ export function renderForm(container, form, {
   // coordinate, that cell's own printed text (to restore when a value is
   // cleared), and the title cell. Kept on the container, as the field panel
   // already keeps its signature pads.
-  // `intervalCells` and `marked` are the same idea for the frequency band:
-  // where each interval's printed option lives, and which one currently
-  // carries the ring, so a later change can move it in place.
+  // `intervalCells` and `boxes` are the same idea for the frequency band:
+  // where each interval's printed option lives, and the checkbox drawn beside
+  // it, so a later change of interval can re-tick them in place.
   const state = {
     cellFor: map, cells: new Map(), printed: new Map(), titleTd: null, titlePrinted: '',
-    intervalCells: intervalCells ?? {}, marked: null
+    intervalCells: intervalCells ?? {}, boxes: new Map(), marked: 0
   };
 
   const inScope = inScopeRows ? new Set(inScopeRows) : null;
@@ -311,10 +379,12 @@ export function renderForm(container, form, {
   }
   table.append(body);
   container.preview = state;
-  // Drawn after the sheet exists, through the very same path a later change
-  // of interval uses — one mechanism, so what a reload shows and what a click
-  // shows can never diverge. A read-only record takes this path too: it rings
-  // the interval that was recorded, with nothing editable anywhere.
+  // The band's boxes are built once the sheet exists, and then ticked through
+  // the very same path a later change of interval uses — one mechanism, so
+  // what a reload shows and what a click shows can never diverge. A read-only
+  // record takes this path too: it ticks the interval that was recorded, with
+  // nothing editable anywhere.
+  buildBand(state);
   markInterval(state, selectedInterval);
   // The task grid is a spreadsheet reproduction — it must never reflow/stack
   // on narrow screens (that would destroy its meaning). Instead it gets its
@@ -323,7 +393,18 @@ export function renderForm(container, form, {
   // in app.css.
   const scroller = document.createElement('div');
   scroller.className = 'table-scroll';
-  scroller.append(table);
+  // The logo is anchored to a rectangle of the sheet, not to a cell, so it is
+  // laid over the table rather than put inside one. The stage is what gives it
+  // something to be positioned against; a form with no image adds neither.
+  const logo = bandLogo(grid, table);
+  if (logo) {
+    const stage = document.createElement('div');
+    stage.className = 'sheet-stage';
+    stage.append(table, logo);
+    scroller.append(stage);
+  } else {
+    scroller.append(table);
+  }
   container.append(scroller);
 }
 
@@ -359,14 +440,14 @@ export function updatePreviewField(container, key, value) {
   return true;
 }
 
-// Move the ring to another interval in the already-rendered sheet.
+// Re-tick the band for another interval in the already-rendered sheet.
 //
-// Same reasoning as updatePreviewField above: this is one lookup and two text
-// nodes, so changing the interval never rebuilds the 71-row grid. Returns
-// false when this form prints no such option (the band of one of the twelve
-// has no yearly option) — the previous ring is still cleared, because the
-// selected interval genuinely is not marked on this sheet, and leaving the
-// old one drawn would state something untrue about the record.
+// Same reasoning as updatePreviewField above: this toggles a class on the two
+// or three boxes that already exist, so changing the interval never rebuilds
+// the 71-row grid. Returns false when this visit ticks nothing on this form
+// (the band of one of the twelve has no yearly option) — every box is still
+// cleared first, because leaving the previous visit's ticks drawn would state
+// something untrue about the record.
 export function updatePreviewInterval(container, interval) {
   const state = container?.preview;
   if (!state) return false;

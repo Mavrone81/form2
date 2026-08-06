@@ -10,7 +10,7 @@ import { parsePartsKey } from './cell-map.js';
 // is precisely how this renderer came to disagree with the preview: labels
 // the form prints on one line were broken mid-word down a narrow column and
 // a one-page controlled document was archived as four pages.
-import { layoutRow, borderPen, fillTitleBlank } from '../web/js/sheet-layout.js';
+import { layoutRow, borderPen, fillTitleBlank, imageBox, checkboxMetrics } from '../web/js/sheet-layout.js';
 
 const asset = (p) => fileURLToPath(new URL(`../assets/${p}`, import.meta.url));
 // The sheets name Aptos Narrow, Calibri and Arial. None of the three may be
@@ -52,6 +52,18 @@ const MIN_FONT_PT = 4;
 // here. Shrinking that cell slightly is far closer to the printed document
 // than breaking its label across four lines.
 const SHRINK_FLOOR = 0.6;
+// The same price, paid on a cell the sheet WRAPS. Excel wraps a cell only when
+// its text does not fit the box at the sheet's OWN font; DejaVu is wider, so a
+// line the form prints whole came out of the archived record broken across two
+// — the header's document number, "CE 95 010 00 01", was arriving as "CE 95 010
+// 00" over "01" while the customer's own completed record prints it on one
+// line. Within this allowance the cell keeps its single line at very slightly
+// reduced type, which is what the document does; past it the text genuinely
+// does not fit and wraps as before. It is deliberately much tighter than
+// SHRINK_FLOOR: it must cover the substituted face being a few per cent wider
+// and nothing else, or a heading the form really does print on two lines (the
+// title block of every one of the twelve) would be squeezed onto one.
+const SUBSTITUTION_ALLOWANCE = 0.88;
 
 /**
  * Render a completed submission as an archival PDF/A-2u document.
@@ -68,7 +80,7 @@ const SHRINK_FLOOR = 0.6;
  * licence-tracked sRGB profile — not PDFKit's bundled one — is what actually
  * ships as the record's archival OutputIntent.
  */
-export async function renderRecordPdf({ form, submission, snapshot, values, signatures, rejections = [], grid, identity = null, notice = '', cellFor = null, titleCell = null }) {
+export async function renderRecordPdf({ form, submission, snapshot, values, signatures, rejections = [], grid, identity = null, notice = '', cellFor = null, titleCell = null, intervalCells = null }) {
   // `identity` is the controlled document as it stood WHEN THIS RECORD WAS
   // SIGNED (stamped on the submission at creation — see server/workflow.js).
   // The live catalog row is only a fallback for records created before those
@@ -97,14 +109,6 @@ export async function renderRecordPdf({ form, submission, snapshot, values, sign
   forcePdfA2u(doc);
   attachOutputIntent(doc, readFileSync(ICC));
 
-  const ctx = { identity: id, submission, notice };
-  drawHeader(doc, ctx);
-  doc.y = PAGE_MARGIN + HEADER_HEIGHT;
-  doc.on('pageAdded', () => {
-    drawHeader(doc, ctx);
-    doc.y = PAGE_MARGIN + HEADER_HEIGHT;
-  });
-
   // What the technician recorded goes ON THE FORM, in the boxes the document
   // prints for it — the same coordinates the live preview writes into (see
   // server/cell-map.js), so the archived record and the preview show the same
@@ -114,16 +118,50 @@ export async function renderRecordPdf({ form, submission, snapshot, values, sign
   const leftovers = unmappedFields(snapshot, values, entries.painted);
 
   const valuesPlan = planValues(doc, leftovers, values);
-  drawGrid(doc, grid, {
-    form: { doc_number: id.doc_number, file_name: id.title },
+  // The sheet is MEASURED before anything is drawn, because how wide it lands
+  // on the page is not known until its scale is settled — and the page's own
+  // furniture has to be drawn inside that width. The forms declare a shrink
+  // factor of their own (72-80%), so on most of the twelve the sheet is
+  // narrower than the printable area, and a header rule ruled across the full
+  // page overhung the table's right edge by up to 40pt. A rule that reaches
+  // past the document it underlines is exactly the kind of thing that makes an
+  // archived record not look like the form it reproduces.
+  const sheet = planSheet(doc, grid, {
     entries,
     budget: sheetBudget(doc, grid, (signatures?.length ? SIGNOFF_HEIGHT : 0) + valuesPlan.height)
   });
+  // ...but not at any price. The header identifies the record, and the sign-off
+  // strip carries three people's names: squeezed into a sliver they would be
+  // ellipsised away, and a record whose signatories cannot be read is not a
+  // better record for having tidy edges. So the furniture follows the sheet
+  // down only as far as half the printable area. Every one of the twelve real
+  // forms lands between 92% and 100% of it, so the floor never binds on a
+  // controlled document — it exists for a degenerate sheet, not for these.
+  const printable = doc.page.width - PAGE_MARGIN * 2;
+  const width = sheet ? Math.max(sheet.width, printable * 0.5) : printable;
+
+  const ctx = { identity: id, submission, notice, width };
+  drawHeader(doc, ctx);
+  doc.y = PAGE_MARGIN + HEADER_HEIGHT;
+  doc.on('pageAdded', () => {
+    drawHeader(doc, ctx);
+    doc.y = PAGE_MARGIN + HEADER_HEIGHT;
+  });
+
+  drawGrid(doc, grid, {
+    form: { doc_number: id.doc_number, file_name: id.title },
+    sheet,
+    // Which boxes of the printed frequency band this visit ticks. Same source
+    // as the live preview (server/cell-map.js), and cumulative — a six-monthly
+    // visit ticks 1M, 3M and 6M — so the record and the preview cannot show a
+    // different band.
+    band: bandFor(intervalCells, submission?.frequency)
+  });
   drawValues(doc, valuesPlan);
   drawRejections(doc, rejections);
-  drawSignatures(doc, signatures);
+  drawSignatures(doc, signatures, width);
 
-  stampPageNumbers(doc);
+  stampPageNumbers(doc, width);
 
   doc.end();
   return await streamToBuffer(doc);
@@ -172,9 +210,12 @@ function attachOutputIntent(doc, iccBuffer) {
 
 // --- Drawing --------------------------------------------------------------
 
-function drawHeader(doc, { identity, submission, notice }) {
+// The running page header. `width` is the SHEET'S own drawn width, not the
+// printable area: everything here — the title, the code block and above all
+// the rule under them — is furniture for the document below, and none of it may
+// reach past the table's right edge.
+function drawHeader(doc, { identity, submission, notice, width }) {
   const top = PAGE_MARGIN;
-  const width = doc.page.width - PAGE_MARGIN * 2;
 
   doc.font('bold').fontSize(12).fillColor('#000')
     .text(identity.title, PAGE_MARGIN, top, { width: width * 0.6, height: 14, ellipsis: true });
@@ -211,9 +252,8 @@ function drawHeader(doc, { identity, submission, notice }) {
 // count is not known until every page has been produced. Nothing was drawn
 // there earlier, so this writes onto clean paper and the text layer carries
 // each page's indicator exactly once.
-function stampPageNumbers(doc) {
+function stampPageNumbers(doc, width) {
   const total = doc.bufferedPageRange().count;
-  const width = doc.page.width - PAGE_MARGIN * 2;
   const codeWidth = width * 0.36;
   const codeX = PAGE_MARGIN + width * 0.64;
   for (let i = 0; i < total; i++) {
@@ -304,9 +344,12 @@ function columnGeometry(grid, scale) {
 // A cell the sheet does not wrap prints on ONE line — that is the whole point
 // of the spill above — so the type shrinks (a little, to a floor) rather than
 // the word breaking. A cell the sheet DOES wrap wraps inside its own width, as
-// the sheet does, and shrinks only to stay inside the height the row allows.
-// Either way the text is never clipped: whatever it still needs after
-// shrinking is reported back as the height the row must grow to.
+// the sheet does, and shrinks only to stay inside the height the row allows —
+// but only once it has been given the chance to stay on one line at very
+// slightly reduced type, because the substituted face is wider than the sheet's
+// own and must not be what decides that a line breaks. Either way the text is
+// never clipped: whatever it still needs after shrinking is reported back as
+// the height the row must grow to.
 function fitCell(doc, { text, bold, align, wrap, boxWidth, runWidth, boxHeight, nominal }) {
   const font = bold ? 'bold' : 'body';
   const width = Math.max(1, boxWidth - CELL_PAD * 2);
@@ -318,13 +361,35 @@ function fitCell(doc, { text, bold, align, wrap, boxWidth, runWidth, boxHeight, 
   let drawWidth = width;
 
   if (wrap) {
+    // Excel wraps a cell only when its text does not fit the box AT THE
+    // SHEET'S OWN FONT. DejaVu is a wider face, so a line the form prints
+    // whole — the header's document number is the one the customer noticed —
+    // was being broken across two lines purely by the substitution. So a
+    // single-line cell is first offered the substitution allowance: if it fits
+    // on one line within a few per cent of the size the sheet sets, that IS
+    // the line the document prints and it does not wrap. Past that allowance
+    // the text genuinely does not fit its box and wraps as before, which is
+    // what keeps a title block the form really does set on two lines from
+    // being squeezed onto one.
+    const oneLine = Math.max(MIN_FONT_PT, nominal * SUBSTITUTION_ALLOWANCE);
+    if (lines.length === 1) {
+      doc.font(font).fontSize(size);
+      while (size > oneLine && doc.widthOfString(text) > width) {
+        size = Math.max(oneLine, size * 0.97);
+        doc.font(font).fontSize(size);
+      }
+      if (doc.widthOfString(text) <= width) wrapped = false;
+      else size = Math.max(MIN_FONT_PT, nominal);
+    }
+  }
+  if (wrapped) {
     const room = Math.max(1, boxHeight - CELL_PAD * 2);
     while (size > floor) {
       doc.font(font).fontSize(size);
       if (doc.heightOfString(text, { width, align }) <= room) break;
       size = Math.max(floor, size * 0.94);
     }
-  } else {
+  } else if (!wrap) {
     const widest = () => Math.max(...lines.map((l) => doc.widthOfString(l)));
     // 1) The size the sheet sets, inside the cell's own box.
     doc.font(font).fontSize(size);
@@ -440,8 +505,13 @@ function measureSheet(doc, grid, entries, scale) {
   return { rows, total, required, scale };
 }
 
-function drawGrid(doc, grid, { form, entries, budget }) {
-  if (!grid || !grid.columns?.length || !grid.rows?.length) return;
+// Everything about how the sheet will land on the page, settled BEFORE a mark
+// is made: the scale it fits at, the measured plan at that scale, and the width
+// it will actually occupy. Split out from the drawing below because the page's
+// own furniture — the header rule, the sign-off boxes — has to be drawn inside
+// that width, and the width is not known until the scale is.
+function planSheet(doc, grid, { entries, budget }) {
+  if (!grid || !grid.columns?.length || !grid.rows?.length) return null;
 
   const contentWidth = doc.page.width - PAGE_MARGIN * 2;
   const naturalWidth = grid.columns.reduce((s, c) => s + c.width, 0) * PT_PER_PX || 1;
@@ -480,38 +550,120 @@ function drawGrid(doc, grid, { form, entries, budget }) {
   const legible = LEGIBLE_PT / (grid.defaults?.size || 10);
   if (scale < legible && budget < fullPage) ({ scale, plan } = fitTo(fullPage));
 
+  return { scale, plan, fullPage, width: naturalWidth * scale };
+}
+
+function drawGrid(doc, grid, { form, sheet, band }) {
+  if (!sheet) return;
+  const { scale, plan, fullPage } = sheet;
+
   let y = doc.y;
+  // The sheet's own top-left on the page, kept so the logo — which the document
+  // anchors to a rectangle rather than to a cell — can be placed against the
+  // very rows and columns the cells below are drawn from.
+  const origin = { page: doc.bufferedPageRange().count - 1, y };
 
-  for (const planned of plan.rows) {
-    if (!planned.items.length) { y += planned.height; continue; }
+  // A row taller than a whole page can never be placed. It does not happen on
+  // any real form — the fit above sees to that — but if it ever did, the row is
+  // capped and its overflowing cells print a VISIBLE ellipsis and log, rather
+  // than a border being drawn off the bottom of the page. `fullPage` is the
+  // most vertical space a row could ever be given: an entirely fresh page,
+  // below the repeated header, down to the bottom margin.
+  const heights = plan.rows.map((p) => Math.min(p.height, Math.max(1, fullPage / p.maxSpanRows)));
+  // What a cell spanning several rows actually covers: the SUM of those rows'
+  // own heights, never one row's height multiplied out. These sheets set the
+  // two lines of their header block to 16 and 35 units, so a box merged across
+  // both was being drawn two-thirds of its true depth — closing in mid-air
+  // above the rest of the header row. That went unseen for as long as the box's
+  // bottom rule was being dropped as well (see mergedBorders in
+  // server/grid-model.js); with the rule restored it is the difference between
+  // a header that closes and one that does not.
+  const spanHeight = (index, rows) => {
+    let total = 0;
+    for (let i = index; i < Math.min(heights.length, index + Math.max(1, rows)); i++) total += heights[i];
+    return total;
+  };
 
-    // A row taller than a whole page can never be placed. It does not happen
-    // on any real form — the fit above sees to that — but if it ever did, the
-    // row is capped and its overflowing cells print a VISIBLE ellipsis and
-    // log, rather than a border being drawn off the bottom of the page.
-    // `fullPage` is the most vertical space a row could ever be given: an
-    // entirely fresh page, below the repeated header, down to the bottom margin.
-    const perRowCap = Math.max(1, fullPage / planned.maxSpanRows);
-    const capped = planned.height > perRowCap;
-    const height = capped ? perRowCap : planned.height;
-    const blockHeight = height * planned.maxSpanRows;
+  plan.rows.forEach((planned, index) => {
+    if (!planned.items.length) { y += heights[index]; return; }
+
+    const height = heights[index];
+    const capped = planned.height > height;
+    const blockHeight = spanHeight(index, planned.maxSpanRows);
 
     if (y + blockHeight > doc.page.height - PAGE_MARGIN) {
       doc.addPage();
       y = PAGE_MARGIN + HEADER_HEIGHT;
     }
 
-    for (const item of planned.items) drawCell(doc, item, y, height, capped ? form : null, planned.row.index);
+    for (const item of planned.items) {
+      drawCell(doc, item, y, spanHeight(index, item.spanRows), capped ? form : null, planned.row.index,
+        band?.get(`${planned.row.index}:${item.cell.col}`));
+    }
     y += height;
-  }
+  });
 
   doc.y = y;
+  drawSheetImage(doc, grid, plan, scale, origin);
   doc.moveDown(0.4);
 }
 
-function drawCell(doc, item, top, rowHeight, cappedForm, rowIndex) {
-  const { cell, box, spanRows } = item;
-  const height = rowHeight * spanRows;
+// The company logo, in the box the form anchors it to.
+//
+// The sheet anchors it to a RECTANGLE that need not line up with any one cell's
+// edges, so it is placed against the grid's own geometry rather than dropped
+// into a cell: the shared imageBox (web/js/sheet-layout.js) turns the anchor
+// into a box over the very column widths and PLANNED row heights this sheet was
+// just drawn from, so it lands where the printed form puts it whatever scale
+// the page forced.
+//
+// Drawn last, and on the page the sheet STARTED on: a form that paginates has
+// long since moved on by the time the rows are done, and the logo belongs in
+// the header at the top of the first page. `fit` is what keeps the mark
+// undistorted — the image is scaled to fit inside its anchored box with its own
+// proportions kept, never stretched to fill it.
+//
+// A form with no image, or one whose anchor will not resolve, draws nothing.
+function drawSheetImage(doc, grid, plan, scale, origin) {
+  if (!grid?.image?.data) return;
+  // Row heights come from the PLAN, not from the sheet's nominal heights: a row
+  // may have grown under the substituted font, and the logo has to sit against
+  // the rows as they were actually drawn.
+  const box = imageBox({
+    columns: grid.columns,
+    rows: plan.rows.map((p) => ({ height: p.height })),
+    image: grid.image
+  });
+  if (!box || box.width <= 0 || box.height <= 0) return;
+
+  const resume = { page: doc.bufferedPageRange().count - 1, y: doc.y };
+  try {
+    if (resume.page !== origin.page) doc.switchToPage(origin.page);
+    // Columns are the model's CSS pixels and still need the sheet's scale;
+    // the planned row heights are already points at that scale.
+    doc.image(Buffer.from(grid.image.data, 'base64'),
+      PAGE_MARGIN + box.x * PT_PER_PX * scale, origin.y + box.y,
+      // `fit` keeps the mark's own proportions inside its anchored box —
+      // Excel STRETCHES an image to its anchor rectangle, and the printed
+      // forms are very slightly distorted because of it, but a squashed
+      // company mark is a defect to reproduce, not a detail to copy. Centred
+      // in both axes so the shorter dimension is not left hugging one edge.
+      { fit: [box.width * PT_PER_PX * scale, box.height], align: 'center', valign: 'center' });
+  } catch {
+    // A logo that cannot be decoded must never cost the company its record.
+    // The form still prints; the mark is simply absent.
+  } finally {
+    if (resume.page !== origin.page) doc.switchToPage(resume.page);
+    doc.y = resume.y;
+  }
+}
+
+// `height` is the cell's FULL footprint — for a cell spanning several rows,
+// the sum of those rows' own heights, worked out by the caller. It is never
+// this row's height multiplied by the span: these sheets merge across rows of
+// very different depths.
+function drawCell(doc, item, top, height, cappedForm, rowIndex, options) {
+  const { cell, box } = item;
 
   // Shading the sheet declares, under everything else the cell draws.
   if (cell.fill) doc.rect(box.x, top, box.width, height).fill(cell.fill);
@@ -549,6 +701,77 @@ function drawCell(doc, item, top, rowHeight, cappedForm, rowIndex) {
   // fitted above, so this cannot overrun the box it was measured into.
   const lineHeight = doc.currentLineHeight();
   lines.forEach((line, i) => doc.text(line, x, y + i * lineHeight, { width, align, lineBreak: false }));
+  if (options?.length) drawCheckboxes(doc, { options, text: item.text, font, size, x, y, lineHeight });
+}
+
+// --- The frequency band's checkboxes --------------------------------------
+//
+// The forms print their interval band as boxes — `☐ Monthly (1M)  ☐ Three
+// Monthly (3M)  …` — and a technician ticks the ones the visit covers. They are
+// not part of any cell's TEXT: each is a rectangle shape anchored on the band's
+// row in the sheet's drawing XML, which is why nothing in the grid model
+// carries them and why both renderers draw them, from one shared geometry
+// (checkboxMetrics in web/js/sheet-layout.js) so the two marks are the same
+// mark.
+//
+// A box is drawn in the whitespace the sheet already leaves BEFORE its option,
+// so the option's own words stay exactly where the document prints them — the
+// band is one of the widest rows on the sheet and must not be pushed wider.
+// The option is located by MEASURING the text that precedes it in this very
+// cell, at the font and size the cell was fitted at, so the box lands against
+// the printed words at whatever scale the page forced.
+//
+// Nothing is drawn unless the range the server reported still delimits the
+// option in the text this cell is actually printing: a box planted over the
+// wrong words on a controlled document is worse than no box.
+function bandFor(intervalCells, selected) {
+  const byCoord = new Map();
+  for (const option of Object.values(intervalCells ?? {})) {
+    if (!option || !Number.isInteger(option.start) || !Number.isInteger(option.end)) continue;
+    if (!Number.isInteger(option.row) || !Number.isInteger(option.col)) continue;
+    const coord = `${option.row}:${option.col}`;
+    if (!byCoord.has(coord)) byCoord.set(coord, []);
+    byCoord.get(coord).push({
+      start: option.start,
+      end: option.end,
+      text: String(option.text ?? ''),
+      // Cumulative: a six-monthly visit ticks 1M, 3M and 6M, which is what
+      // every completed record the customer keeps shows. The rule itself lives
+      // in server/intervals.js and reaches here already applied, so the two
+      // renderers cannot disagree about it.
+      checked: (option.tickedBy ?? []).includes(selected)
+    });
+  }
+  for (const list of byCoord.values()) list.sort((a, b) => a.start - b.start);
+  return byCoord;
+}
+
+function drawCheckboxes(doc, { options, text, font, size, x, y, lineHeight }) {
+  const metrics = checkboxMetrics(size);
+  if (!(metrics.size > 0)) return;
+  const top = y + Math.max(0, (lineHeight - metrics.size) / 2);
+
+  for (const option of options) {
+    if (option.start < 0 || option.end > text.length || option.start >= option.end) continue;
+    if (text.slice(option.start, option.end) !== option.text) continue;
+
+    doc.font(font).fontSize(size);
+    const left = x + doc.widthOfString(text.slice(0, option.start)) - metrics.advance;
+    // A box that would be drawn off the left edge of the page is not drawn at
+    // all. It cannot happen on any of the twelve — every band sits well inside
+    // the sheet — but a mark in the margin would be a defect in the record.
+    if (left < PAGE_MARGIN - metrics.size) continue;
+
+    doc.undash().lineWidth(metrics.stroke).strokeColor('#000')
+      .rect(left, top, metrics.size, metrics.size).stroke();
+    if (!option.checked) continue;
+
+    const [first, ...rest] = metrics.tick;
+    doc.lineWidth(Math.max(0.35, metrics.stroke * 1.6)).lineJoin('miter').lineCap('butt')
+      .moveTo(left + first[0], top + first[1]);
+    for (const [tx, ty] of rest) doc.lineTo(left + tx, top + ty);
+    doc.stroke();
+  }
 }
 
 function warnTruncation(form, rowIndex, col) {
@@ -835,7 +1058,7 @@ function rejectionStageLabel(stage) {
 // down by. It stays a strip rather than a page of its own because the record
 // is a one-page document and its sign-off belongs on the same page as the work
 // it attests to.
-function drawSignatures(doc, signatures) {
+function drawSignatures(doc, signatures, sheetWidth) {
   if (!signatures?.length) return;
 
   const headingHeight = 11;
@@ -845,7 +1068,20 @@ function drawSignatures(doc, signatures) {
   doc.font('bold').fontSize(8).fillColor('#000').text('SIGN-OFF', PAGE_MARGIN, doc.y);
   doc.moveDown(0.2);
 
-  const blockWidth = (doc.page.width - PAGE_MARGIN * 2) / 3;
+  // Ruled to the SHEET'S width, not the page's: these boxes are furniture for
+  // the document above them, and a box whose right edge overshoots the form's
+  // makes the record look like two documents printed on one page.
+  //
+  // Never narrower than its own contents need, though. This strip is the only
+  // place the record says WHO signed it, and three names squeezed into a
+  // sliver would be ellipsised into initials. The floor is measured, not
+  // guessed: the widest stage label the strip has to print, plus the inset the
+  // block draws it at. On every one of the twelve real forms the sheet is far
+  // wider than that and the floor never binds.
+  const printable = doc.page.width - PAGE_MARGIN * 2;
+  doc.font('body').fontSize(6);
+  const widestLabel = Math.max(0, ...signatures.map((sig) => doc.widthOfString(stageLabel(sig.stage))));
+  const blockWidth = Math.min(printable, Math.max(sheetWidth ?? printable, (widestLabel + 14) * 3)) / 3;
   ensureSpace(doc, blockHeight);
   const top = doc.y;
 

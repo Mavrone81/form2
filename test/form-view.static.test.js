@@ -56,42 +56,56 @@ test('a single field update never re-renders the grid', () => {
   assert.match(update[0], /paintCell\(/, 'the live update must go through the same cell painter');
 });
 
-test('the ringed interval is built from nodes, never from markup', () => {
-  // The band that gets split into "before / the ringed option / after" is
-  // spreadsheet text like every other cell on this sheet. Splitting a string
-  // into parts is exactly where a renderer is tempted to reach for markup, so
-  // this pins the one path that does it: elements and text nodes only, and
-  // none of the four unsafe DOM APIs anywhere in it.
-  const mark = /function markInterval\([\s\S]*?\n\}/.exec(src);
-  assert.ok(mark, 'expected a helper that rings one option of the frequency band');
-  assert.doesNotMatch(mark[0], /\.innerHTML\b/, 'must never use innerHTML');
-  assert.doesNotMatch(mark[0], /insertAdjacentHTML/, 'must never use insertAdjacentHTML');
-  assert.doesNotMatch(mark[0], /\.outerHTML\b/, 'must never use outerHTML');
-  assert.doesNotMatch(mark[0], /document\.write\(/, 'must never use document.write');
-  assert.match(mark[0], /createElement\(/, 'the ring itself must be a created element');
-  assert.match(mark[0], /\.textContent\s*=/, 'the ringed run must be set as text');
+test('the frequency band is rebuilt from nodes, never from markup', () => {
+  // The band gets split into "printed text / a checkbox / the option / more
+  // printed text". Splitting a string into parts is exactly where a renderer is
+  // tempted to reach for markup, so this pins the one path that does it:
+  // elements and text nodes only, and none of the four unsafe DOM APIs
+  // anywhere in it.
+  const build = /function buildBand\([\s\S]*?\n\}/.exec(src);
+  assert.ok(build, 'expected a helper that rebuilds the frequency band with its boxes');
+  assert.doesNotMatch(build[0], /\.innerHTML\b/, 'must never use innerHTML');
+  assert.doesNotMatch(build[0], /insertAdjacentHTML/, 'must never use insertAdjacentHTML');
+  assert.doesNotMatch(build[0], /\.outerHTML\b/, 'must never use outerHTML');
+  assert.doesNotMatch(build[0], /document\.write\(/, 'must never use document.write');
+  assert.match(build[0], /createTextNode\(/, 'the printed runs must be text nodes');
+  const box = /function checkbox\(\)[\s\S]*?\n\}/.exec(src);
+  assert.ok(box, 'expected a helper that builds one checkbox');
+  assert.match(box[0], /createElement\(/, 'the box itself must be a created element');
+  assert.match(box[0], /createElementNS\(/, 'the tick must be a created SVG element, never markup');
 });
 
-test('only one option can be ringed, and the range is checked before anything is drawn', () => {
-  const mark = /function markInterval\([\s\S]*?\n\}/.exec(src);
-  assert.ok(mark, 'expected the frequency-band marker');
-  // Whatever was ringed before is restored to its printed text first, so a
-  // second selection moves the mark instead of adding another one.
-  assert.match(mark[0], /state\.marked/, 'the marker must track which option currently carries the ring');
-  assert.match(mark[0], /textContent\s*=\s*state\.printed\.get/,
-    'the previously ringed cell must be put back to its printed text');
-  // ...and the server's range must still delimit the server's option in the
-  // text this cell actually renders, or nothing is drawn over it.
-  assert.match(mark[0], /printed\.slice\(start,\s*end\)\s*!==\s*mark\.text/,
+test('a box is only drawn where the server\'s range still delimits the server\'s option', () => {
+  const build = /function buildBand\([\s\S]*?\n\}/.exec(src);
+  assert.ok(build, 'expected the frequency-band builder');
+  // The reported range must still delimit the reported option in the text this
+  // cell actually renders, or nothing is planted over a controlled document.
+  assert.match(build[0], /printed\.slice\(start,\s*end\)\s*!==\s*option\.text/,
     'the reported range must be verified against the rendered text before drawing');
 });
 
+test('the ticks follow the record\'s interval, and every other box is cleared', () => {
+  const mark = /function markInterval\([\s\S]*?\n\}/.exec(src);
+  assert.ok(mark, 'expected the frequency-band marker');
+  // Every box is visited on every change, so the previous visit's ticks can
+  // never be left behind claiming work that was not done on this one.
+  assert.match(mark[0], /for \(const \[code, box\] of state\.boxes\)/,
+    'the marker must visit every box, not only the one being ticked');
+  assert.match(mark[0], /classList\.toggle\('on', on\)/,
+    'a box that is not covered by this visit must be cleared, not merely left');
+  // Which boxes a visit ticks is the SERVER's answer (cumulative interval
+  // scope), never a rule this file works out for itself.
+  assert.match(mark[0], /tickedBy\b[\s\S]*?\.includes\(interval\)/,
+    'coverage must come from the band the server sent');
+});
+
 test('changing the interval never re-renders the grid', () => {
-  // Same rule as a single field update: moving the ring is a lookup and a few
-  // text nodes, not a rebuild of a 71-row sheet.
+  // Same rule as a single field update: re-ticking the band is a class toggle
+  // on boxes that already exist, not a rebuild of a 71-row sheet.
   const update = /export function updatePreviewInterval\([\s\S]*?\n\}/.exec(src);
   assert.ok(update, 'expected an exported single-cell interval update function');
-  assert.doesNotMatch(update[0], /renderForm\(/, 'moving the ring must not re-render the whole form');
+  assert.doesNotMatch(update[0], /renderForm\(/, 'moving the ticks must not re-render the whole form');
+  assert.doesNotMatch(update[0], /buildBand\(/, 'moving the ticks must not rebuild the band either');
   assert.match(update[0], /markInterval\(/, 'it must go through the same marker the first render uses');
 });
 

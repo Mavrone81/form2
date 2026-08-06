@@ -11,6 +11,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fillTitleBlank, cellStyle, layoutRow } from '../web/js/form-view.js';
+// Straight from the shared module: the preview re-exports only what it used to,
+// and these two are consumed by both renderers rather than by the preview alone.
+import { imageBox, checkboxMetrics } from '../web/js/sheet-layout.js';
 import { buildGrid } from '../server/grid-model.js';
 import { loadFixtures, SKIP } from './helpers/fixtures.js';
 
@@ -277,4 +280,68 @@ test('spill only ever takes empty columns — never a bordered box, never text',
     layoutRow([{ col: 1, text: 'x', span: { rows: 1, cols: 2 } }, { col: 3, filler: true }]).map((i) => i.cols),
     [3]
   );
+});
+
+// --- The shared geometry both renderers draw the logo and the band with -----
+//
+// These are pure functions over the grid model, so they can be pinned without a
+// DOM and without PDFKit. Both renderers consume exactly these answers, which
+// is what stops the preview and the archived record drawing two different
+// marks in two different places.
+
+test('the logo anchor becomes a box measured in the grid\'s own column and row units', () => {
+  const grid = {
+    columns: [{ index: 1, width: 40 }, { index: 2, width: 60 }, { index: 3, width: 100 }],
+    rows: [{ index: 1, height: 20 }, { index: 2, height: 30 }, { index: 3, height: 50 }],
+    image: { mime: 'image/png', data: 'x', from: { col: 1.5, row: 1 }, to: { col: 3, row: 2.5 } }
+  };
+  // x/width are COLUMN units (the model's CSS pixels): half of column 1 in,
+  // running to the leading edge of column 3.
+  // y/height are ROW units (points): the top of row 1, down to halfway
+  // through row 2.
+  assert.deepEqual(imageBox(grid), { x: 20, y: 0, width: 80, height: 35 });
+});
+
+test('an anchor with no area, and a grid with no image, both yield no box', () => {
+  const columns = [{ index: 1, width: 40 }, { index: 2, width: 60 }];
+  const rows = [{ index: 1, height: 20 }, { index: 2, height: 30 }];
+  assert.equal(imageBox({ columns, rows }), null, 'a form with no image must yield no box');
+  assert.equal(imageBox({ columns, rows, image: { from: { col: 2, row: 1 }, to: { col: 2, row: 2 } } }), null,
+    'a zero-width anchor must yield nothing rather than a box to divide by');
+  assert.equal(imageBox({ columns: [], rows: [], image: { from: { col: 1, row: 1 }, to: { col: 2, row: 2 } } }), null);
+});
+
+test('an anchor reaching past the grid stops at the grid\'s own edge', () => {
+  const grid = {
+    columns: [{ index: 1, width: 40 }, { index: 2, width: 60 }],
+    rows: [{ index: 1, height: 20 }],
+    image: { from: { col: 1, row: 1 }, to: { col: 99, row: 99 } }
+  };
+  assert.deepEqual(imageBox(grid), { x: 0, y: 0, width: 100, height: 20 });
+});
+
+test('a checkbox scales with the type of the option it belongs to', () => {
+  const small = checkboxMetrics(6);
+  const large = checkboxMetrics(12);
+  assert.ok(small.size > 0 && large.size > 0);
+  assert.equal(large.size / small.size, 2, 'the box must scale with the type, as the printed one does');
+  assert.equal(large.advance, large.size + large.gap, 'the advance is the box plus its gap and nothing else');
+  assert.ok(large.gap > 0, 'a box drawn hard against its label reads as part of the word');
+  // The tick is a three-point polyline inside the box, never outside it.
+  assert.equal(large.tick.length, 3);
+  for (const [x, y] of large.tick) {
+    assert.ok(x >= 0 && x <= large.size, `tick x ${x} must lie inside the box`);
+    assert.ok(y >= 0 && y <= large.size, `tick y ${y} must lie inside the box`);
+  }
+  // It goes down and then up — a check, not a line or a cross.
+  const [a, b, c] = large.tick;
+  assert.ok(b[1] > a[1] && c[1] < b[1], 'the tick must fall to a point and rise again');
+  assert.ok(a[0] < b[0] && b[0] < c[0], 'and read left to right');
+});
+
+test('a checkbox has a drawable rule at any size', () => {
+  // A hairline that rounds to nothing would drop the box off the printed page.
+  for (const size of [0, 1, 4, 8, 20]) {
+    assert.ok(checkboxMetrics(size).stroke >= 0.25, `a box at ${size}pt must still be strokeable`);
+  }
 });

@@ -260,3 +260,42 @@ test('cell shading never outranks the out-of-scope row tint', () => {
   assert.match(tinted.body, /background\s*:\s*var\(--tint\)/, 'the out-of-scope tint must win inside the sheet');
   assert.doesNotMatch(tinted.body, /opacity\s*:\s*0?\.[0-6]\b/, 'de-emphasis is never a fade');
 });
+
+test('a frequency checkbox costs the band no width, and an unticked box still draws its outline', () => {
+  const box = rules.find((r) => r.selector === '.sheet .checkbox');
+  assert.ok(box, 'the frequency band must draw a checkbox before each option');
+
+  // The band is one of the widest rows on the sheet. A box that took its own
+  // horizontal space would push every option to the right of where the
+  // document prints it, so the advance is cancelled by an equal negative
+  // margin — the box is drawn into the whitespace the sheet already leaves.
+  const left = /margin-left:\s*(-?[\d.]+)em/.exec(box.body);
+  const right = /margin-right:\s*([\d.]+)em/.exec(box.body);
+  const width = /width:\s*([\d.]+)em/.exec(box.body);
+  assert.ok(left && right && width, 'the box must be sized and spaced in em, so it scales with the option\'s type');
+  assert.ok(Number(left[1]) < 0, 'the box\'s advance must be cancelled, not added to the band');
+  assert.ok(Math.abs(Number(left[1]) + Number(width[1]) + Number(right[1])) < 0.01,
+    `the negative margin must cancel the box exactly (width ${width[1]} + gap ${right[1]} vs ${left[1]})`);
+
+  // The printed form carries a box beside EVERY option, ticked or not. A
+  // record showing only the ticked one would not be the same document.
+  assert.match(box.body, /border:\s*[\d.]+em solid/, 'every box keeps its outline, ticked or not');
+
+  const tick = rules.find((r) => r.selector === '.sheet .checkbox polyline');
+  const ticked = rules.find((r) => r.selector === '.sheet .checkbox.on polyline');
+  assert.ok(tick && ticked, 'the tick must be drawn only on a ticked box');
+  assert.match(tick.body, /stroke:\s*none/, 'an unticked box must show no tick at all');
+  assert.match(ticked.body, /stroke:\s*var\(--ink\)/, 'a ticked box is marked in the document\'s own ink');
+});
+
+test('the logo is fitted to its anchored box and can never be stretched', () => {
+  const logo = rules.find((r) => r.selector === '.sheet-logo');
+  assert.ok(logo, 'the sheet must be able to draw the logo the form embeds');
+  assert.match(logo.body, /object-fit:\s*contain/,
+    'a company mark squashed to fill a box it does not share proportions with is a defect');
+  assert.match(logo.body, /position:\s*absolute/,
+    'the logo is anchored to a rectangle of the sheet, not to a cell');
+  const stage = rules.find((r) => r.selector === '.sheet-stage');
+  assert.ok(stage, 'an absolutely positioned logo needs something to be positioned against');
+  assert.match(stage.body, /position:\s*relative/);
+});

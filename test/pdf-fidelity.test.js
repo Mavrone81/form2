@@ -346,16 +346,289 @@ test('sign-off, rejection history and the recorded values all still appear on a 
 
 // --- the two renderers must not be able to drift apart again --------------
 
-test('the preview and the archived PDF derive spill-over from ONE shared module', () => {
+test('the preview and the archived PDF derive spill-over, the logo box and the checkbox from ONE shared module', () => {
   const view = readFileSync(new URL('../web/js/form-view.js', import.meta.url), 'utf8');
   const pdf = readFileSync(new URL('../server/pdf-record.js', import.meta.url), 'utf8');
   const shared = readFileSync(new URL('../web/js/sheet-layout.js', import.meta.url), 'utf8');
 
-  assert.match(shared, /export function layoutRow/, 'the shared module owns the spill rule');
-  for (const [name, src] of [['form-view.js', view], ['pdf-record.js', pdf]]) {
-    assert.match(src, /import \{[^}]*layoutRow[^}]*\} from '[^']*sheet-layout\.js'/,
-      `${name} must IMPORT the spill rule, not carry its own`);
-    assert.doesNotMatch(src, /function layoutRow/,
-      `${name} must not define its own layoutRow — a second copy is how the two renderers drifted apart`);
+  // Everything about HOW THE SHEET PRINTS that both renderers need: where an
+  // unwrapped cell spills, where the anchored logo sits, and how big a
+  // checkbox is against the type of the option it belongs to. Each of the
+  // three is one definition, imported twice — a second copy of the spill rule
+  // is exactly how these two drifted apart before.
+  for (const rule of ['layoutRow', 'imageBox', 'checkboxMetrics']) {
+    assert.match(shared, new RegExp(`export function ${rule}`), `the shared module must own ${rule}`);
+    for (const [name, src] of [['form-view.js', view], ['pdf-record.js', pdf]]) {
+      assert.match(src, new RegExp(`import \\{[^}]*${rule}[^}]*\\} from '[^']*sheet-layout\\.js'`),
+        `${name} must IMPORT ${rule}, not carry its own`);
+      assert.doesNotMatch(src, new RegExp(`function ${rule}`),
+        `${name} must not define its own ${rule} — a second copy is how the two renderers drifted apart`);
+    }
   }
+});
+
+// --- 7. the company logo reaches the archived record ----------------------
+//
+// Every one of the twelve controlled documents embeds one image, and on the
+// printed form it fills the framed box at the top-left of the header. The
+// archived record left that box empty: neither the grid model nor either
+// renderer handled images at all. A quality record whose header is missing the
+// company mark does not look like the document it claims to be.
+
+// A 2x1 PNG, written byte by byte so nothing has to be vendored for a test.
+// The real logo is form content and is never committed here.
+const TINY_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGMQVDJetfsMAAYjApjF8PQBAAAAAElFTkSuQmCC';
+
+function logoGrid(withImage) {
+  const columns = [{ index: 1, width: 90 }, { index: 2, width: 90 }, { index: 3, width: 200 }];
+  const rows = [
+    { index: 1, height: 20, cells: [
+      { col: 1, text: '', span: { rows: 2, cols: 2 }, borders: { t: 'medium', r: 'thin', b: 'medium', l: 'medium' } },
+      { col: 3, text: 'Document Title:', wrap: true, borders: { t: 'medium', r: 'medium' } }
+    ] },
+    { index: 2, height: 40, cells: [
+      { col: 3, text: 'Widget Maintenance Record', wrap: true, borders: { r: 'medium', b: 'medium' } }
+    ] }
+  ];
+  const grid = { columns, rows, defaults: { size: 10, font: 'Calibri' } };
+  if (withImage) {
+    grid.image = { mime: 'image/png', data: TINY_PNG_B64, from: { col: 1, row: 1 }, to: { col: 3, row: 3 } };
+  }
+  return grid;
+}
+
+const hasImageXObject = (buffer) => /\/Subtype\s*\/Image/.test(buffer.toString('latin1'));
+
+test('the logo a form embeds is drawn into the archived record, and nothing is drawn when a form has none', async () => {
+  const withLogo = await renderRecordPdf({ ...BASE, grid: logoGrid(true) });
+  const without = await renderRecordPdf({ ...BASE, grid: logoGrid(false) });
+
+  assert.ok(hasImageXObject(withLogo), 'the embedded logo must reach the archived record');
+  assert.ok(!hasImageXObject(without),
+    'a form with no image must draw none — this record has no signature ink either, so any image here is invented');
+  // ...and the record still renders rather than throwing, which is the whole
+  // point of the "no image" branch.
+  assert.equal(without.subarray(0, 4).toString('latin1'), '%PDF');
+});
+
+test('an embedded logo does not cost the record its PDF/A conformance',
+  { skip: hasVera ? false : 'veraPDF not installed' }, async () => {
+    // The image is the one thing added to this document that PDF/A has an
+    // opinion about — colour space, and what may be transparent. If it could
+    // not be embedded conformantly that would have to be said out loud rather
+    // than the logo or the conformance being dropped quietly.
+    assert.match(veraVerdict(await renderRecordPdf({ ...BASE, grid: logoGrid(true) })), /PASS/);
+  });
+
+test('a logo that cannot be decoded costs the record nothing but the logo', async () => {
+  const grid = logoGrid(true);
+  grid.image = { ...grid.image, data: Buffer.from('not a png at all').toString('base64') };
+  const buf = await renderRecordPdf({ ...BASE, grid });
+  assert.equal(buf.subarray(0, 4).toString('latin1'), '%PDF');
+  if (hasPdftotext) {
+    assert.match(extractText(buf).replace(/\s+/g, ' '), /Widget Maintenance Record/,
+      'the form itself must still print');
+  }
+});
+
+// --- 8. the frequency band is checkboxes, ticked cumulatively -------------
+//
+// The forms print their interval band as boxes and a technician ticks the ones
+// the visit covers. They are rectangle shapes anchored on the band's row in the
+// sheet's drawing XML, so nothing in the grid model carries them and both
+// renderers have to draw them. Every completed record the customer keeps shows
+// a box beside EVERY option the form prints, with the covered ones ticked — a
+// six-monthly visit comes back with 1M, 3M and 6M ticked and Y empty.
+const BAND_TEXT = 'Monthly (1M)     Quarterly (3M)     Half-yearly (6M)     Annual (Y)';
+
+function bandGrid() {
+  const columns = [{ index: 1, width: 60 }, { index: 2, width: 420 }];
+  return {
+    columns,
+    rows: [{ index: 1, height: 15, cells: [
+      { col: 1, filler: true },
+      { col: 2, text: BAND_TEXT }
+    ] }],
+    defaults: { size: 10, font: 'Calibri' }
+  };
+}
+
+// The band as server/cell-map.js reports it: every printed option, each with
+// the visits that tick it (cumulative).
+function bandCells() {
+  const codes = [['1M', 0], ['3M', 1], ['6M', 2], ['Y', 3]];
+  const order = ['1M', '3M', '6M', 'Y'];
+  const cells = {};
+  for (const [code, i] of codes) {
+    const text = BAND_TEXT.split(/\s{2,}/)[i];
+    const start = BAND_TEXT.indexOf(text);
+    cells[code] = {
+      row: 1, col: 2, start, end: start + text.length, text,
+      tickedBy: order.slice(order.indexOf(code))
+    };
+  }
+  return cells;
+}
+
+const rectCount = (buffer) => paintOperators(buffer).filter((op) => /\bre$/.test(op)).length;
+const strokeSegments = (buffer) => paintOperators(buffer).filter((op) => /\b[ml]$/.test(op)).length;
+
+test('a box is drawn beside every option the band prints, not only the one this visit covers', async () => {
+  const at = (frequency) => renderRecordPdf({
+    ...BASE, submission: { ...BASE.submission, frequency }, grid: bandGrid(), intervalCells: bandCells()
+  });
+  const withBand = await at('1M');
+  const withoutBand = await renderRecordPdf({ ...BASE, grid: bandGrid() });
+
+  assert.equal(rectCount(withBand) - rectCount(withoutBand), 4,
+    'the band prints four options, so four boxes must be drawn — the printed form carries a box for each');
+});
+
+test('the ticks are cumulative: a six-monthly visit ticks the monthly and quarterly boxes too', async () => {
+  const at = async (frequency) => strokeSegments(await renderRecordPdf({
+    ...BASE, submission: { ...BASE.submission, frequency }, grid: bandGrid(), intervalCells: bandCells()
+  }));
+  // A tick is one polyline of three points: one `m` and two `l`.
+  const perTick = 3;
+  const monthly = await at('1M');
+  const sixMonthly = await at('6M');
+  const yearly = await at('Y');
+  assert.equal(sixMonthly - monthly, 2 * perTick, 'a 6M visit ticks two more boxes than a 1M one');
+  assert.equal(yearly - monthly, 3 * perTick, 'a Y visit ticks three more boxes than a 1M one');
+});
+
+test('a form with no band draws no boxes, and a band whose range no longer fits its text draws none either', async () => {
+  const plain = rectCount(await renderRecordPdf({ ...BASE, grid: bandGrid() }));
+  // A range that does not delimit the option it names must be refused: a box
+  // planted over the wrong words on a controlled document is worse than none.
+  const wrong = Object.fromEntries(Object.entries(bandCells())
+    .map(([code, o]) => [code, { ...o, text: 'Something else entirely' }]));
+  assert.equal(rectCount(await renderRecordPdf({ ...BASE, grid: bandGrid(), intervalCells: wrong })), plain);
+  assert.equal(rectCount(await renderRecordPdf({ ...BASE, grid: bandGrid(), intervalCells: null })), plain);
+});
+
+// --- 9. no rule reaches past the table ------------------------------------
+//
+// The forms declare a shrink factor of their own (72-80%), so on most of the
+// twelve the sheet lands narrower than the printable area — and the page
+// header's rule was ruled across the full page, overhanging the table's right
+// edge by up to 40pt. A rule that reaches past the document it underlines is
+// exactly what makes an archived record not look like the form it reproduces.
+function pathXs(buffer) {
+  const xs = [];
+  for (const op of paintOperators(buffer)) {
+    const n = op.split(/\s+/).map(Number);
+    if (/\bre$/.test(op)) xs.push(n[0], n[0] + n[2]);
+    else xs.push(n[0]);
+  }
+  return xs.filter((x) => Number.isFinite(x));
+}
+
+test('nothing the record draws reaches past the sheet\'s own right edge', async () => {
+  const columns = [];
+  for (let c = 1; c <= 12; c++) columns.push({ index: c, width: 60 });
+  const cells = columns.map((col) => ({ col: col.index, text: 'x', borders: { t: 'thin', b: 'thin', l: 'thin', r: 'thin' } }));
+  const grid = {
+    columns,
+    rows: [{ index: 1, height: 15, cells }],
+    defaults: { size: 10, font: 'Calibri' },
+    // The author's own 75% — the same statement eleven of the twelve make.
+    pageSetup: { orientation: 'portrait', scale: 75, fitToWidth: 1, fitToHeight: 1, printArea: null }
+  };
+  const buf = await renderRecordPdf({ ...BASE, grid });
+
+  const PAGE_MARGIN = 28;
+  const printable = 595.28 - PAGE_MARGIN * 2;
+  const sheetWidth = 12 * 60 * 0.75 * 0.75;
+  assert.ok(sheetWidth < printable - 50, 'the fixture must genuinely be narrower than the page');
+  const rightEdge = PAGE_MARGIN + sheetWidth;
+
+  const worst = Math.max(...pathXs(buf));
+  assert.ok(worst <= rightEdge + 1,
+    `every rule must stop at the table's right edge (${rightEdge.toFixed(1)}pt); the furthest reached ${worst.toFixed(1)}pt`);
+});
+
+// --- 10. a wrapped cell still prints the line the form prints -------------
+
+test('a cell the sheet wraps still prints on ONE line when that is what the form prints',
+  { skip: hasPdftotext ? false : 'pdftotext not installed' }, async () => {
+    // The header's document number. The sheet marks the cell as wrapping, and
+    // at the sheet's own font it fits its box on one line; the substituted face
+    // is a few per cent wider, so the archived record was breaking it in two
+    // where the customer's own completed record prints it whole. Invented code,
+    // real shape.
+    const CODE = 'AB 12 345 00 67';
+    const grid = {
+      columns: [{ index: 1, width: 111 }],
+      rows: [{ index: 1, height: 30, cells: [{ col: 1, text: CODE, wrap: true, borders: { t: 'thin', b: 'thin', l: 'thin', r: 'thin' } }] }],
+      defaults: { size: 10, font: 'Calibri' }
+    };
+    const lines = extractText(await renderRecordPdf({ ...BASE, grid }))
+      .split('\n').map((l) => l.replace(/\s+/g, ' ').trim());
+    assert.ok(lines.includes(CODE),
+      `the document number must print on one line as the form prints it. Extracted:\n${lines.join('\n')}`);
+  });
+
+test('a cell the sheet wraps and genuinely cannot fit on one line still wraps',
+  { skip: hasPdftotext ? false : 'pdftotext not installed' }, async () => {
+    // The allowance above is for the substituted face being a few per cent
+    // wider, and for nothing else. A heading the form really does set on two
+    // lines — the title block of every one of the twelve — must not be squeezed
+    // onto one. This one needs 57% of its size to fit on a single line, which
+    // is far outside any substitution penalty and squarely inside what a
+    // careless allowance would swallow.
+    const HEADING = 'Widget Maintenance Record';
+    const grid = {
+      columns: [{ index: 1, width: 111 }],
+      rows: [{ index: 1, height: 60, cells: [{ col: 1, text: HEADING, wrap: true, borders: { t: 'thin', b: 'thin', l: 'thin', r: 'thin' } }] }],
+      defaults: { size: 10, font: 'Calibri' }
+    };
+    const lines = extractText(await renderRecordPdf({ ...BASE, grid }))
+      .split('\n').map((l) => l.replace(/\s+/g, ' ').trim());
+    assert.ok(!lines.includes(HEADING), 'a heading far too wide for its box must still wrap');
+    // ...and every word of it must still be there, unbroken.
+    const joined = lines.join(' ').replace(/\s+/g, ' ');
+    assert.ok(joined.includes(HEADING), `no word may be broken in the wrap. Extracted:\n${lines.join('\n')}`);
+  });
+
+// --- 11. a merged box is drawn to its FULL footprint ----------------------
+
+test('a box merged across rows of different heights is drawn to the sum of them, not to one of them twice', async () => {
+  // These sheets set the two lines of their header block to very different
+  // heights and merge the logo box across both. Drawing that box as "this row's
+  // height, twice" closed it in mid-air, two-thirds of the way down the header
+  // row — which only became visible once the box's bottom rule was restored at
+  // all (see mergedBorders in server/grid-model.js).
+  // Both rows are deliberately taller than anything in them needs, so neither
+  // grows under the substituted font and the expected footprint is exactly
+  // their sum. The sheet is far narrower and shorter than the page, so nothing
+  // scales it either.
+  const grid = {
+    columns: [{ index: 1, width: 100 }, { index: 2, width: 100 }],
+    rows: [
+      { index: 1, height: 20, cells: [
+        { col: 1, text: 'M', span: { rows: 2, cols: 1 }, borders: { t: 'medium', r: 'medium', b: 'medium', l: 'medium' } },
+        { col: 2, text: 'a', borders: { t: 'thin', b: 'thin' } }
+      ] },
+      { index: 2, height: 44, cells: [{ col: 2, text: 'b', borders: { b: 'thin' } }] }
+    ],
+    defaults: { size: 8, font: 'Calibri' }
+  };
+  const buf = await renderRecordPdf({ ...BASE, grid });
+
+  // Every vertical stroke the document draws, by length. The merged box's own
+  // sides are the tallest thing on this sheet.
+  const ops = paintOperators(buf);
+  const lengths = [];
+  for (let i = 1; i < ops.length; i++) {
+    const from = ops[i - 1].split(/\s+/), to = ops[i].split(/\s+/);
+    if (!/\bm$/.test(ops[i - 1]) || !/\bl$/.test(ops[i])) continue;
+    if (Math.abs(Number(from[0]) - Number(to[0])) > 0.01) continue;
+    lengths.push(Math.abs(Number(from[1]) - Number(to[1])));
+  }
+  const tallest = Math.max(0, ...lengths);
+  // 20 + 44 at a scale of 1. Drawing "this row's height, twice" would give 40 —
+  // the box would stop 24pt short, in mid-air above the second row's own rule.
+  assert.ok(Math.abs(tallest - 64) < 1.5,
+    `the merged box must cover both rows (64pt); the tallest side drawn was ${tallest.toFixed(1)}pt`);
 });

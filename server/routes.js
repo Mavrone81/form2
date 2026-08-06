@@ -327,7 +327,10 @@ export function makeRoutes(db) {
 
     const buffer = await renderRecordPdf({
       form, submission: sub, snapshot, values, signatures, rejections, grid, identity, notice,
-      cellFor: cellMap?.cellFor ?? null, titleCell: cellMap?.titleCell ?? null
+      cellFor: cellMap?.cellFor ?? null, titleCell: cellMap?.titleCell ?? null,
+      // The printed frequency band, so the archived record carries the same
+      // ticked checkboxes the live preview shows.
+      intervalCells: cellMap?.intervalCells ?? null
     });
 
     // A machine id typed into a spreadsheet cell is untrusted input reaching

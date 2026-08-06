@@ -133,6 +133,89 @@ export function layoutRow(cells) {
 }
 
 // ---------------------------------------------------------------------------
+// Where the embedded logo sits
+// ---------------------------------------------------------------------------
+// The grid model reports the one image these documents embed as a rectangle in
+// the sheet's own coordinates: one-based FRACTIONAL column and row positions
+// (see imageOf in server/grid-model.js). Turning that into a box is arithmetic
+// over the very same column widths and row heights both renderers already lay
+// their cells out with, so the logo lands in the header box the form draws for
+// it rather than at a position each renderer guessed separately.
+//
+// UNITS follow the grid model's own, unconverted, because the two axes are
+// measured differently there and each renderer already knows it:
+//   - `x` and `width` are in COLUMN units (CSS pixels, as `columns[i].width`);
+//   - `y` and `height` are in ROW units (points, as `rows[i].height`).
+// Both are measured from the top-left corner of the grid.
+//
+// The box is where the image is ANCHORED, not the shape it must be drawn as: a
+// renderer fits the image inside it and preserves the aspect ratio, so a box
+// that is not the image's own proportion crops nothing and stretches nothing.
+function offsetAlong(sizes, position) {
+  // `position` is one-based and fractional: 1 is the leading edge of the first
+  // cell, 2.5 the middle of the second. Anything past the end stops at the end
+  // rather than running off it.
+  const p = Math.min(Math.max(position, 1), sizes.length + 1);
+  const index = Math.min(Math.floor(p), sizes.length);
+  let total = 0;
+  for (let i = 0; i < index - 1; i++) total += sizes[i] ?? 0;
+  return total + (sizes[index - 1] ?? 0) * Math.min(1, Math.max(0, p - index));
+}
+
+export function imageBox(grid) {
+  const image = grid?.image;
+  if (!image?.from || !image?.to) return null;
+  const columns = (grid.columns ?? []).map((c) => c.width ?? 0);
+  const rows = (grid.rows ?? []).map((r) => r.height ?? 15);
+  if (!columns.length || !rows.length) return null;
+
+  const x = offsetAlong(columns, image.from.col);
+  const right = offsetAlong(columns, image.to.col);
+  const y = offsetAlong(rows, image.from.row);
+  const bottom = offsetAlong(rows, image.to.row);
+  // A rectangle with no area cannot be drawn into; report nothing rather than
+  // a degenerate box for a renderer to divide by.
+  if (!(right > x) || !(bottom > y)) return null;
+  return { x, y, width: right - x, height: bottom - y };
+}
+
+// ---------------------------------------------------------------------------
+// The frequency band's checkboxes
+// ---------------------------------------------------------------------------
+// The forms print the interval band as CHECKBOXES — `☐ Monthly (1M)  ☐ Three
+// Monthly (3M)  …` — and the technician ticks the ones the visit covers. They
+// are not part of the cell's TEXT: each is a rectangle shape anchored on the
+// band's row in the sheet's drawing XML, which is why nothing in the grid model
+// carries them and why both renderers have to draw them.
+//
+// The geometry is here, in sheet units of the TYPE SIZE the option is set in,
+// so a box scales with the band exactly as the printed one does and the preview
+// and the archived record cannot drift into two different marks. `tick` is the
+// check itself as a three-point polyline in the box's own square, given as
+// fractions of the box's side so a renderer can scale it into pixels, points,
+// or an SVG viewBox of 1 without knowing anything else.
+//
+// `advance` is what the box costs horizontally. Both renderers draw the box in
+// the whitespace the sheet already leaves BEFORE the option (these bands pad
+// their options apart with long space runs), so the option's own words stay
+// exactly where the document prints them — the band is one of the widest rows
+// on the sheet and must not be pushed wider by a mark being added to it.
+const CHECKBOX = { side: 0.95, gap: 0.4, stroke: 0.08 };
+const CHECK_TICK = [[0.17, 0.5], [0.4, 0.76], [0.85, 0.2]];
+
+export function checkboxMetrics(fontSize) {
+  const size = Math.max(0, fontSize) * CHECKBOX.side;
+  const gap = Math.max(0, fontSize) * CHECKBOX.gap;
+  return {
+    size,
+    gap,
+    advance: size + gap,
+    stroke: Math.max(0.25, Math.max(0, fontSize) * CHECKBOX.stroke),
+    tick: CHECK_TICK.map(([x, y]) => [x * size, y * size])
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The machine ID in the printed title's blank
 // ---------------------------------------------------------------------------
 // A machine ID filled into the blank the printed title leaves for it, e.g.

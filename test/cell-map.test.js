@@ -144,12 +144,13 @@ test('a form with a status column maps each task to it (synthetic)', async () =>
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-// --- The frequency band: which printed option this visit's interval is ------
+// --- The frequency band: where each printed option sits ---------------------
 //
-// On paper the technician RINGS one option of the band printed above the task
-// table, so the preview has to know which run of characters to ring. All the
-// prose below is invented: the wording differs between real documents, which
-// is precisely why nothing here may match on it.
+// The band printed above the task table is a row of CHECKBOXES, and on paper
+// the technician ticks the ones the visit covers. Both renderers therefore have
+// to know where every option the form prints begins and ends. All the prose
+// below is invented: the wording differs between real documents, which is
+// precisely why nothing here may match on it.
 
 // Synthetic workbook with a frequency band above the task table. `band` is a
 // list of [column, text] pairs on one row, which covers both real shapes —
@@ -190,11 +191,14 @@ test('a band that prints each option in its own cell resolves to that whole cell
     const { intervalCells } = cellMapFor(def);
 
     // Each interval is a DIFFERENT cell, and the whole of that cell is the
-    // option — there is nothing else printed in it to leave outside the ring.
-    assert.deepEqual(intervalCells['3M'], { row: 3, col: 4, start: 0, end: 14, text: 'Quarterly (3M)' });
-    assert.deepEqual(intervalCells['6M'], { row: 3, col: 8, start: 0, end: 16, text: 'Half-yearly (6M)' });
-    assert.deepEqual(intervalCells.Y, { row: 3, col: 12, start: 0, end: 10, text: 'Annual (Y)' });
-    // Selecting another interval must move the mark to another cell.
+    // option — there is nothing else printed in it to leave outside the box.
+    assert.deepEqual(intervalCells['3M'],
+      { row: 3, col: 4, start: 0, end: 14, text: 'Quarterly (3M)', tickedBy: ['3M', '6M', 'Y'] });
+    assert.deepEqual(intervalCells['6M'],
+      { row: 3, col: 8, start: 0, end: 16, text: 'Half-yearly (6M)', tickedBy: ['6M', 'Y'] });
+    assert.deepEqual(intervalCells.Y,
+      { row: 3, col: 12, start: 0, end: 10, text: 'Annual (Y)', tickedBy: ['Y'] });
+    // Each option's box is drawn against its own cell.
     assert.notEqual(intervalCells['3M'].col, intervalCells['6M'].col);
     assert.notEqual(intervalCells['6M'].col, intervalCells.Y.col);
   });
@@ -262,10 +266,11 @@ test('the match is on the parenthesised code, never on the wording (synthetic)',
   });
 });
 
-test('an interval the form does not offer resolves to nothing, and does not throw (synthetic)', async () => {
+test('an option the band does not print resolves to nothing, and does not throw (synthetic)', async () => {
   await inTempDir(async (dir) => {
     // (a) The band simply does not print a yearly option — the shape one of
-    // the twelve real documents has.
+    // the twelve real documents has. Nothing may be invented for it: the form
+    // draws no box there, so neither may we.
     const noYearly = await writeBandWorkbook(join(dir, 'no-yearly.xlsx'), {
       band: [[3, 'Monthly (1M)     Quarterly (3M)     Half-yearly (6M)']],
       freqs: ['1M', '3M', '6M']
@@ -274,15 +279,24 @@ test('an interval the form does not offer resolves to nothing, and does not thro
     assert.equal(a.Y, undefined, 'no yearly option is printed, so there is no position to report');
     assert.ok(a['6M'], 'the options that ARE printed still resolve');
 
-    // (b) The band prints an option this document has no tasks for. Still
-    // nothing: the record can never be scoped to it.
+    // (b) The band PRINTS an option this document has no tasks for. The form
+    // still draws a box beside it — the printed sheets carry four boxes even
+    // where the task list only reaches 3M, and every completed record the
+    // customer keeps shows all four — so it still resolves. What it can never
+    // do is be TICKED: no selectable interval covers it, because the interval
+    // selector only ever offers what the document has tasks for.
     const notOffered = await writeBandWorkbook(join(dir, 'not-offered.xlsx'), {
       band: [[3, 'Monthly (1M)     Quarterly (3M)     Annual (Y)']],
       freqs: ['1M', '3M']
     });
-    const b = cellMapFor(await parseWorkbook(notOffered)).intervalCells;
-    assert.equal(b.Y, undefined);
+    const def = await parseWorkbook(notOffered);
+    const b = cellMapFor(def).intervalCells;
+    assert.ok(b.Y, 'the form prints a box for it, so its position must be reported');
     assert.ok(b['1M'] && b['3M']);
+    for (const offered of def.frequencies) {
+      assert.ok(!b.Y.tickedBy.includes(offered),
+        `a ${offered} visit must not tick an option this document has no tasks for`);
+    }
 
     // (c) A form with no band at all, and a definition with nothing in it,
     // are both answered with an empty map rather than an exception.
@@ -291,6 +305,25 @@ test('an interval the form does not offer resolves to nothing, and does not thro
     assert.deepEqual(intervalMarksFor(undefined), {});
     assert.deepEqual(intervalMarksFor({}), {});
     assert.deepEqual(intervalMarksFor({ frequencies: ['Y'], cells: {} }), {});
+  });
+});
+
+test('the band ticks cumulatively: a longer visit ticks the shorter options too (synthetic)', async () => {
+  // The documents say so themselves — several print "for Y maintenance, 3M and
+  // 6M must be performed at the same time" — and every completed record the
+  // customer keeps bears it out: a six-monthly visit comes back with 1M, 3M and
+  // 6M all ticked and Y empty.
+  await inTempDir(async (dir) => {
+    const path = await writeBandWorkbook(join(dir, 'cumulative.xlsx'), {
+      band: [[3, 'Monthly (1M)     Quarterly (3M)     Half-yearly (6M)     Annual (Y)']]
+    });
+    const { intervalCells } = cellMapFor(await parseWorkbook(path));
+    const tickedFor = (visit) => ORDER.filter((code) => intervalCells[code]?.tickedBy.includes(visit));
+
+    assert.deepEqual(tickedFor('1M'), ['1M']);
+    assert.deepEqual(tickedFor('3M'), ['1M', '3M']);
+    assert.deepEqual(tickedFor('6M'), ['1M', '3M', '6M']);
+    assert.deepEqual(tickedFor('Y'), ['1M', '3M', '6M', 'Y']);
   });
 });
 
@@ -311,7 +344,7 @@ test('the band is found by its codes, not by a fixed row or column (synthetic)',
 
 // --- The same, against the real controlled documents -----------------------
 
-test('every interval a real form offers is ringed on a cell the grid renders, at a range that slices to that option',
+test('every option a real form prints gets a box on a cell the grid renders, at a range that slices to that option',
   { skip: fx ? false : SKIP }, async () => {
     let separateCellForms = 0, mergedCellForms = 0, bandsShortOfAnOption = 0, printedButNotOffered = 0;
 
@@ -333,8 +366,14 @@ test('every interval a real form offers is ringed on a cell the grid renders, at
       for (const code of ORDER) {
         if (printed.has(code) && !def.frequencies.includes(code)) {
           printedButNotOffered += 1;
-          assert.equal(intervalCells[code], undefined,
-            `${f.id} prints ${code} but has no tasks for it, so it must not be markable`);
+          // The form draws a box beside it, so it must resolve — but no visit
+          // this document can be scoped to may ever tick it.
+          assert.ok(intervalCells[code],
+            `${f.id} prints ${code}, so the box the form draws for it must be placeable`);
+          for (const offered of def.frequencies) {
+            assert.ok(!intervalCells[code].tickedBy.includes(offered),
+              `${f.id}: a ${offered} visit must not tick ${code}, which this form has no tasks for`);
+          }
         }
         if (!printed.has(code)) assert.equal(intervalCells[code], undefined,
           `${f.id} does not print ${code}, so no position may be invented for it`);
@@ -344,10 +383,10 @@ test('every interval a real form offers is ringed on a cell the grid renders, at
       for (const code of ORDER) {
         const mark = intervalCells[code];
         if (!mark) continue;
-        assert.ok(def.frequencies.includes(code), `${f.id} must not mark an interval it does not offer`);
+        assert.ok(printed.has(code), `${f.id} must not place a box beside an option it does not print`);
         const coord = `${mark.row}:${mark.col}`;
         // The cell must be one the preview actually draws, or there would be
-        // nowhere on screen for the ring to go.
+        // nowhere on screen for the box to go.
         assert.ok(rendered.has(coord), `${f.id} ${code} -> ${coord} is not a rendered cell`);
         // THE assertion: slicing the text the grid renders with the reported
         // range yields exactly the option, ending in that option's own code.

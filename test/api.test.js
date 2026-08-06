@@ -605,15 +605,21 @@ test('GET /forms/:id/fields says which printed option of the frequency band each
       assert.equal(res.status, 200);
       const marks = res.body.intervalCells;
       assert.ok(marks, 'the payload must carry the frequency-band positions');
-      // The client rings exactly what this range delimits, so the range has to
-      // slice the band text back to the option itself.
+      // The client draws a checkbox against exactly what this range delimits,
+      // so the range has to slice the band text back to the option itself.
       assert.deepEqual(
         { row: marks['3M'].row, col: marks['3M'].col }, { row: 1, col: 2 });
       assert.equal(band.slice(marks['3M'].start, marks['3M'].end), 'Quarterly (3M)');
       assert.equal(band.slice(marks['1M'].start, marks['1M'].end), 'Monthly (1M)');
-      // The band prints a yearly option this form has no tasks for; it can
-      // never be the record's interval, so no position is reported for it.
-      assert.equal(marks.Y, undefined);
+      // The band prints a yearly option this form has no tasks for. The printed
+      // form still draws a box beside it, so it is still placed — but no visit
+      // this document can be scoped to may tick it.
+      assert.ok(marks.Y, 'an option the form prints must still be placeable');
+      assert.deepEqual(marks.Y.tickedBy.filter((c) => res.body.frequencies.includes(c)), []);
+      // Ticking is cumulative, which is what the completed records show: a
+      // three-monthly visit ticks the monthly option too.
+      assert.deepEqual(marks['1M'].tickedBy.includes('3M'), true);
+      assert.deepEqual(marks['3M'].tickedBy.includes('1M'), false);
     } finally { server.close(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

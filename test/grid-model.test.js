@@ -447,3 +447,139 @@ test('shading is reported when a sheet genuinely has some', { skip: fx ? false :
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// --- The embedded logo -----------------------------------------------------
+//
+// Every one of the twelve controlled documents embeds exactly one image, and on
+// the printed form it fills the framed box at the top-left of the header. The
+// archived record was leaving that box empty, because nothing read the image at
+// all. These build their own workbooks — the real logo is form content and is
+// never committed here.
+
+const withTempDir = async (prefix, fn) => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  try { return await fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+};
+
+// A 2x1 PNG, written byte by byte so nothing has to be vendored for a test.
+const TINY_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGMQVDJetfsMAAYjApjF8PQBAAAAAElFTkSuQmCC',
+  'base64');
+
+test('the one image a form embeds travels with the grid, anchored where the sheet puts it', async () => {
+  await withTempDir('grid-image-', async (dir) => {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('s');
+    ws.getColumn(1).width = 10;
+    ws.getColumn(2).width = 10;
+    ws.getRow(1).height = 20;
+    ws.getRow(2).height = 40;
+    ws.getCell('A1').value = 'header';
+    ws.getCell('C3').value = 'body';
+    const id = wb.addImage({ buffer: TINY_PNG, extension: 'png' });
+    // Anchored across the first two columns and the first two rows, the shape
+    // the header box has on all twelve.
+    ws.addImage(id, { tl: { col: 0, row: 0 }, br: { col: 2, row: 2 } });
+    const path = join(dir, 'logo.xlsx');
+    await wb.xlsx.writeFile(path);
+
+    const grid = await buildGrid(path);
+    assert.ok(grid.image, 'the grid must carry the embedded image');
+    assert.equal(grid.image.mime, 'image/png');
+    // The bytes must be the image itself, not a path or a promise of one: the
+    // archived PDF has to embed them and the preview has to show them.
+    assert.equal(Buffer.from(grid.image.data, 'base64').toString('latin1'), TINY_PNG.toString('latin1'));
+    // One-based fractional grid coordinates, so a renderer can interpolate the
+    // box straight from the column widths and row heights it already has.
+    assert.deepEqual(grid.image.from, { col: 1, row: 1 });
+    assert.deepEqual(grid.image.to, { col: 3, row: 3 });
+  });
+});
+
+test('a form with no image reports none, and buildGrid does not throw', async () => {
+  await withTempDir('grid-noimage-', async (dir) => {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('s');
+    ws.getCell('A1').value = 'no logo here';
+    const path = join(dir, 'plain.xlsx');
+    await wb.xlsx.writeFile(path);
+    const grid = await buildGrid(path);
+    assert.equal(grid.image, null, 'a form with no image must report none, never an empty object');
+  });
+});
+
+test('every real controlled form carries its logo, anchored inside the grid it is drawn on',
+  { skip: fx ? false : SKIP }, async () => {
+    for (const sample of samples()) {
+      const grid = await gridFor(sample);
+      assert.ok(grid.image, `${sample.id} embeds an image and the grid must carry it`);
+      assert.match(grid.image.mime, /^image\//, `${sample.id} must report a raster mime type`);
+      assert.ok(Buffer.from(grid.image.data, 'base64').length > 0, `${sample.id} must carry real bytes`);
+      // The anchor must land on the grid that is actually rendered — an image
+      // anchored past the trimmed extent would be drawn off the form.
+      const { from, to } = grid.image;
+      assert.ok(from.col >= 1 && to.col <= grid.columns.length + 1,
+        `${sample.id} image columns ${from.col}..${to.col} must lie inside 1..${grid.columns.length + 1}`);
+      assert.ok(from.row >= 1 && to.row <= grid.rows.length + 1,
+        `${sample.id} image rows ${from.row}..${to.row} must lie inside 1..${grid.rows.length + 1}`);
+      assert.ok(to.col > from.col && to.row > from.row, `${sample.id} image box must have area`);
+    }
+  });
+
+// --- A merged box's frame --------------------------------------------------
+
+test('a merged box takes its frame from the whole perimeter, not from its anchor alone',
+  { skip: fx ? false : SKIP }, async () => {
+    // Excel does not keep a merge's outline on its anchor: each covered cell
+    // carries the segment of the perimeter along its own edge. The header box
+    // that holds the logo on all twelve real documents is exactly this shape —
+    // the anchor declares a top and a left, the cell below carries the bottom
+    // and the cell beside it the right — so reading the anchor alone drew that
+    // box with two of its four sides missing and the record's header did not
+    // close on the archived PDF.
+    //
+    // This is measured on the real forms deliberately: ExcelJS writes ONE style
+    // across a whole merge, so a workbook built here cannot express the shape
+    // at all (measured — every covered cell comes back with the same border).
+    // Only a file Excel itself wrote carries it, and all twelve do. No form
+    // content is used: border styles and the box's own geometry, nothing else.
+    let boxes = 0;
+    for (const sample of samples()) {
+      const grid = await gridFor(sample);
+      for (const row of grid.rows) {
+        for (const cell of realCells(row)) {
+          const span = spanOf(cell);
+          if (span.rows < 2 || span.cols < 2) continue;
+          const sides = sidesOf(cell);
+          if (Object.keys(sides).length === 0) continue;
+          boxes += 1;
+          // A merged box the sheet frames must be framed on ALL FOUR sides.
+          // Half a box is not a lighter box; it is a box that does not close.
+          assert.deepEqual(Object.keys(sides).sort(), ['b', 'l', 'r', 't'],
+            `${sample.id}: the merged box at row ${row.index} col ${cell.col} must report all four sides, got ${JSON.stringify(sides)}`);
+        }
+      }
+    }
+    assert.ok(boxes > 0, 'expected the real forms to carry at least one framed merged box');
+  });
+
+test('an ordinary cell still reports only its own four sides', async () => {
+  await withTempDir('grid-single-', async (dir) => {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('s');
+    ws.getCell('A1').value = 'boxed';
+    ws.getCell('A1').border = { top: { style: 'thin' }, left: { style: 'medium' } };
+    // A neighbour's borders must never leak into it.
+    ws.getCell('B1').value = 'next';
+    ws.getCell('B1').border = { right: { style: 'thick' }, bottom: { style: 'double' } };
+    const path = join(dir, 'single.xlsx');
+    await wb.xlsx.writeFile(path);
+
+    const grid = await buildGrid(path);
+    const byCol = new Map(grid.rows[0].cells.map((c) => [c.col, c]));
+    assert.deepEqual(sidesOf(byCol.get(1)), { t: 'thin', l: 'medium' });
+    assert.deepEqual(sidesOf(byCol.get(2)), { r: 'thick', b: 'double' });
+  });
+});

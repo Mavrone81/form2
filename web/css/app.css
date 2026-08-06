@@ -273,6 +273,18 @@ a{color:var(--ink)}
    and their padding is zero so they cannot make a row taller than the sheet
    prints it. */
 .sheet.xl td.filler{border:0;background:none;padding:0}
+/* The company logo. These documents anchor it to a RECTANGLE of the sheet that
+   need not line up with any one cell's edges, so it is laid over the table
+   rather than put inside a <td> that would size it by that cell. The stage is
+   only ever created for a form that has an image, so a form without one adds
+   no wrapper at all. `object-fit:contain` is what guarantees the mark is never
+   stretched: it fits inside its anchored box and keeps its own proportions,
+   which is the same promise the archived PDF's `fit` makes.
+   pointer-events:none so the logo cannot swallow a click or a text selection
+   in the cells it happens to overlap. */
+.sheet-stage{position:relative;width:max-content;min-width:100%}
+.sheet-logo{position:absolute;object-fit:contain;object-position:left top;
+  pointer-events:none}
 .sheet td.n{width:32px;text-align:right;color:var(--mute);font-family:var(--mono);font-size:11px}
 .sheet td.f{width:44px;font-family:var(--mono);font-size:11px;font-weight:600}
 .sheet td.status-cell{width:96px;padding:0}
@@ -301,25 +313,30 @@ a{color:var(--ink)}
   border-bottom:1.5px solid var(--ink);padding-bottom:1px;
   white-space:pre-wrap;overflow-wrap:anywhere}
 
-/* The interval this visit covers, ringed in the document's own frequency band
-   exactly as a technician rings it in pen on the paper form.
-   An OUTLINE, never a fill and never a colour change: the words inside keep
-   the full --ink contrast they were printed with, because emphasis in this
-   design is never bought by fading or recolouring text. The ring is drawn in
-   --ink, the same monochrome family as everything else on the sheet, so it
-   introduces no hue and does not spend the single state accent (--stamp /
-   --ok, which mean "unapproved" and "approved" and nothing else).
-   `display:inline` is deliberate and load-bearing on two axes. Vertically, an
-   inline box's padding and border do not grow its line box, so the ring is
-   drawn around the words without making the band row taller. Horizontally,
-   the padding that gives the ring its width is cancelled by an equal negative
-   margin, so the option occupies exactly the width it did unringed — the band
-   is one of the widest rows on the sheet and must not be pushed wider. The
-   font is untouched for the same reason: a heavier weight would re-wrap it.
-   nowrap keeps an option from breaking across two lines, where half a ring
-   would read as damage rather than a mark. */
-.sheet .interval-mark{display:inline;border:1.5px solid var(--ink);border-radius:50%;
-  padding:.3em .55em;margin:0 -.55em;white-space:nowrap;color:var(--ink)}
+/* The frequency band's checkboxes — a box before every interval option the
+   form prints, ticked for the ones this visit covers, exactly as the paper
+   form is ticked in pen. The boxes are not text: on the sheet they are
+   rectangle shapes anchored on the band's row, so this renderer draws them,
+   and its sizes come from the same shared geometry the archived PDF uses
+   (checkboxMetrics in sheet-layout.js) — hence the em units, which scale a box
+   with the type of the option it belongs to just as the printed one does.
+   Drawn in --ink, the same monochrome family as everything else on the sheet:
+   no hue, and none of the single state accent (--stamp / --ok, which mean
+   "unapproved" and "approved" and nothing else).
+   The negative left margin is load-bearing: it cancels the box's own advance
+   so the option's words sit exactly where the document prints them, in the
+   whitespace the sheet already leaves between options. The band is one of the
+   widest rows on the sheet and must not be pushed wider by a mark being added
+   to it. An unticked box keeps its outline — the printed form has four empty
+   boxes on it and a record that showed only the ticked one would not be the
+   same document. */
+.sheet .checkbox{display:inline-block;width:.95em;height:.95em;
+  border:.08em solid var(--ink);vertical-align:-.12em;
+  margin-left:-1.35em;margin-right:.4em}
+.sheet .checkbox svg{display:block;width:100%;height:100%;overflow:visible}
+.sheet .checkbox polyline{fill:none;stroke:none;stroke-width:.14;
+  stroke-linecap:square;stroke-linejoin:miter}
+.sheet .checkbox.on polyline{stroke:var(--ink)}
 
 /* Out of scope: tint the row, never fade the words. Instruction and Freq stay
    at full reading contrast — a technician must be able to read every line,

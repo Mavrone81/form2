@@ -120,6 +120,50 @@ export function mergeMap(ws) {
 // further down share one definition.
 function borderSide(b) { return b?.style ? String(b.style) : null; }
 
+// The frame around a MERGED box.
+//
+// Excel does not keep a merge's outline on its anchor: it keeps it on the cells
+// the merge COVERS, each carrying the segment of the perimeter that runs along
+// its own edge. The header box that holds the company logo on all twelve of
+// these documents is exactly that shape — the anchor declares only a top and a
+// left, while the bottom lives on the cell below it and the right on the cell
+// beside it — so reading the anchor alone drew that box with two of its four
+// sides missing, and the archived record's header did not close.
+//
+// So each side is taken from the whole run of cells along it, anchor included:
+// the anchor's own declaration first (it is the cell the document names), then
+// the rest of that edge, first one found. A merge whose edge changes style
+// half-way along is drawn in the style it starts with — this model states ONE
+// style per side, and the alternative (silently dropping the rest of the box)
+// is what was already wrong.
+//
+// A 1x1 cell has no covered cells, so this returns exactly what it always did.
+function mergedBorders(ws, row, col, span) {
+  const rows = Math.max(1, span?.rows ?? 1);
+  const cols = Math.max(1, span?.cols ?? 1);
+  const at = (r, c) => ws.getRow(r).getCell(c).border ?? {};
+  const along = (side, coords) => {
+    for (const [r, c] of coords) {
+      const style = borderSide(at(r, c)[side]);
+      if (style) return style;
+    }
+    return null;
+  };
+  const across = (r) => Array.from({ length: cols }, (_, i) => [r, col + i]);
+  const down = (c) => Array.from({ length: rows }, (_, i) => [row + i, c]);
+  const borders = {};
+  for (const [key, side, coords] of [
+    ['t', 'top', across(row)],
+    ['b', 'bottom', across(row + rows - 1)],
+    ['l', 'left', down(col)],
+    ['r', 'right', down(col + cols - 1)]
+  ]) {
+    const style = along(side, coords);
+    if (style) borders[key] = style;
+  }
+  return borders;
+}
+
 // The sheet's own declared columnCount/rowCount routinely runs past what the
 // form actually uses — Excel's print area stops short of it. Rendering the
 // surplus draws a dead strip with no content and no border, past which the
@@ -179,6 +223,107 @@ function parsePrintArea(area) {
   // here", and not something to assume on a controlled document.
   if (firstCol !== 1 || firstRow !== 1) return null;
   return { maxCol: lastCol, maxRow: lastRow };
+}
+
+// ---------------------------------------------------------------------------
+// The company logo
+// ---------------------------------------------------------------------------
+// Every one of the twelve controlled documents embeds exactly one image, and
+// on the printed form it fills the framed box at the top-left of the header —
+// the box the archived record was leaving empty. A quality record whose header
+// is missing the company mark does not look like the document it claims to be,
+// which is the whole complaint this model exists to answer.
+//
+// ExcelJS resolves `xl/drawings/drawing1.xml` into a range and offers a ready
+// FRACTIONAL cell position on it (`tl.col`, `br.col`). Those are NOT used:
+// measured against the drawing XML on the twelve real forms they disagree with
+// the file — one document anchors its logo 88,215 EMU into a column 552,450 EMU
+// wide, a sixth of the way in, and ExcelJS reports that as a whole column in,
+// which drew that form's logo at a third of its size and in the wrong place.
+// What IS used is the raw anchor the file states — `nativeCol` plus
+// `nativeColOff` in EMU — converted against THIS MODEL'S own column widths and
+// row heights, so the rectangle is expressed in the same geometry the cells are
+// laid out in and cannot drift from it.
+//
+// What is reported is a rectangle in the grid's OWN coordinates — one-based
+// fractional column and row positions, matching `columns[i].index` and
+// `rows[i].index` — plus the image bytes. Neither renderer is told a size in
+// pixels or points: web/js/sheet-layout.js turns the rectangle into each
+// medium's units, and each renderer fits the image INSIDE it preserving the
+// aspect ratio, so the mark can never come out stretched.
+//
+// A form with no image yields null and every consumer draws nothing. An image
+// whose anchor cannot be resolved is likewise dropped rather than guessed at:
+// a logo in the wrong place on a controlled document is worse than none.
+const IMAGE_MIME = { png: 'image/png', jpeg: 'image/jpeg', jpg: 'image/jpeg', gif: 'image/gif' };
+// Office's own units. A column is measured in PIXELS here (as `columns[i].width`
+// is) and a row in POINTS (as `rows[i].height` is), so the two axes convert
+// differently — the same split the rest of this model already carries.
+const EMU_PER_PX = 9525;
+const EMU_PER_PT = 12700;
+
+// Where a one-based fractional position lands after moving `amount` further
+// along a run of cell sizes. Used only for a ONE-cell anchor, which states its
+// extent as a size rather than as a far corner.
+function advanceAlong(sizes, start, amount) {
+  if (!(amount > 0)) return null;
+  let position = start;
+  let left = amount;
+  while (left > 0 && position < sizes.length + 1) {
+    const size = sizes[Math.min(Math.floor(position), sizes.length) - 1] || 1;
+    const room = size * (Math.floor(position) + 1 - position) || size;
+    if (left <= room) return position + left / size;
+    left -= room;
+    position = Math.floor(position) + 1;
+  }
+  return sizes.length + 1;
+}
+
+function imageOf(wb, ws, columns, rows) {
+  const images = typeof ws.getImages === 'function' ? ws.getImages() : [];
+  if (!images.length) return null;
+  const anchor = images[0];
+  const media = typeof wb.getImage === 'function' ? wb.getImage(anchor.imageId) : null;
+  const mime = IMAGE_MIME[String(media?.extension ?? '').toLowerCase()];
+  if (!media || !mime || !media.buffer?.length) return null;
+
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  // One-based fractional position of an anchor point, clamped to the grid this
+  // model actually emits: a whole cell index plus how far into that cell the
+  // stated offset reaches. `sizes` are the model's own cell sizes on that axis
+  // and `perUnit` the EMU in one of them.
+  const positionOf = (index, offsetEmu, sizes, perUnit) => {
+    if (index == null || offsetEmu == null) return null;
+    if (index >= sizes.length) return sizes.length + 1;
+    const size = sizes[Math.max(0, index)] || 1;
+    const fraction = Math.min(1, Math.max(0, (offsetEmu / perUnit) / size));
+    return Math.min(sizes.length + 1, index + 1 + fraction);
+  };
+
+  const widths = columns.map((c) => c.width ?? 0);
+  const heights = rows.map((r) => r.height ?? 15);
+  const point = (a) => (a ? {
+    col: positionOf(num(a.nativeCol), num(a.nativeColOff), widths, EMU_PER_PX),
+    row: positionOf(num(a.nativeRow), num(a.nativeRowOff), heights, EMU_PER_PT)
+  } : null);
+
+  const from = point(anchor.range?.tl);
+  if (!from || from.col == null || from.row == null) return null;
+
+  // A two-cell anchor states its far corner; a one-cell anchor states a SIZE in
+  // pixels instead, which is walked out along the same widths and heights.
+  let to = point(anchor.range?.br);
+  const ext = anchor.range?.ext;
+  if ((!to || to.col == null || to.row == null) && ext) {
+    to = {
+      col: advanceAlong(widths, from.col, num(ext.width)),
+      row: advanceAlong(heights, from.row, num(ext.height) * 0.75)
+    };
+  }
+  if (!to || to.col == null || to.row == null) return null;
+  if (to.col <= from.col || to.row <= from.row) return null;
+
+  return { mime, data: media.buffer.toString('base64'), from, to };
 }
 
 function pageSetupOf(ws) {
@@ -252,12 +397,25 @@ export async function buildGrid(path, definition = null) {
       if (covered.has(`${r}:${c}`)) continue;
       const cell = row.getCell(c);
       const text = cell.value == null ? '' : String(cell.text ?? cell.value).trim();
+      // A merge is clamped to the trimmed extent before anything else looks at
+      // it, so the frame below is read from the perimeter of the box that will
+      // actually be DRAWN, not from one reaching past the form's last column.
+      const merge = spans.get(`${r}:${c}`);
+      const span = merge && {
+        rows: Math.min(merge.rows, maxRow - r + 1),
+        cols: Math.min(merge.cols, maxCol - c + 1)
+      };
       const b = cell.border ?? {};
-      const borders = {};
-      for (const [key, source] of [['t', b.top], ['r', b.right], ['b', b.bottom], ['l', b.left]]) {
-        const style = side(source);
-        if (style) borders[key] = style;
-      }
+      const borders = span && (span.rows > 1 || span.cols > 1)
+        ? mergedBorders(ws, r, c, span)
+        : (() => {
+          const own = {};
+          for (const [key, source] of [['t', b.top], ['r', b.right], ['b', b.bottom], ['l', b.left]]) {
+            const style = side(source);
+            if (style) own[key] = style;
+          }
+          return own;
+        })();
       const hasBorder = Object.keys(borders).length > 0;
       if (!text && !hasBorder && !spans.has(`${r}:${c}`)) {
         // Blank, unbordered, unmerged: hold the column open so everything to
@@ -270,7 +428,6 @@ export async function buildGrid(path, definition = null) {
       }
       hasReal = true;
 
-      const span = spans.get(`${r}:${c}`);
       const align = cell.alignment?.horizontal;
       const valign = cell.alignment?.vertical;
       const size = typeof cell.font?.size === 'number' ? cell.font.size : null;
@@ -280,18 +437,12 @@ export async function buildGrid(path, definition = null) {
       tally(families, family);
 
       const out = { col: c, text };
-      if (span && (span.rows > 1 || span.cols > 1)) {
-        // A merge can reach past the trimmed extent (its anchor real, its
-        // tail cells blank/unbordered and therefore not what pushed the
-        // extent out). Clamp so the tiling invariant still holds exactly
-        // against the trimmed column/row count, and drop the span entirely
-        // if clamping leaves it 1x1 — same convention as never spanning.
-        const clamped = {
-          rows: Math.min(span.rows, maxRow - r + 1),
-          cols: Math.min(span.cols, maxCol - c + 1)
-        };
-        if (clamped.rows > 1 || clamped.cols > 1) out.span = clamped;
-      }
+      // A merge can reach past the trimmed extent (its anchor real, its tail
+      // cells blank/unbordered and therefore not what pushed the extent out).
+      // It was clamped above so the tiling invariant still holds exactly
+      // against the trimmed column/row count; a clamp that leaves it 1x1 drops
+      // the span entirely — same convention as never spanning.
+      if (span && (span.rows > 1 || span.cols > 1)) out.span = span;
       if (cell.font?.bold) out.bold = true;
       if (align && align !== 'left') out.align = align;
       if (hasBorder) out.borders = borders;
@@ -320,5 +471,8 @@ export async function buildGrid(path, definition = null) {
     }
   }
 
-  return { columns, rows, defaults, pageSetup };
+  // The logo is placed against the columns and rows this model has just
+  // settled, so it can never be measured against a different geometry from the
+  // cells it sits among.
+  return { columns, rows, defaults, pageSetup, image: imageOf(wb, ws, columns, rows) };
 }
