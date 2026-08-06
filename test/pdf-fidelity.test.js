@@ -464,7 +464,7 @@ function bandCells() {
     const start = BAND_TEXT.indexOf(text);
     cells[code] = {
       row: 1, col: 2, start, end: start + text.length, text,
-      tickedBy: order.slice(order.indexOf(code))
+      tickedBy: [code]
     };
   }
   return cells;
@@ -484,17 +484,28 @@ test('a box is drawn beside every option the band prints, not only the one this 
     'the band prints four options, so four boxes must be drawn — the printed form carries a box for each');
 });
 
-test('the ticks are cumulative: a six-monthly visit ticks the monthly and quarterly boxes too', async () => {
+test('exactly one box is ticked, whichever interval the visit is', async () => {
   const at = async (frequency) => strokeSegments(await renderRecordPdf({
     ...BASE, submission: { ...BASE.submission, frequency }, grid: bandGrid(), intervalCells: bandCells()
   }));
   // A tick is one polyline of three points: one `m` and two `l`.
   const perTick = 3;
+  // The customer's archived records each carry a SINGLE tick — checked against
+  // four of them directly. Cumulative scope governs which tasks a visit covers,
+  // not how many boxes the band shows ticked; an earlier version conflated the
+  // two and put three ticks on a record that should carry one.
   const monthly = await at('1M');
   const sixMonthly = await at('6M');
   const yearly = await at('Y');
-  assert.equal(sixMonthly - monthly, 2 * perTick, 'a 6M visit ticks two more boxes than a 1M one');
-  assert.equal(yearly - monthly, 3 * perTick, 'a Y visit ticks three more boxes than a 1M one');
+  assert.equal(sixMonthly, monthly, 'a 6M visit ticks no more boxes than a 1M one');
+  assert.equal(yearly, monthly, 'a Y visit ticks no more boxes than a 1M one');
+  // And a tick is genuinely drawn: selecting nothing draws strictly fewer
+  // stroke segments than selecting an interval does.
+  const none = strokeSegments(await renderRecordPdf({
+    ...BASE, submission: { ...BASE.submission, frequency: '' }, grid: bandGrid(), intervalCells: bandCells()
+  }));
+  assert.ok(monthly > none, `a ticked band must draw more strokes than an unticked one (${monthly} vs ${none})`);
+  assert.equal(monthly - none, perTick, 'exactly one tick is drawn');
 });
 
 test('a form with no band draws no boxes, and a band whose range no longer fits its text draws none either', async () => {

@@ -193,9 +193,9 @@ test('a band that prints each option in its own cell resolves to that whole cell
     // Each interval is a DIFFERENT cell, and the whole of that cell is the
     // option — there is nothing else printed in it to leave outside the box.
     assert.deepEqual(intervalCells['3M'],
-      { row: 3, col: 4, start: 0, end: 14, text: 'Quarterly (3M)', tickedBy: ['3M', '6M', 'Y'] });
+      { row: 3, col: 4, start: 0, end: 14, text: 'Quarterly (3M)', tickedBy: ['3M'] });
     assert.deepEqual(intervalCells['6M'],
-      { row: 3, col: 8, start: 0, end: 16, text: 'Half-yearly (6M)', tickedBy: ['6M', 'Y'] });
+      { row: 3, col: 8, start: 0, end: 16, text: 'Half-yearly (6M)', tickedBy: ['6M'] });
     assert.deepEqual(intervalCells.Y,
       { row: 3, col: 12, start: 0, end: 10, text: 'Annual (Y)', tickedBy: ['Y'] });
     // Each option's box is drawn against its own cell.
@@ -308,11 +308,11 @@ test('an option the band does not print resolves to nothing, and does not throw 
   });
 });
 
-test('the band ticks cumulatively: a longer visit ticks the shorter options too (synthetic)', async () => {
+test('the band ticks exactly one box: the interval of this visit (synthetic)', async () => {
   // The documents say so themselves — several print "for Y maintenance, 3M and
   // 6M must be performed at the same time" — and every completed record the
   // customer keeps bears it out: a six-monthly visit comes back with 1M, 3M and
-  // 6M all ticked and Y empty.
+  // one box ticked and the rest empty.
   await inTempDir(async (dir) => {
     const path = await writeBandWorkbook(join(dir, 'cumulative.xlsx'), {
       band: [[3, 'Monthly (1M)     Quarterly (3M)     Half-yearly (6M)     Annual (Y)']]
@@ -320,10 +320,12 @@ test('the band ticks cumulatively: a longer visit ticks the shorter options too 
     const { intervalCells } = cellMapFor(await parseWorkbook(path));
     const tickedFor = (visit) => ORDER.filter((code) => intervalCells[code]?.tickedBy.includes(visit));
 
+    // One box per visit — verified against four of the customer's archived
+    // records, each of which carries a single tick.
     assert.deepEqual(tickedFor('1M'), ['1M']);
-    assert.deepEqual(tickedFor('3M'), ['1M', '3M']);
-    assert.deepEqual(tickedFor('6M'), ['1M', '3M', '6M']);
-    assert.deepEqual(tickedFor('Y'), ['1M', '3M', '6M', 'Y']);
+    assert.deepEqual(tickedFor('3M'), ['3M']);
+    assert.deepEqual(tickedFor('6M'), ['6M']);
+    assert.deepEqual(tickedFor('Y'), ['Y']);
   });
 });
 

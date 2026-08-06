@@ -79,11 +79,21 @@ function optionStart(text, from, codeStart) {
 // no yearly option) is still simply absent: a position is never guessed.
 //
 // `tickedBy` is which selected intervals put a tick in this box, and it is
-// stated here so the two renderers can never disagree about it. Interval scope
-// is CUMULATIVE (see server/intervals.js — several of these forms say in their
-// own remarks that a yearly service requires the 3M and 6M work at the same
-// time), so a six-monthly visit ticks 1M, 3M and 6M. Every completed record
-// supplied by the customer shows exactly that.
+// stated here so the two renderers can never disagree about it.
+//
+// EXACTLY ONE box is ticked: the interval of this visit. An earlier version
+// ticked cumulatively — a six-monthly visit marking 1M, 3M and 6M — on the
+// stated grounds that the customer's completed records showed that. They do
+// not. Four of their archived records were checked against this directly and
+// every one carries a single tick: MB shows 1M alone, DP and KW show 3M alone,
+// AVS shows 1M alone.
+//
+// The cumulative rule (server/intervals.js) is a different question with a
+// different answer. It decides which TASKS this visit must cover — a yearly
+// service does include the 3M and 6M work, which is why selecting Y puts 18
+// tasks in scope and not 1. But the band records WHICH VISIT THIS IS, and a
+// technician ticks one box. Conflating the two put three ticks on a record
+// that should carry one.
 export function intervalMarksFor(definition) {
   const marks = {};
   for (const cell of definition?.cells?.frequencyBand ?? []) {
@@ -95,7 +105,7 @@ export function intervalMarksFor(definition) {
       marks[code.code] = {
         row: cell.row, col: cell.col,
         start, end: code.end, text: text.slice(start, code.end),
-        tickedBy: ORDER.filter((selected) => covers(selected, code.code))
+        tickedBy: [code.code]
       };
     });
   }

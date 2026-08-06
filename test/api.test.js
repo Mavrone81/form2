@@ -616,10 +616,14 @@ test('GET /forms/:id/fields says which printed option of the frequency band each
       // this document can be scoped to may tick it.
       assert.ok(marks.Y, 'an option the form prints must still be placeable');
       assert.deepEqual(marks.Y.tickedBy.filter((c) => res.body.frequencies.includes(c)), []);
-      // Ticking is cumulative, which is what the completed records show: a
-      // three-monthly visit ticks the monthly option too.
-      assert.deepEqual(marks['1M'].tickedBy.includes('3M'), true);
-      assert.deepEqual(marks['3M'].tickedBy.includes('1M'), false);
+      // EXACTLY ONE box is ticked: the interval of this visit. Four of the
+      // customer's archived records were checked directly and every one
+      // carries a single tick. Cumulative scope decides which TASKS a visit
+      // covers, not how many boxes the band shows ticked.
+      assert.deepEqual(marks['1M'].tickedBy, ['1M']);
+      assert.deepEqual(marks['3M'].tickedBy, ['3M']);
+      assert.equal(marks['3M'].tickedBy.includes('1M'), false);
+      assert.equal(marks['1M'].tickedBy.includes('3M'), false);
     } finally { server.close(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
