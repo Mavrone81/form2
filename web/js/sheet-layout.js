@@ -232,11 +232,22 @@ export function checkboxMetrics(fontSize) {
 //  - Otherwise the first run of two or more underscores is replaced. A run
 //    of two is the shortest thing that reads as a ruled blank; a lone "_"
 //    is left alone because it is far more likely to be part of a name.
-//  - If the machine ID already repeats the short code immediately before the
-//    blank ("ED____" + "ED04"), that code is dropped from the title so the
-//    result is "ED04" and not "EDED04". Only a stem of up to four
-//    non-space characters is ever dropped, so a whole word before the blank
-//    ("...Record______") can never be swallowed.
+//  - If the machine ID already repeats the code immediately before the blank
+//    ("ED____" + "ED04"), that code is dropped from the title so the result
+//    is "ED04" and not "EDED04". The LONGEST such overlap wins: a title
+//    ending "AVS 35-" with ID "AVS 35-01" must read "AVS 35-01", not
+//    "AVS 35-AVS 35-01". Comparing only the last run of non-space characters
+//    missed that case, because the run was "35-" while the repeated code was
+//    "AVS 35-" — the space inside it hid the overlap.
+//  - A whole word before the blank must never be swallowed: "…Record______"
+//    with "Recorder 9" reads "RecordRecorder 9", not "Recorder 9". So a longer
+//    overlap only counts when it ENDS in a separator, which is what makes it
+//    read as a code prefix ("AVS 35-") rather than a word ("Record"). Short
+//    codes are allowed either way, since "ED", "MB", "KW" and "DP" carry no
+//    trailing separator.
+const SHORT_CODE = 4;
+const OVERLAP_LIMIT = 8;
+
 export function fillTitleBlank(title, machineId) {
   const printed = String(title ?? '');
   const id = String(machineId ?? '').trim();
@@ -247,7 +258,22 @@ export function fillTitleBlank(title, machineId) {
   let head = printed.slice(0, blank.index);
   const tail = printed.slice(blank.index + blank[0].length);
   const key = (s) => s.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-  const stem = (/\S{1,4}$/.exec(head) ?? [''])[0];
-  if (key(stem) && key(id).startsWith(key(stem))) head = head.slice(0, head.length - stem.length);
+
+  // Longest first, so "AVS 35-" is preferred over the "35-" that sits inside it.
+  const keyedId = key(id);
+  for (let take = Math.min(OVERLAP_LIMIT, head.length); take >= 1; take--) {
+    const suffix = head.slice(head.length - take);
+    // The overlap is the repeated CODE, never the space that separates it from
+    // the words before it: starting at whitespace would turn "Record ED____"
+    // + "ED04" into "RecordED04", closing up a gap the form prints.
+    if (/^\s/.test(suffix)) continue;
+    // A bare separator is not evidence of a repeated code; require a letter
+    // or digit in the overlap, or "Record -" + "01" would lose its dash.
+    if (!key(suffix)) continue;
+    // Past a short code, only a suffix ending in a separator reads as a code
+    // prefix. Without this, "Record" is droppable and "Recorder 9" swallows it.
+    if (take > SHORT_CODE && /[A-Za-z0-9]$/.test(suffix)) continue;
+    if (keyedId.startsWith(key(suffix))) { head = head.slice(0, head.length - take); break; }
+  }
   return head + id + tail;
 }

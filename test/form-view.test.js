@@ -345,3 +345,14 @@ test('a checkbox has a drawable rule at any size', () => {
     assert.ok(checkboxMetrics(size).stroke >= 0.25, `a box at ${size}pt must still be strokeable`);
   }
 });
+
+test('a repeated code prefix containing a space is dropped whole', () => {
+  // "…Record AVS 35-____" with the full machine ID printed "AVS 35-AVS 35-01"
+  // on a real record: the overlap was measured from the last run of non-space
+  // characters ("35-"), so the space inside "AVS 35-" hid the repetition.
+  assert.equal(fillTitleBlank('Record AVS 35-____', 'AVS 35-01'), 'Record AVS 35-01');
+  // Typing only the suffix must still work, and must not lose the separator.
+  assert.equal(fillTitleBlank('Record AVS 35-____', '01'), 'Record AVS 35-01');
+  // The space before a short code is not part of the code.
+  assert.equal(fillTitleBlank('Record ED____', 'ED04'), 'Record ED04');
+});
