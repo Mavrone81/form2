@@ -336,3 +336,138 @@ test('a record carrying parts values still passes veraPDF as PDF/A-2U',
     assert.match(out, /PASS/, `veraPDF reported: ${out}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+// --- The leftover appendix: only for a value the sheet has no cell for ------
+//
+// server/cell-map.js supplies `cellFor`, coordinate for coordinate, the same
+// map the live preview uses. A value whose field IS in that map is already
+// printed in its own box on the sheet (see entriesForSheet above) and must
+// not be repeated below it. Only a value the map genuinely cannot place —
+// because the field has no cell at all (this fixture's `note_1`, standing in
+// for the real forms' Remarks, which no document prints a blank for), or
+// because the document itself has no Status column for a task (F04/F09 on
+// the real forms) — belongs in the leftover block.
+//
+// A tiny grid with ONE task row and its own Status cell, mapped by cellFor
+// exactly as server/cell-map.js would map a real Status column.
+const STATUS_GRID = {
+  columns: [{ index: 1, width: 260 }, { index: 2, width: 40 }],
+  rows: [{ index: 1, height: 15, cells: [
+    { col: 1, span: { rows: 1, cols: 1 }, text: 'Check the widget', bold: false, align: 'left',
+      borders: { t: true, r: true, b: true, l: true } },
+    { col: 2, span: { rows: 1, cols: 1 }, text: '', bold: false, align: 'center',
+      borders: { t: true, r: true, b: true, l: true } }
+  ] }]
+};
+const STATUS_CELL_FOR = { task_1: { row: 1, col: 2 } };
+
+test('a form WITH a status column, fully filled, produces no leftover appendix and stays one page',
+  { skip: hasPdftotext ? false : 'pdftotext not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdf-noappendix-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    const buf = await renderRecordPdf({
+      ...FIXTURE,
+      // 'note_1' models a field with NO cell on this document (like Remarks
+      // on the real forms) that nobody wrote anything in — the exact shape
+      // that used to force an appendix onto every otherwise-complete record.
+      snapshot: [
+        { field_key: 'task_1', label: 'Check the widget', section: 'Tasks', kind: 'text' },
+        { field_key: 'note_1', label: 'Remarks', section: 'Record', kind: 'text' }
+      ],
+      values: [{ field_key: 'task_1', value: 'OK' }],
+      grid: STATUS_GRID,
+      cellFor: STATUS_CELL_FOR,
+      titleCell: null
+    });
+    writeFileSync(file, buf);
+    const text = execFileSync('pdftotext', [file, '-'], { encoding: 'utf8' }).replace(/\s+/g, ' ');
+    assert.doesNotMatch(text, /RECORDED VALUES/i, 'the old blanket heading must be gone');
+    assert.doesNotMatch(text, /Remarks:/, 'an untouched field with no cell must not print an empty appendix line');
+    assert.equal((text.match(/\bOK\b/g) ?? []).length, 1, 'the task value should print exactly once, on the sheet');
+    const pageMatch = /PAGE 1 \/ (\d+)/.exec(text);
+    assert.ok(pageMatch, 'page indicator should be present');
+    assert.equal(pageMatch[1], '1', `record should be one page, was ${pageMatch[1]}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a form WITHOUT a status column still records its task result somewhere in the PDF',
+  { skip: hasPdftotext ? false : 'pdftotext not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdf-nostatus-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    const buf = await renderRecordPdf({
+      ...FIXTURE,
+      snapshot: [{ field_key: 'task_1', label: 'Check the widget', section: 'Tasks', kind: 'text' }],
+      values: [{ field_key: 'task_1', value: 'PASS-NOSTATUS' }],
+      grid: STATUS_GRID,
+      // No status column on this document — cell-map.js reports no coordinate
+      // for the task, exactly as it does for F04/F09 on the real forms.
+      cellFor: {},
+      titleCell: null
+    });
+    writeFileSync(file, buf);
+    const text = execFileSync('pdftotext', [file, '-'], { encoding: 'utf8' }).replace(/\s+/g, ' ');
+    assert.match(text, /PASS-NOSTATUS/, 'a task result with nowhere on the sheet to go must still be recorded');
+    assert.match(text, /Check the widget/, 'and labelled, so the recorded value is identifiable');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a field with no cell mapping on any form is still recorded, heading says so honestly',
+  { skip: hasPdftotext ? false : 'pdftotext not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdf-unmapped-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    const buf = await renderRecordPdf({
+      ...FIXTURE,
+      snapshot: [
+        { field_key: 'task_1', label: 'Check the widget', section: 'Tasks', kind: 'text' },
+        { field_key: 'note_1', label: 'Remarks', section: 'Record', kind: 'text' }
+      ],
+      values: [{ field_key: 'task_1', value: 'OK' }, { field_key: 'note_1', value: 'Filter replaced early' }],
+      grid: STATUS_GRID,
+      cellFor: STATUS_CELL_FOR,
+      titleCell: null
+    });
+    writeFileSync(file, buf);
+    const text = execFileSync('pdftotext', [file, '-'], { encoding: 'utf8' }).replace(/\s+/g, ' ');
+    assert.match(text, /Filter replaced early/, 'the unmappable value must not be lost');
+    assert.doesNotMatch(text, /RECORDED VALUES/i, 'the heading must not claim to be a complete list');
+    assert.match(text, /no space on the form/i, 'the heading should say these are entries the form has no printed space for');
+    assert.equal((text.match(/\bOK\b/g) ?? []).length, 1, 'the mapped task value must not also be repeated in the leftover block');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a leftover appendix does not break veraPDF PDF/A-2U conformance',
+  { skip: hasVera ? false : 'veraPDF not installed' }, async () => {
+  const { writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pdfa-leftover-'));
+  try {
+    const file = join(dir, 'r.pdf');
+    const buf = await renderRecordPdf({
+      ...FIXTURE,
+      snapshot: [
+        { field_key: 'task_1', label: 'Check the widget', section: 'Tasks', kind: 'text' },
+        { field_key: 'note_1', label: 'Remarks', section: 'Record', kind: 'text' }
+      ],
+      values: [{ field_key: 'task_1', value: 'OK' }, { field_key: 'note_1', value: 'Filter replaced early' }],
+      grid: STATUS_GRID,
+      cellFor: STATUS_CELL_FOR,
+      titleCell: null
+    });
+    writeFileSync(file, buf);
+    const out = execFileSync('verapdf', ['-f', '2u', '--format', 'text', file], { encoding: 'utf8' });
+    assert.match(out, /PASS/, `veraPDF reported: ${out}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -660,16 +660,28 @@ function usedPartsRows(snapshot, byKey) {
 }
 
 // The recorded values the SHEET has no box for — a remark the form prints no
-// blank for, or a field on a document whose layout the map cannot place. Those
-// print below the form; everything else is already on it, in the box the
-// document prints for it. A record whose every value is placed on the form
-// prints nothing here at all.
+// blank for, or a field on a document whose layout the map cannot place (a
+// task's status on the two documents with no Status column). Those print
+// below the form; everything else is already on it, in the box the document
+// prints for it. A record whose every value is placed on the form — or whose
+// only leftover fields are ones nobody actually wrote anything in — prints
+// nothing here at all.
 //
-// Signature fields never appear (the sign-off blocks carry those), and a parts
-// row nobody wrote anything in is not an omission — most maintenance visits
-// replace no parts — so it prints nothing rather than four empty labelled
-// lines. Rows are judged whole: a part number with no quantity beside it says
-// something, and dropping the empty box would hide that.
+// A field with NOTHING entered is not a recorded value: it is an untouched
+// optional field (this is what "Remarks" was on every one of the twelve real
+// forms before this filter existed — always present in the snapshot, never
+// mapped to a cell, and so always forcing an appendix onto an otherwise
+// one-page record even when nobody had written a remark). Nothing was
+// recorded, so there is nothing to append. This mirrors the same "filled"
+// test completenessFor already uses (server/workflow.js): non-empty after
+// trimming, so whitespace does not count as an entry either.
+//
+// Parts rows are the one exception, and deliberately so: they are judged
+// WHOLE by usedPartsRows below, not box by box, so a used row still prints
+// its own blank boxes (a part number with no quantity beside it still says
+// something) rather than looking like three separate missing fields.
+//
+// Signature fields never appear here (the sign-off blocks carry those).
 export function unmappedFields(snapshot, values, painted = new Set()) {
   if (!snapshot?.length) return [];
   const byKey = new Map((values ?? []).map((v) => [v.field_key, v.value]));
@@ -678,7 +690,8 @@ export function unmappedFields(snapshot, values, painted = new Set()) {
     if (f.kind === 'signature') return false;
     if (painted.has(f.field_key)) return false;
     const part = parsePartsKey(f.field_key);
-    return part ? used.has(part.row) : true;
+    if (part) return used.has(part.row);
+    return String(byKey.get(f.field_key) ?? '').trim() !== '';
   });
 }
 
@@ -706,7 +719,12 @@ function planValues(doc, fields, values) {
 
   doc.font('bold').fontSize(9);
   let height = doc.currentLineHeight() + 4;
-  blocks.push({ kind: 'title', text: 'RECORDED VALUES', height });
+  // "RECORDED VALUES" implied a complete list, which stopped being true once
+  // every placeable value moved onto the sheet itself (entriesForSheet,
+  // above) — this block now carries only the remainder: entries the form has
+  // no printed space for. The heading says exactly that, honestly, rather
+  // than implying "here is everything".
+  blocks.push({ kind: 'title', text: 'ENTRIES WITH NO SPACE ON THE FORM', height });
 
   // Section by section, so a heading always sits above its own fields.
   const sections = [];
