@@ -147,20 +147,26 @@ test('a spanning cell near a page boundary does not overflow past the bottom mar
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
 
-  // Matches server/pdf-record.js constants: PAGE_MARGIN=28, HEADER_HEIGHT=46,
-  // GRID_ROW_SCALE=0.62 -> a 26-unit row becomes a 16pt row. 44 filler rows
-  // land the next row at y=778 on an A4 page (841.89pt tall): a single 16pt
-  // row would still fit (778+16=794 < 813.89), but a 4-row span (778+64=842)
-  // would not — exactly the gap the old code missed.
+  // The sheet is now SCALED to the page rather than drawn at a fixed row
+  // height, so the old fixture's arithmetic (44 rows of 26 units landing the
+  // next row at y=778) no longer picks out a page boundary — that sheet simply
+  // shrinks until it fits one page, and the case goes untested.
+  //
+  // So this fixture is built to be genuinely unpageable: far more rows than
+  // even the smallest permitted scale can fit, which FORCES real page breaks,
+  // with a 4-row spanning cell every tenth row so that one of them is bound to
+  // land near a boundary. The column is wide enough that scaling never squeezes
+  // a word out of it, which is a separate concern with its own guard.
   const rows = [];
-  for (let i = 1; i <= 44; i++) {
-    rows.push({ index: i, height: 26, cells: [{ col: 1, span: { rows: 1, cols: 1 }, text: `Row ${i}`,
+  for (let i = 1; i <= 150; i++) {
+    const spanning = i % 10 === 0;
+    rows.push({ index: i, height: 26, cells: [{ col: 1,
+      span: { rows: spanning ? 4 : 1, cols: 1 },
+      text: spanning ? `SPANCELL ${i}` : `Row ${i}`,
       bold: false, align: 'left', borders: { t: true, r: true, b: true, l: true } }] });
   }
-  rows.push({ index: 45, height: 26, cells: [{ col: 1, span: { rows: 4, cols: 1 }, text: 'SPANCELL near boundary',
-    bold: false, align: 'left', borders: { t: true, r: true, b: true, l: true } }] });
 
-  const buf = await renderRecordPdf({ ...FIXTURE, grid: { columns: [{ index: 1, width: 60 }], rows } });
+  const buf = await renderRecordPdf({ ...FIXTURE, grid: { columns: [{ index: 1, width: 420 }], rows } });
   const dir = mkdtempSync(join(tmpdir(), 'pdftsv-'));
   try {
     const file = join(dir, 'r.pdf');
@@ -185,6 +191,10 @@ test('a spanning cell near a page boundary does not overflow past the bottom mar
       if (bottom > maxAllowed) overflowingWords.push({ page, text: row.text, bottom, maxAllowed });
     }
     assert.ok(sawSpanCell, 'the spanning cell\'s text should be present somewhere in the document');
+    // ...and the document must genuinely have broken across pages, or none of
+    // the above tested a page boundary at all.
+    assert.ok(pageHeights.size > 1,
+      `this fixture must force a page break to be worth anything; it produced ${pageHeights.size} page(s)`);
     assert.deepEqual(overflowingWords, [], 'no word should be drawn past the bottom margin on any page');
 
     // A4 height (841.89pt) minus PAGE_MARGIN (28pt), the same page geometry

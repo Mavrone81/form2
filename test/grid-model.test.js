@@ -157,17 +157,68 @@ async function rawExtent(path) {
   return { lastCol, lastRow };
 }
 
-test('the grid trims to exactly the last column and row that carry anything real, on every sample form',
+// The author's own print area, read independently of grid-model here for the
+// same reason rawExtent is: a test that asks the code under test what it
+// thinks the answer is proves nothing.
+async function rawPrintArea(path) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(path);
+  const m = /^\$?([A-Z]+)\$?1:\$?([A-Z]+)\$?(\d+)$/
+    .exec(String(wb.worksheets[0].pageSetup?.printArea ?? '').trim().toUpperCase());
+  if (!m || m[1] !== 'A') return null;
+  const toNum = (s) => [...s].reduce((a, ch) => a * 26 + (ch.charCodeAt(0) - 64), 0);
+  return { lastCol: toNum(m[2]), lastRow: Number(m[3]) };
+}
+
+test('the grid trims to the smaller of the declared print area and the last cell carrying anything real',
   { skip: fx ? false : SKIP }, async () => {
+    let declared = 0;
     for (const sample of samples()) {
       const grid = await gridFor(sample);
       const { lastCol, lastRow } = await rawExtent(sample.path);
-      assert.equal(grid.columns.length, lastCol,
-        `${sample.id}: expected the grid to trim to column ${lastCol}, the last one carrying text or a border`);
-      assert.equal(grid.rows.length, lastRow,
-        `${sample.id}: expected the grid to trim to row ${lastRow}, the last one carrying text or a border`);
+      const area = await rawPrintArea(sample.path);
+      if (area) declared++;
+
+      // Where the author declared a print area it is a STATEMENT of where the
+      // form ends and the scan is only a heuristic, so the smaller wins: the
+      // declaration trims material the form does not print (one of the twelve
+      // keeps ten columns of off-print working notes), and never pads the
+      // document out with declared-but-empty columns. Where nothing is
+      // declared, the scan still governs exactly, as it always did.
+      const expectedCol = area ? Math.min(area.lastCol, lastCol) : lastCol;
+      const expectedRow = area ? Math.min(area.lastRow, lastRow) : lastRow;
+      assert.equal(grid.columns.length, expectedCol,
+        `${sample.id}: expected the grid to end at column ${expectedCol}`);
+      assert.equal(grid.rows.length, expectedRow,
+        `${sample.id}: expected the grid to end at row ${expectedRow}`);
     }
+    assert.ok(declared > 0, 'expected the sample forms to declare print areas — otherwise this asserts nothing new');
   });
+
+// The page setup is the author's own statement about how this document
+// prints, and the archived PDF is built on it: fitToWidth/fitToHeight of 1 is
+// what says the form is a ONE-PAGE document, and `scale` is the shrink factor
+// they chose. It must reach consumers intact, not be re-derived downstream.
+test('the author\'s declared page setup travels with the grid', { skip: fx ? false : SKIP }, async () => {
+  let withSetup = 0;
+  for (const sample of samples()) {
+    const grid = await gridFor(sample);
+    assert.ok(grid.pageSetup, `${sample.id}: every grid carries a pageSetup, even when the sheet declares nothing`);
+    const area = await rawPrintArea(sample.path);
+    if (area) {
+      withSetup++;
+      assert.deepEqual(grid.pageSetup.printArea, { maxCol: area.lastCol, maxRow: area.lastRow },
+        `${sample.id}: the declared print area must be reported as declared`);
+      assert.equal(grid.pageSetup.orientation, 'portrait',
+        `${sample.id}: the forms print portrait — the PDF must not silently turn one landscape`);
+      assert.ok(grid.pageSetup.scale > 0 && grid.pageSetup.scale <= 100,
+        `${sample.id}: expected the author's own scale factor`);
+      assert.equal(grid.pageSetup.fitToHeight, 1,
+        `${sample.id}: the form declares itself a one-page document`);
+    }
+  }
+  assert.ok(withSetup >= 11, `expected 11 of the 12 forms to declare a print setup, saw ${withSetup}`);
+});
 
 // The cell map is what places a technician's entered value on the sheet. If
 // trimming ever removed a column or row a mapped field points at, that field

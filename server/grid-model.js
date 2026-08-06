@@ -152,12 +152,72 @@ function realExtent(ws) {
   };
 }
 
+// What the AUTHOR said about printing this sheet, read off the worksheet
+// rather than inferred: eleven of the twelve controlled documents carry an
+// explicit page setup, and it answers most of the layout question outright.
+//
+//   orientation portrait, fitToWidth 1, fitToHeight 1, scale 72-80,
+//   printArea A1:Q39 (and so on)
+//
+// `fitToWidth: 1` with `fitToHeight: 1` is the author stating that the form is
+// a ONE-PAGE document — which is exactly the claim the archived PDF was
+// failing, coming out at three to six pages. `scale` is the shrink factor they
+// chose themselves, and is honoured as an upper bound rather than reinvented.
+// `printArea` states where the form ends, which is strictly better evidence
+// than the content scan below: see realExtent's caller.
+//
+// A sheet that declares nothing (one of the twelve does) yields nulls
+// throughout and every consumer falls back to computing its own fit.
+function parsePrintArea(area) {
+  const m = /^\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)$/.exec(String(area ?? '').trim().toUpperCase());
+  if (!m) return null;
+  const toNum = (s) => [...s].reduce((a, ch) => a * 26 + (ch.charCodeAt(0) - 64), 0);
+  const [firstCol, firstRow, lastCol, lastRow] = [toNum(m[1]), Number(m[2]), toNum(m[3]), Number(m[4])];
+  // Only a print area anchored at A1 is used as an extent. Every one of the
+  // twelve is, and a region starting elsewhere would mean the printed form is
+  // a WINDOW onto the sheet — a different thing entirely from "the form ends
+  // here", and not something to assume on a controlled document.
+  if (firstCol !== 1 || firstRow !== 1) return null;
+  return { maxCol: lastCol, maxRow: lastRow };
+}
+
+function pageSetupOf(ws) {
+  const ps = ws.pageSetup ?? {};
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  return {
+    orientation: typeof ps.orientation === 'string' ? ps.orientation : null,
+    scale: num(ps.scale),
+    fitToWidth: num(ps.fitToWidth),
+    fitToHeight: num(ps.fitToHeight),
+    printArea: parsePrintArea(ps.printArea)
+  };
+}
+
 export async function buildGrid(path, definition = null) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(path);
   const ws = wb.worksheets[0];
 
-  const { maxCol, maxRow } = realExtent(ws);
+  const pageSetup = pageSetupOf(ws);
+  // Where the form ends. Two independent answers, and the SMALLER wins:
+  //  - the author's declared print area, which is a statement of intent;
+  //  - realExtent()'s scan for the last cell carrying text or a border, which
+  //    is a heuristic.
+  // Taking the smaller means the print area can trim material the scan found
+  // OUTSIDE what the form prints — on one of the twelve that is ten columns of
+  // off-print working notes, which is why that form was rendering at 1,699px
+  // wide against its siblings' ~920 — while a print area that reaches past the
+  // real content never pads the document out with declared-but-empty columns.
+  //
+  // What this deliberately cannot do is print something the author excluded.
+  // That is the point: the printed form is the controlled document. The guard
+  // against trimming too far is the cell-map test — every coordinate a value
+  // can be written into must be one the rendered grid still contains — so a
+  // print area that cut a fillable box would fail the suite rather than
+  // silently drop a technician's entry.
+  const scanned = realExtent(ws);
+  const maxCol = pageSetup.printArea ? Math.min(pageSetup.printArea.maxCol, scanned.maxCol) : scanned.maxCol;
+  const maxRow = pageSetup.printArea ? Math.min(pageSetup.printArea.maxRow, scanned.maxRow) : scanned.maxRow;
   const columns = [];
   for (let c = 1; c <= maxCol; c++) {
     const w = ws.getColumn(c).width ?? DEFAULT_COL_WIDTH;
@@ -260,5 +320,5 @@ export async function buildGrid(path, definition = null) {
     }
   }
 
-  return { columns, rows, defaults };
+  return { columns, rows, defaults, pageSetup };
 }

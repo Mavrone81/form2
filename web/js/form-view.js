@@ -28,38 +28,18 @@
 // whole point of this file. The exception stops at the edge of the sheet —
 // every control, panel and label around it stays in the app's own language.
 
-// A machine ID filled into the blank the printed title leaves for it, e.g.
-// "BESI Die Attach Preventive Maintenance Record ED____" with machine ID
-// "ED04" reads "...Record ED04". Display only: the stored title and the
-// source file are never touched.
+// How the sheet PRINTS — the rules this renderer shares, cell for cell, with
+// the archived PDF (server/pdf-record.js): where an unwrapped cell spills, how
+// heavy each border weight is, and how the machine ID fills the blank in the
+// printed title. They live in one module because the preview and the archived
+// record are two drawings of the same controlled document and must agree; the
+// PDF drifting away from this file is exactly what a second copy of the spill
+// rule produced. See web/js/sheet-layout.js.
 //
-// Rules, in order:
-//  - No machine ID yet: the title is left exactly as printed.
-//  - No blank in the title (four of the twelve forms name their machine in
-//    the title outright): left exactly as printed. Never appended to — a
-//    title that does not ask for a machine ID must not grow one.
-//  - Otherwise the first run of two or more underscores is replaced. A run
-//    of two is the shortest thing that reads as a ruled blank; a lone "_"
-//    is left alone because it is far more likely to be part of a name.
-//  - If the machine ID already repeats the short code immediately before the
-//    blank ("ED____" + "ED04"), that code is dropped from the title so the
-//    result is "ED04" and not "EDED04". Only a stem of up to four
-//    non-space characters is ever dropped, so a whole word before the blank
-//    ("...Record______") can never be swallowed.
-export function fillTitleBlank(title, machineId) {
-  const printed = String(title ?? '');
-  const id = String(machineId ?? '').trim();
-  if (!id) return printed;
-  const blank = /_{2,}/.exec(printed);
-  if (!blank) return printed;
-
-  let head = printed.slice(0, blank.index);
-  const tail = printed.slice(blank.index + blank[0].length);
-  const key = (s) => s.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-  const stem = (/\S{1,4}$/.exec(head) ?? [''])[0];
-  if (key(stem) && key(id).startsWith(key(stem))) head = head.slice(0, head.length - stem.length);
-  return head + id + tail;
-}
+// `fillTitleBlank` is re-exported so callers (and its tests) can keep taking
+// it from the renderer they use.
+import { layoutRow, borderPen, fillTitleBlank } from './sheet-layout.js';
+export { layoutRow, borderPen, fillTitleBlank };
 
 // What an entered value looks like inside the reproduced sheet: the value
 // itself in a `.entry` span, or — when the value is cleared — the cell's own
@@ -85,37 +65,11 @@ function paintCell(td, printed, value) {
 
 const at = (cell) => `${cell.row}:${cell.col}`;
 
-// How a spreadsheet border style is drawn. The WEIGHT is the point: these
-// documents frame each section in `medium` and rule the gridlines inside it in
-// `thin`, and that contrast is the document's entire visual hierarchy. Drawing
-// both at one weight — which a blanket `td{border:1px}` does — flattens the
-// form into an undifferentiated mesh, which is exactly why the preview did not
-// look like the print.
-//
-// Tone follows weight for the same reason: a section frame is drawn in the
-// document ink, an interior gridline in the lighter rule grey the rest of this
-// app uses for gridlines. Both are monochrome, so this borrows nothing from
-// the state accent.
-//
-// An unrecognised style still draws a line (thin, solid). A border the sheet
-// asks for must never silently disappear, and none of the twelve forms uses
-// anything but thin and medium, so this branch is insurance rather than a
-// guess about content.
-const BORDER = {
-  hair: ['0.5px', 'solid', 'rule'],
-  thin: ['1px', 'solid', 'rule'],
-  dotted: ['1px', 'dotted', 'rule'],
-  dashed: ['1px', 'dashed', 'rule'],
-  dashDot: ['1px', 'dashed', 'rule'],
-  dashDotDot: ['1px', 'dashed', 'rule'],
-  medium: ['2px', 'solid', 'ink'],
-  mediumDashed: ['2px', 'dashed', 'ink'],
-  mediumDashDot: ['2px', 'dashed', 'ink'],
-  mediumDashDotDot: ['2px', 'dashed', 'ink'],
-  slantDashDot: ['2px', 'dashed', 'ink'],
-  thick: ['3px', 'solid', 'ink'],
-  double: ['3px', 'double', 'ink']
-};
+// Tone follows the shared weight: a section frame is drawn in the document
+// ink, an interior gridline in the lighter rule grey the rest of this app uses
+// for gridlines. Both are monochrome, so this borrows nothing from the state
+// accent. The weights themselves are the sheet's, not this renderer's — see
+// borderPen in sheet-layout.js.
 const SIDE = { t: 'top', r: 'right', b: 'bottom', l: 'left' };
 
 // A family name reaches here from a spreadsheet file, so it is treated as
@@ -146,8 +100,8 @@ export function cellStyle(cell, defaults = {}) {
   for (const [key, name] of Object.entries(SIDE)) {
     const style = cell.borders?.[key];
     if (!style) continue;
-    const [width, line, token] = BORDER[style] ?? BORDER.thin;
-    css[`border-${name}`] = `${width} ${line} var(--${token})`;
+    const { weight, line, heavy } = borderPen(style);
+    css[`border-${name}`] = `${weight}px ${line} var(--${heavy ? 'ink' : 'rule'})`;
   }
 
   // Shading travels as a custom property, not as an inline background: an
@@ -179,47 +133,6 @@ export function cellStyle(cell, defaults = {}) {
 const applyStyle = (el, css) => {
   for (const [prop, value] of Object.entries(css)) el.style.setProperty(prop, value);
 };
-
-// How a row is laid out, given that a spreadsheet lets text SPILL and an HTML
-// table does not.
-//
-// A cell the sheet does not wrap is drawn by Excel on one line, running on
-// across the empty cells to its right for as far as it needs. A table cell
-// cannot do that: hold it to its own column and a line of prose the form
-// prints once becomes a 26-line tower, which drags the row — and the whole
-// document's vertical proportions — far away from the printed page. Measured
-// on the reference form, that alone made the preview 3,613px tall where the
-// sheet is 914px.
-//
-// So the spill is reproduced the only way a table can: the cell is given the
-// columns it spills into. It may only ever take PLACEHOLDER columns — columns
-// the sheet leaves genuinely empty, with no text, no border and no merge, so
-// nothing is displaced and nothing is covered up. A bordered box the form
-// means someone to write in is not a placeholder and is never absorbed, and
-// neither is anything with text in it. The moment a real cell is reached, the
-// run stops, exactly where the ink stops on paper.
-//
-// The row still accounts for every one of its columns afterwards — the widths
-// simply move from the placeholders into the cell that spills over them —
-// which is the invariant the whole column alignment rests on.
-export function layoutRow(cells) {
-  const out = [];
-  let absorb = 0;
-  for (let i = 0; i < cells.length; i++) {
-    const cell = cells[i];
-    if (absorb > 0 && cell.filler === true) { absorb--; continue; }
-    const cols = cell.span?.cols ?? 1;
-    if (cell.filler === true || cell.wrap || !cell.text) {
-      out.push({ cell, cols });
-      continue;
-    }
-    let extra = 0;
-    while (i + 1 + extra < cells.length && cells[i + 1 + extra].filler === true) extra++;
-    absorb = extra;
-    out.push({ cell, cols: cols + extra });
-  }
-  return out;
-}
 
 // Ring the interval this visit covers, on the option the document already
 // prints in its frequency band — the same mark a technician makes with a pen

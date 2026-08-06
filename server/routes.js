@@ -294,11 +294,18 @@ export function makeRoutes(db) {
     // readable but is no longer the one this record was signed against, the
     // record still renders, and says so on its face.
     let grid = null;
+    let cellMap = null;
     let notice = '';
     if (form?.file_type === 'xlsx') {
       try {
         const def = await parseWorkbook(form.file_path);
         grid = await buildGrid(form.file_path, def);
+        // The same map the live preview uses to place a value in the box the
+        // document prints for it. Passing it here is what makes the archived
+        // record show the record ON THE FORM rather than as a list beside it —
+        // one mapping, so the preview and the archive cannot disagree about
+        // where a technician's entry belongs.
+        cellMap = cellMapFor(def);
       } catch (err) {
         console.error(`Record ${sub.id}: form ${form.id} could not be read; rendering from the stored snapshot instead:`, err);
         notice = 'SOURCE FORM COULD NOT BE READ — RENDERED FROM THE STORED RECORD';
@@ -318,7 +325,10 @@ export function makeRoutes(db) {
     // it was sent back, by whom and why, is not.
     const rejections = db.prepare(REJECTIONS_SQL).all(sub.id);
 
-    const buffer = await renderRecordPdf({ form, submission: sub, snapshot, values, signatures, rejections, grid, identity, notice });
+    const buffer = await renderRecordPdf({
+      form, submission: sub, snapshot, values, signatures, rejections, grid, identity, notice,
+      cellFor: cellMap?.cellFor ?? null, titleCell: cellMap?.titleCell ?? null
+    });
 
     // A machine id typed into a spreadsheet cell is untrusted input reaching
     // an HTTP response header — strip everything but alphanumerics, dash,
