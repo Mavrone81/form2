@@ -146,8 +146,92 @@ export function assertCanEdit(db, submissionId, user) {
   });
 }
 
-export function signAndAdvance(db, { submissionId, user, signaturePng }) {
+// A signature is the one thing on this record that attests a named person
+// approved it, so what gets stored has to actually BE a signature image.
+//
+// This is not an XSS defence — the value only ever reaches an <img src>, and
+// a browser executes neither `javascript:` nor script inside an SVG loaded
+// that way. It is an INTEGRITY defence. Before this, anything truthy was
+// accepted, so a record could be "signed" with a string that is not an image
+// at all and the workflow would advance it as a valid sign-off; a reviewer
+// would open an approved quality record and find a broken image where the
+// attestation should be, with no way to tell whether the sign-off ever
+// happened.
+//
+// Two independent things are checked, because the first is only a claim:
+//   * the `data:image/png;base64,` prefix — what the caller SAYS it sent;
+//   * the PNG magic number in the decoded bytes — EVIDENCE of what it is.
+// Declaring image/png costs an attacker nothing, so the declaration alone
+// would be no rule at all.
+//
+// Nothing here repairs or coerces a bad value. A signature that had to be
+// corrected before it could be stored is not the mark the signer made, and
+// silently storing a fixed-up version is exactly the sort of thing an audit
+// of these records exists to catch. Bad input is refused outright.
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG_DATA_URI_PREFIX = 'data:image/png;base64,';
+
+// 1 MiB of decoded image. A pad stroke from server/../web/js/signature-pad.js
+// is a few tens of KB, so this is orders of magnitude more than a real
+// signature needs while still bounding what one row can put in the database.
+// The corresponding data URI is ~1.37 MB (base64 costs 4 bytes per 3), which
+// sits comfortably under the 4mb express.json limit in server/index.js — so
+// an oversized signature is refused HERE, with a message that says what is
+// wrong, instead of being cut off by the body parser as a bare 413.
+const MAX_SIGNATURE_BYTES = 1024 * 1024;
+const MAX_BASE64_CHARS = Math.ceil(MAX_SIGNATURE_BYTES / 3) * 4;
+
+// Buffer.from(s, 'base64') is deliberately lenient: it discards characters
+// outside the alphabet rather than failing, so "!!!!" decodes to an empty
+// buffer instead of an error and `javascript:alert(1)` decodes to garbage.
+// That leniency is the whole reason a decode alone cannot be trusted, so the
+// payload is checked against the strict base64 grammar first.
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+// Exported so that any FUTURE path which stores a signature can apply the
+// identical rule. It is not a substitute for calling signAndAdvance: that
+// function enforces this itself, for the same reason saveFields enforces
+// assertCanEdit rather than trusting its callers to remember.
+export function assertValidSignature(signaturePng) {
   if (!signaturePng) throw new Error('A signature is required before submitting.');
+  if (typeof signaturePng !== 'string') {
+    throw new Error('That signature is not a PNG image and cannot be accepted.');
+  }
+  if (!signaturePng.startsWith(PNG_DATA_URI_PREFIX)) {
+    throw new Error('That signature is not a PNG image and cannot be accepted.');
+  }
+
+  const payload = signaturePng.slice(PNG_DATA_URI_PREFIX.length);
+  // Length first, before decoding, so an oversized payload is never expanded
+  // into memory just to be thrown away.
+  if (payload.length > MAX_BASE64_CHARS) {
+    throw new Error(`That signature is too large — a signature must be under ${MAX_SIGNATURE_BYTES / 1024} KB.`);
+  }
+  if (!BASE64_RE.test(payload) || payload.length % 4 !== 0) {
+    throw new Error('That signature is not a valid PNG image and cannot be accepted.');
+  }
+
+  const bytes = Buffer.from(payload, 'base64');
+  if (bytes.length > MAX_SIGNATURE_BYTES) {
+    throw new Error(`That signature is too large — a signature must be under ${MAX_SIGNATURE_BYTES / 1024} KB.`);
+  }
+  if (bytes.length < PNG_MAGIC.length || !bytes.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+    throw new Error('That signature is not a PNG image and cannot be accepted.');
+  }
+}
+
+export function signAndAdvance(db, { submissionId, user, signaturePng }) {
+  // Checked before the transaction opens: the rule reads only the submitted
+  // payload, never any record state, so refusing here reveals nothing about
+  // whether the record exists or who owns it — the answer is the same 400 for
+  // any submission id. A caller who IS entitled to sign still meets the
+  // unchanged ownership check inside the transaction below.
+  //
+  // Thrown WITHOUT the FORBIDDEN marker, so routes map it to 400: the caller
+  // may well have been entitled to sign, their input was simply unusable.
+  // Exactly the distinction the missing-signature case has always made, and
+  // that rejectSubmission makes for a missing reason.
+  assertValidSignature(signaturePng);
 
   const tx = db.transaction(() => {
     // Re-read state inside the transaction so two concurrent actors cannot

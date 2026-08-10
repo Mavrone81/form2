@@ -30,6 +30,72 @@ export function createApp({ db, sessionSecret, secureCookies }) {
   // the test that proves the production shape emits it).
   const secure = secureCookies ?? process.env.NODE_ENV === 'production';
 
+  // Response hardening, applied to EVERYTHING — the API, the static app, the
+  // raw form-file stream and every error page alike. Registered first, before
+  // any route can answer, so no branch of the app can reply without it. Done
+  // by hand rather than with helmet: the project keeps exactly five runtime
+  // dependencies on purpose, and this is a dozen lines of static strings.
+  //
+  // The policy is written for what this app actually is: a no-build app that
+  // serves its own ES modules and its own stylesheet from its own origin, and
+  // loads nothing from anywhere else. Every directive below is therefore
+  // 'self', with exactly two deliberate departures:
+  //
+  //   img-src ... data:  The controlled document's embedded company logo is
+  //     rendered straight from the workbook's image bytes as a data: URI
+  //     (bandLogo in web/js/form-view.js), and every stored signature is a
+  //     data:image/png URI drawn into an <img> (web/js/field-panel.js).
+  //     Forbid data: here and the logo and every signature on every record
+  //     silently vanish — a CSP that blanks the sign-off on a quality record
+  //     would be far worse than no CSP at all.
+  //
+  //   frame-ancestors 'self' rather than 'none'/DENY  The app frames its OWN
+  //     endpoints: the admin field mapper embeds /api/forms/:id/file to show
+  //     the source document beside the mapping (web/js/admin.js), and the
+  //     form view embeds it to preview a pdf form (web/js/form-view.js).
+  //     A blanket DENY breaks both. 'self' still refuses every third-party
+  //     framing, which is the clickjacking case that matters.
+  //
+  // What is NOT here is as deliberate: no 'unsafe-inline' and no
+  // 'unsafe-eval'. There is no inline script anywhere in web/ today — both
+  // pages load a single <script type="module" src>, and every element is
+  // built with createElement/textContent — so script-src 'self' costs
+  // nothing now and is what makes the policy worth having. object-src 'none'
+  // and base-uri 'self' close the two classic bypasses that survive an
+  // otherwise strict policy.
+  //
+  // Note on style-src 'self': the renderers size cells and position the logo
+  // through the CSSOM (element.style.setProperty / .cssText), which CSP does
+  // not govern — only `style` attributes and <style> blocks in parsed markup
+  // are, and there are none. Verified in a browser, not assumed.
+  const CSP = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "frame-src 'self'",
+    "frame-ancestors 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'"
+  ].join('; ');
+
+  app.use((_req, res, next) => {
+    res.set('Content-Security-Policy', CSP);
+    // The /api/forms/:id/file route streams raw .xlsx and .pdf bytes. Without
+    // this a browser may ignore the declared Content-Type and sniff the body
+    // into something it will render instead of download.
+    res.set('X-Content-Type-Options', 'nosniff');
+    // Legacy equivalent of frame-ancestors, for anything that does not honour
+    // CSP. SAMEORIGIN, not DENY, for the same reason: the app frames itself.
+    res.set('X-Frame-Options', 'SAMEORIGIN');
+    // A record URL can carry a machine id; never leak one to a third party.
+    res.set('Referrer-Policy', 'same-origin');
+    next();
+  });
+
   app.use(express.json({ limit: '4mb' })); // signature PNGs
   app.use(session({
     secret: sessionSecret ?? resolveConfig({}).sessionSecret,
