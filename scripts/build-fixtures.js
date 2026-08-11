@@ -19,7 +19,15 @@ for (const [i, file] of files.entries()) {
     file,
     tasks: def.tasks.length,
     statusCol: def.statusColumn,
-    freqs: [...new Set(def.tasks.map((t) => t.freq))].sort()
+    freqs: [...new Set(def.tasks.map((t) => t.freq))].sort(),
+    // How many measurements the Calibration Record table asks for, and which
+    // columns carry the two things a technician enters against each. Counts and
+    // coordinates only — never the measurements themselves, which are form
+    // content and must stay out of the repository.
+    calRows: def.calibration?.rows.length ?? 0,
+    calCols: def.calibration
+      ? { reading: def.calibration.columns.reading, pass: def.calibration.columns.pass, fail: def.calibration.columns.fail }
+      : null
   });
 }
 const out = new URL('../test/fixtures.local.json', import.meta.url).pathname;

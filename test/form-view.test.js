@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { fillTitleBlank, cellStyle, layoutRow } from '../web/js/form-view.js';
 // Straight from the shared module: the preview re-exports only what it used to,
 // and these two are consumed by both renderers rather than by the preview alone.
-import { imageBox, checkboxMetrics } from '../web/js/sheet-layout.js';
+import { imageBox, checkboxMetrics, calibrationTicks } from '../web/js/sheet-layout.js';
 import { buildGrid } from '../server/grid-model.js';
 import { loadFixtures, SKIP } from './helpers/fixtures.js';
 
@@ -355,4 +355,58 @@ test('a repeated code prefix containing a space is dropped whole', () => {
   assert.equal(fillTitleBlank('Record AVS 35-____', '01'), 'Record AVS 35-01');
   // The space before a short code is not part of the code.
   assert.equal(fillTitleBlank('Record ED____', 'ED04'), 'Record ED04');
+});
+
+// ---------------------------------------------------------------------------
+// Which box a Pass / Fail answer is ticked in
+// ---------------------------------------------------------------------------
+// This resolution is what the preview and the archived PDF must agree on: a
+// record that shows a pass on screen and a fail on paper is worse than one
+// that shows neither. It lives in the shared module for that reason, and this
+// is its contract.
+const MARKS = {
+  54: { Pass: { row: 54, col: 15 }, Fail: { row: 54, col: 16 } },
+  55: { Pass: { row: 55, col: 15 }, Fail: { row: 55, col: 16 } }
+};
+const answers = (map) => calibrationTicks(MARKS, (key) => map[key]);
+
+test('an answer is marked in the box the document prints for it', () => {
+  assert.deepEqual(answers({ cal_54_result: 'Pass' }),
+    [{ row: 54, answer: 'Pass', cell: { row: 54, col: 15 } }]);
+  assert.deepEqual(answers({ cal_54_result: 'Fail' }),
+    [{ row: 54, answer: 'Fail', cell: { row: 54, col: 16 } }]);
+});
+
+test('each measurement is marked independently of the others', () => {
+  const marks = answers({ cal_54_result: 'Fail', cal_55_result: 'Pass' });
+  assert.equal(marks.length, 2);
+  assert.deepEqual(marks.find((m) => m.row === 54).cell, { row: 54, col: 16 });
+  assert.deepEqual(marks.find((m) => m.row === 55).cell, { row: 55, col: 15 });
+});
+
+test('an unanswered measurement is marked nowhere', () => {
+  assert.deepEqual(answers({}), []);
+  assert.deepEqual(answers({ cal_54_result: '' }), []);
+  assert.deepEqual(answers({ cal_54_result: '   ' }), []);
+  assert.deepEqual(answers({ cal_54_result: null }), []);
+});
+
+test('an answer the document has no box for is never placed in the other one', () => {
+  // The failure this forbids: treating "anything that is not Fail" as a pass,
+  // which would silently mark an unrecognised or stale value as a pass on a
+  // quality record.
+  for (const bad of ['Marginal', 'pass', 'PASS', 'N/A', 'Passed', 0, false]) {
+    assert.deepEqual(answers({ cal_54_result: bad }), [], String(bad));
+  }
+});
+
+test('a padded answer still reads as the answer it is', () => {
+  assert.deepEqual(answers({ cal_54_result: ' Pass ' }),
+    [{ row: 54, answer: 'Pass', cell: { row: 54, col: 15 } }]);
+});
+
+test('calibrationTicks tolerates having no marks at all', () => {
+  for (const marks of [null, undefined, {}]) {
+    assert.deepEqual(calibrationTicks(marks, () => 'Pass'), []);
+  }
 });

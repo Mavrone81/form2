@@ -540,7 +540,8 @@ async function paint() {
     // the sheet the way it is ringed on paper. Read straight from the record's
     // own interval, so an approved record shows the interval that was
     // recorded and a draft shows what is selected now.
-    intervalCells: spec.intervalCells, selectedInterval: frequency
+    intervalCells: spec.intervalCells, selectedInterval: frequency,
+    calibrationCells: spec.calibrationCells
   });
 
   const saveError = document.createElement('p');

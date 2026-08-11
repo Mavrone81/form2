@@ -471,3 +471,104 @@ test('a leftover appendix does not break veraPDF PDF/A-2U conformance',
     assert.match(out, /PASS/, `veraPDF reported: ${out}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+// ---------------------------------------------------------------------------
+// The Calibration Record's Pass / Fail mark
+// ---------------------------------------------------------------------------
+// Every (x, y) a path operator names, so a mark drawn as vector strokes — a
+// tick has no text at all — can be located. pdftotext cannot see it; nor can
+// the y-only extractor above.
+function extractPathPoints(pdfBuffer) {
+  const text = pdfBuffer.toString('latin1');
+  const objectRe = /\d+ 0 obj\s*<<([\s\S]*?)>>\s*stream\r?\n/g;
+  const points = [];
+  let match;
+  while ((match = objectRe.exec(text))) {
+    const dict = match[1];
+    const start = match.index + match[0].length;
+    const end = text.indexOf('endstream', start);
+    if (end === -1) continue;
+    let raw = Buffer.from(text.slice(start, end), 'latin1');
+    if (/\/FlateDecode/.test(dict)) {
+      try { raw = inflateSync(raw); } catch { continue; }
+    }
+    for (const line of raw.toString('latin1').split('\n')) {
+      const m = /^(-?\d+\.?\d*) (-?\d+\.?\d*) [ml]$/.exec(line.trim());
+      if (m) points.push({ x: Number(m[1]), y: Number(m[2]) });
+    }
+  }
+  return points;
+}
+
+// A sheet with one calibration row: a Reading box and the two ruled boxes the
+// document prints for Pass and Fail. Invented content only.
+const CAL_FIXTURE = (result) => ({
+  ...FIXTURE,
+  snapshot: [
+    { field_key: 'cal_2_reading', label: 'Generic measurement A (0 - 1 unit)', section: 'Calibration record', kind: 'text' },
+    { field_key: 'cal_2_result', label: 'Generic measurement A (0 - 1 unit)', section: 'Calibration record', kind: 'text', options: 'Pass\nFail' }
+  ],
+  values: [
+    { field_key: 'cal_2_reading', value: '0.5' },
+    ...(result ? [{ field_key: 'cal_2_result', value: result }] : [])
+  ],
+  cellFor: { cal_2_reading: { row: 2, col: 1 } },
+  calibrationCells: { 2: { Pass: { row: 2, col: 2 }, Fail: { row: 2, col: 3 } } },
+  grid: {
+    columns: [{ index: 1, width: 90 }, { index: 2, width: 40 }, { index: 3, width: 40 }],
+    rows: [
+      { index: 1, height: 15, cells: [1, 2, 3].map((col) => ({
+        col, span: { rows: 1, cols: 1 }, text: ['Reading', 'Pass', 'Fail'][col - 1],
+        bold: true, align: 'center', borders: { t: true, r: true, b: true, l: true } })) },
+      { index: 2, height: 18, cells: [1, 2, 3].map((col) => ({
+        col, span: { rows: 1, cols: 1 }, text: '', align: 'center',
+        borders: { t: true, r: true, b: true, l: true } })) }
+    ]
+  }
+});
+
+test('a Pass answer marks the Pass box, and a Fail answer marks the other one', async () => {
+  const blank = extractPathPoints(await renderRecordPdf(CAL_FIXTURE(null)));
+  const pass = extractPathPoints(await renderRecordPdf(CAL_FIXTURE('Pass')));
+  const fail = extractPathPoints(await renderRecordPdf(CAL_FIXTURE('Fail')));
+
+  // A tick is a three-point polyline: one moveto and two linetos.
+  assert.equal(pass.length - blank.length, 3, 'a Pass answer draws exactly one tick');
+  assert.equal(fail.length - blank.length, 3, 'a Fail answer draws exactly one tick');
+
+  // And in DIFFERENT boxes. Pass is the left column of the two, so its mark
+  // must be to the left of Fail's — the whole point of two printed boxes is
+  // that a record shows which one was ticked.
+  const added = (points) => {
+    const seen = new Map();
+    for (const p of blank) seen.set(`${p.x},${p.y}`, (seen.get(`${p.x},${p.y}`) ?? 0) + 1);
+    return points.filter((p) => {
+      const k = `${p.x},${p.y}`;
+      if (seen.get(k)) { seen.set(k, seen.get(k) - 1); return false; }
+      return true;
+    });
+  };
+  const passMark = added(pass);
+  const failMark = added(fail);
+  assert.equal(passMark.length, 3);
+  assert.equal(failMark.length, 3);
+  assert.ok(Math.max(...passMark.map((p) => p.x)) < Math.min(...failMark.map((p) => p.x)),
+    'the Pass mark sits entirely left of the Fail mark');
+});
+
+test('an unanswered measurement is marked nowhere, and an unknown answer is not guessed at', async () => {
+  const blank = extractPathPoints(await renderRecordPdf(CAL_FIXTURE(null)));
+  for (const answer of ['', 'Marginal', 'pass', 'N/A']) {
+    const points = extractPathPoints(await renderRecordPdf(CAL_FIXTURE(answer)));
+    assert.equal(points.length, blank.length, `"${answer}" marks nothing`);
+  }
+});
+
+test('a Pass/Fail answer is not ALSO printed in the leftover appendix', async () => {
+  // It is already on the sheet, as a tick in the box the document prints. A
+  // record that showed it twice — once as a mark, once as the word "Pass" in
+  // a list below — would read as two separate findings.
+  const buf = await renderRecordPdf(CAL_FIXTURE('Pass'));
+  const s = buf.toString('latin1');
+  assert.ok(!/Not on the form/i.test(s), 'nothing was pushed into the leftover appendix');
+});

@@ -14,7 +14,8 @@ const SUPPORTED = new Set(['.xlsx', '.pdf']);
 // and each submission carries its own frozen form_snapshot.
 //   1: machine_id, special_tools, task_<row>, remarks, sig_<stage>
 //   2: adds the Parts Required table (part_<row>_<no|desc|qty|remarks>)
-export const FIELDS_VERSION = 2;
+//   3: adds the Calibration Record table (cal_<row>_<reading|result>)
+export const FIELDS_VERSION = 3;
 const hash = (p) => createHash('sha256').update(readFileSync(p)).digest('hex');
 
 // One field per box of the Parts Required table. The label is the column's own
@@ -25,6 +26,25 @@ const hash = (p) => createHash('sha256').update(readFileSync(p)).digest('hex');
 // list still has the sheet row in the key.
 const PARTS_LABELS = { no: 'Part No', desc: 'Description', qty: 'Qty', remarks: 'Remarks' };
 const PARTS_SECTION = 'Parts required';
+
+// The Calibration Record table, on the three wire-bond documents that print
+// one. Two entries per measurement: the reading taken, and whether it passed.
+//
+// The document prints Pass and Fail as two separate boxes and a technician
+// ticks one, so the result is offered as exactly those two answers rather than
+// as free text — anything else could not be placed on the sheet, because there
+// is no third box to put it in.
+export const CAL_SECTION = 'Calibration record';
+export const CAL_RESULTS = ['Pass', 'Fail'];
+
+// What to call one measurement. The description alone is often ambiguous
+// across rows ("PRS Calibration" appears four times on one document, once per
+// axis), so the printed specification is carried alongside it — which is also
+// the number the technician is checking their reading against, and therefore
+// worth having in front of them while they type it.
+function calLabel(row) {
+  return row.specification ? `${row.description} (${row.specification})` : row.description;
+}
 
 function fieldsFromDefinition(def) {
   const fields = [
@@ -47,11 +67,22 @@ function fieldsFromDefinition(def) {
       kind: 'text'
     });
   }
+  // After the tasks and before the remarks, which is the order the documents
+  // that carry one print it in. Forms without a calibration table contribute
+  // nothing here.
+  for (const row of def.calibration?.rows ?? []) {
+    const label = calLabel(row);
+    fields.push({ field_key: `cal_${row.row}_reading`, label, section: CAL_SECTION, kind: 'text' });
+    fields.push({
+      field_key: `cal_${row.row}_result`, label, section: CAL_SECTION, kind: 'text',
+      options: CAL_RESULTS.join('\n')
+    });
+  }
   fields.push({ field_key: 'remarks', label: 'Remarks', section: 'Record', kind: 'text' });
   for (const s of def.signatures) {
     fields.push({ field_key: `sig_${s.key}`, label: s.label, section: 'Sign-off', kind: 'signature' });
   }
-  return fields.map((f, i) => ({ ...f, sort_order: i, source: 'parsed' }));
+  return fields.map((f, i) => ({ options: '', ...f, sort_order: i, source: 'parsed' }));
 }
 
 export async function scanFolder(db, dir) {
@@ -132,11 +163,11 @@ export async function scanFolder(db, dir) {
       );
       db.prepare('delete from form_fields where form_id = ? and source = ?').run(id, 'parsed');
       const ins = db.prepare(`insert into form_fields
-        (form_id, field_key, label, section, kind, sort_order, source)
-        values (?,?,?,?,?,?,?)`);
+        (form_id, field_key, label, section, kind, sort_order, source, options)
+        values (?,?,?,?,?,?,?,?)`);
       for (const f of fieldsFromDefinition(def)) {
         if (adminKeys.has(f.field_key)) continue;
-        ins.run(id, f.field_key, f.label, f.section, f.kind, f.sort_order, f.source);
+        ins.run(id, f.field_key, f.label, f.section, f.kind, f.sort_order, f.source, f.options);
       }
     }
   }

@@ -26,6 +26,15 @@ export function parsePartsKey(fieldKey) {
   return m ? { row: Number(m[1]), column: m[2] } : null;
 }
 
+// One entry of the Calibration Record table, or null. Same shape as the parts
+// key above, for the same reason: a field name resolves to a coordinate by
+// arithmetic rather than by a lookup table.
+const CAL_KEY = /^cal_(\d+)_(reading|result)$/;
+export function parseCalKey(fieldKey) {
+  const m = CAL_KEY.exec(String(fieldKey ?? ''));
+  return m ? { row: Number(m[1]), column: m[2] } : null;
+}
+
 // Column letter to 1-based index: A -> 1, M -> 13, AA -> 27. Returns null for
 // anything that is not a column letter (including the null the parser reports
 // for a form with no Status column), so callers can test it as a single
@@ -112,6 +121,30 @@ export function intervalMarksFor(definition) {
   return marks;
 }
 
+// Where a Pass/Fail answer is MARKED, per calibration row.
+//
+// The document prints Pass and Fail as two separate ruled boxes, so the answer
+// is not text written into a cell — it is a tick in one box and nothing in the
+// other. Each entry names the cell for each answer, keyed by the answer's own
+// word, so a renderer resolves "Pass" to a coordinate with a plain lookup and
+// an unrecognised answer resolves to nothing rather than to a guess.
+//
+// The Reading beside it IS ordinary text and goes through `cellFor` with every
+// other written value.
+export function calibrationMarksFor(definition) {
+  const marks = {};
+  const cols = definition?.calibration?.columns;
+  if (!cols) return marks;
+  for (const row of definition.calibration.rows ?? []) {
+    if (!Number.isInteger(row?.row)) continue;
+    const entry = {};
+    if (Number.isInteger(cols.pass)) entry.Pass = { row: row.row, col: cols.pass };
+    if (Number.isInteger(cols.fail)) entry.Fail = { row: row.row, col: cols.fail };
+    if (Object.keys(entry).length) marks[row.row] = entry;
+  }
+  return marks;
+}
+
 export function cellMapFor(definition) {
   const cellFor = {};
   const cells = definition?.cells ?? {};
@@ -138,6 +171,16 @@ export function cellMapFor(definition) {
     }
   }
 
+  // Each calibration reading, in the Reading column on that measurement's own
+  // row. The result beside it is a tick rather than text and travels
+  // separately (see calibrationMarksFor), exactly as the frequency band does.
+  const calCols = definition?.calibration?.columns;
+  if (Number.isInteger(calCols?.reading)) {
+    for (const row of definition.calibration.rows ?? []) {
+      if (Number.isInteger(row?.row)) cellFor[`cal_${row.row}_reading`] = { row: row.row, col: calCols.reading };
+    }
+  }
+
   // The parser reports null for any of these it could not locate on the
   // sheet; a null must stay out of the map entirely.
   if (cells.special_tools) cellFor.special_tools = { ...cells.special_tools };
@@ -154,6 +197,7 @@ export function cellMapFor(definition) {
   return {
     cellFor,
     titleCell: cells.title ?? null,
-    intervalCells: intervalMarksFor(definition)
+    intervalCells: intervalMarksFor(definition),
+    calibrationCells: calibrationMarksFor(definition)
   };
 }

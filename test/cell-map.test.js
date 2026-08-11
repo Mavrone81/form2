@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import ExcelJS from 'exceljs';
 import { parseWorkbook } from '../server/excel-parser.js';
 import { buildGrid } from '../server/grid-model.js';
-import { cellMapFor, columnNumber, intervalMarksFor } from '../server/cell-map.js';
+import { cellMapFor, columnNumber, intervalMarksFor, parseCalKey, calibrationMarksFor } from '../server/cell-map.js';
 import { ORDER, findIntervalCodes } from '../server/intervals.js';
 import { loadFixtures, SKIP } from './helpers/fixtures.js';
 
@@ -520,3 +520,98 @@ test('cellMapFor tolerates a definition with a malformed parts table', () => {
   assert.deepEqual(Object.keys(cellFor).filter((k) => k.startsWith('part_')), ['part_4_qty', 'part_4_remarks']);
   assert.deepEqual(cellMapFor({ parts: null }).cellFor, {});
 });
+
+// ---------------------------------------------------------------------------
+// The Calibration Record table
+// ---------------------------------------------------------------------------
+// A definition's calibration half, built by hand — the parser's own reading of
+// it is covered in test/excel-parser.test.js. Invented content only.
+const calDefinition = (rows = [54, 55], columns = {}) => ({
+  calibration: {
+    headerRow: 53,
+    columns: { no: 1, section: 2, description: 5, specification: 10, reading: 13, pass: 15, fail: 16, ...columns },
+    rows: rows.map((row, i) => ({
+      row, no: String(i + 1), section: 'A section',
+      description: `Generic measurement ${i + 1}`, specification: '0 - 1 unit'
+    }))
+  }
+});
+
+test('a calibration field key resolves to its row and column, and nothing else does', () => {
+  assert.deepEqual(parseCalKey('cal_54_reading'), { row: 54, column: 'reading' });
+  assert.deepEqual(parseCalKey('cal_7_result'), { row: 7, column: 'result' });
+  for (const key of ['cal_54', 'cal__reading', 'cal_54_pass', 'cal_x_reading',
+                     'part_5_qty', 'task_26', 'sig_engineer', '', null, undefined]) {
+    assert.equal(parseCalKey(key), null, `${String(key)} is not a calibration key`);
+  }
+});
+
+test('each calibration reading maps to the Reading column on its own row', () => {
+  const { cellFor } = cellMapFor(calDefinition([54, 55, 56]));
+  assert.deepEqual(cellFor.cal_54_reading, { row: 54, col: 13 });
+  assert.deepEqual(cellFor.cal_55_reading, { row: 55, col: 13 });
+  assert.deepEqual(cellFor.cal_56_reading, { row: 56, col: 13 });
+});
+
+test('a Pass/Fail answer is NOT a written cell — it travels as a mark', () => {
+  // The document prints two boxes and one is ticked. Routing the answer
+  // through cellFor would write the word "Pass" into a cell as text, in a
+  // column whose heading already says Pass — and it would never be written
+  // into the Fail column at all, so a failed measurement would print a record
+  // that reads as if it had passed.
+  const { cellFor, calibrationCells } = cellMapFor(calDefinition([54, 55]));
+  assert.equal(cellFor.cal_54_result, undefined);
+  assert.equal(cellFor.cal_55_result, undefined);
+  assert.deepEqual(calibrationCells[54], { Pass: { row: 54, col: 15 }, Fail: { row: 54, col: 16 } });
+  assert.deepEqual(calibrationCells[55], { Pass: { row: 55, col: 15 }, Fail: { row: 55, col: 16 } });
+});
+
+test('a form with no calibration table maps no calibration cells and does not throw', () => {
+  for (const def of [{}, { calibration: null }, { calibration: { columns: null, rows: [] } }]) {
+    const map = cellMapFor(def);
+    assert.deepEqual(map.calibrationCells, {});
+    assert.ok(!Object.keys(map.cellFor).some((k) => k.startsWith('cal_')));
+  }
+});
+
+test('calibrationMarksFor ignores rows and columns that are not real coordinates', () => {
+  const marks = calibrationMarksFor({
+    calibration: {
+      columns: { reading: 13, pass: 15, fail: 16 },
+      rows: [{ row: 54 }, { row: null }, { row: 'x' }, {}]
+    }
+  });
+  assert.deepEqual(Object.keys(marks), ['54']);
+});
+
+test('a calibration table with only one of the two boxes reports only that one', () => {
+  // Never invent the missing box's position: a tick in a guessed column on a
+  // controlled document is worse than no tick.
+  const marks = calibrationMarksFor(calDefinition([54], { fail: null }));
+  assert.deepEqual(marks[54], { Pass: { row: 54, col: 15 } });
+});
+
+test('the sample forms map every calibration measurement to a real, rendered cell',
+  { skip: fx ? false : SKIP }, async () => {
+    for (const f of fx.forms.filter((x) => x.calRows)) {
+      const def = await parseWorkbook(join(fx.formsDir, f.file));
+      const grid = await buildGrid(join(fx.formsDir, f.file));
+      const { cellFor, calibrationCells } = cellMapFor(def);
+
+      const rendered = new Set();
+      for (const row of grid.rows) {
+        for (const cell of row.cells) if (cell.filler !== true) rendered.add(`${row.index}:${cell.col}`);
+      }
+
+      assert.equal(Object.keys(calibrationCells).length, f.calRows, `${f.id} marks per measurement`);
+      for (const r of def.calibration.rows) {
+        const read = cellFor[`cal_${r.row}_reading`];
+        assert.ok(read, `${f.id} row ${r.row} has a reading cell`);
+        assert.ok(rendered.has(`${read.row}:${read.col}`), `${f.id} reading cell ${r.row} is rendered`);
+        for (const [answer, cell] of Object.entries(calibrationCells[r.row])) {
+          assert.ok(rendered.has(`${cell.row}:${cell.col}`),
+            `${f.id} ${answer} box on row ${r.row} is rendered`);
+        }
+      }
+    }
+  });

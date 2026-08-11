@@ -146,6 +146,133 @@ function partsGrid(fields, values, isLocked, change, preview) {
   return wrap;
 }
 
+// ------------------------------------------------------------------------
+// The Calibration Record table
+// ------------------------------------------------------------------------
+// One entry of it, or null. Mirrors parseCalKey() in server/cell-map.js, for
+// the same reason partsKeyOf above mirrors parsePartsKey: web/ is served as
+// static files and shares no module with the server, so the convention is
+// restated here and both copies are covered by tests.
+function calKeyOf(fieldKey) {
+  const m = /^cal_(\d+)_(reading|result)$/.exec(String(fieldKey ?? ''));
+  return m ? { row: Number(m[1]), column: m[2] } : null;
+}
+
+// The allowed answers for a field, or [] for free text. Mirrors optionsOf() in
+// server/db.js — same reason again.
+function optionsOf(field) {
+  return String(field?.options ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
+}
+
+// Up to 27 measurements, each with a reading and a pass/fail answer, is 54
+// controls. Through the ordinary `.fld` path that is 54 stacked boxes with the
+// measurement's name repeated over each pair — the same problem the parts
+// table has, and it gets the same answer: lay it out as the table the document
+// prints, one line per measurement.
+//
+// It differs from the parts table in one way that matters. A parts row is
+// usually blank and is identified by what you type into it; a calibration row
+// is never blank of MEANING — the document names the measurement and prints
+// the specification to check it against. So the measurement's name is the row
+// heading here, and it is the widest column: a technician needs to read
+// "Bond Force Verification Input Force 100g (95 - 105 g)" to know what to
+// measure, and truncating it would make the record unfillable.
+//
+// UNLIKE the parts table, rows are NOT hidden when the record is read-only: an
+// unanswered measurement is itself information on a calibration record — it
+// says the check was not done — and a reviewer has to be able to see which
+// ones those are.
+const CAL_ORDER = ['reading', 'result'];
+const CAL_HEADINGS = { reading: 'Reading', result: 'Result' };
+
+function calGrid(fields, values, isLocked, change, preview) {
+  const rows = new Map();
+  for (const f of fields) {
+    const cal = calKeyOf(f.field_key);
+    if (!rows.has(cal.row)) rows.set(cal.row, new Map());
+    rows.get(cal.row).set(cal.column, f);
+  }
+
+  const wrap = document.createElement('div');
+  wrap.className = 'cal';
+
+  const head = document.createElement('div');
+  head.className = 'cal-hd';
+  head.setAttribute('aria-hidden', 'true');
+  for (const text of ['Measurement', ...CAL_ORDER.map((c) => CAL_HEADINGS[c])]) {
+    const cell = document.createElement('span');
+    cell.textContent = text;
+    head.append(cell);
+  }
+  wrap.append(head);
+
+  for (const [, row] of rows) {
+    const tr = document.createElement('div');
+    tr.className = 'cal-row';
+
+    // The measurement's own name, as the document prints it. Taken from
+    // whichever of the row's two fields is present, so the panel and the sheet
+    // cannot name the same measurement differently.
+    const name = row.get('reading')?.label ?? row.get('result')?.label ?? '';
+    const nameEl = document.createElement('span');
+    nameEl.className = 'cal-name';
+    nameEl.textContent = name;
+    tr.append(nameEl);
+
+    for (const column of CAL_ORDER) {
+      const f = row.get(column);
+      if (!f) { tr.append(document.createElement('span')); continue; }
+      const value = values.get(f.field_key) ?? '';
+      const label = `${CAL_HEADINGS[column]}, ${name}`;
+
+      if (isLocked) {
+        const p = document.createElement('p');
+        p.className = 'cal-ro';
+        p.textContent = value || '—';
+        tr.append(p);
+        continue;
+      }
+
+      const allowed = optionsOf(f);
+      if (allowed.length) {
+        // The document prints one box per answer and a technician ticks one,
+        // so the control offers exactly those answers. The blank option is
+        // what an unanswered measurement is, and is how one is un-answered
+        // again after a mistake — without it the first click would be
+        // irreversible.
+        const select = document.createElement('select');
+        select.id = `f-${f.field_key}`;
+        select.setAttribute('aria-label', label);
+        for (const text of ['', ...allowed]) {
+          const opt = document.createElement('option');
+          opt.value = text;
+          opt.textContent = text || '—';
+          if (text === value) opt.selected = true;
+          select.append(opt);
+        }
+        // A select commits on change; there is no half-typed state to mirror
+        // separately, so the preview and the save are driven by the one event.
+        select.addEventListener('change', () => {
+          if (preview) preview(f.field_key, select.value);
+          change(f.field_key, select.value);
+        });
+        tr.append(select);
+        continue;
+      }
+
+      const input = document.createElement('input');
+      input.id = `f-${f.field_key}`;
+      input.value = value;
+      input.setAttribute('aria-label', label);
+      if (preview) input.addEventListener('input', () => preview(f.field_key, input.value));
+      input.addEventListener('change', () => change(f.field_key, input.value));
+      tr.append(input);
+    }
+    wrap.append(tr);
+  }
+  return wrap;
+}
+
 // `locked` and `canSign` are deliberately separate flags — a deviation from
 // the brief, which used a single `locked` to gate both the general record
 // fields (machine_id/task/remarks) AND signature-pad availability via
@@ -242,8 +369,12 @@ export function renderFields(container, { snapshot, values, signatures, frequenc
     const partFields = fields.filter((f) => partsKeyOf(f.field_key));
     if (partFields.length) sec.append(partsGrid(partFields, byKey, locked, onChange, onPreview));
 
+    // The Calibration Record is a table for the same reasons — see calGrid.
+    const calFields = fields.filter((f) => calKeyOf(f.field_key));
+    if (calFields.length) sec.append(calGrid(calFields, byKey, locked, onChange, onPreview));
+
     for (const f of fields) {
-      if (partsKeyOf(f.field_key)) continue;
+      if (partsKeyOf(f.field_key) || calKeyOf(f.field_key)) continue;
       if (f.kind === 'signature') {
         const stage = f.field_key.replace('sig_', '');
         const wrap = document.createElement('div');

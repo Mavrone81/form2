@@ -270,3 +270,192 @@ test('a normal synthetic header still parses correctly (happy path unaffected)',
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// The Calibration Record table
+// ---------------------------------------------------------------------------
+// Three of the twelve controlled documents print a second table below the
+// sign-off blocks. All content below is invented/generic — no real form text.
+
+// A workbook with a calibration table beneath a minimal task table. `rows` is
+// a list of {no, section, description, specification} written one per sheet
+// row; `headerRows` optionally merges the heading down that many rows, which
+// is the shape one of the three documents uses for its split Specification
+// column. `footer` writes a full-width merged strip after the table, which is
+// what every one of the twelve prints at the bottom of the sheet.
+async function writeCalibrationWorkbook(dir, name, rows, { headerRows = 1, footer = true } = {}) {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Sheet1');
+  ws.getRow(1).getCell(1).value = 'No';
+  ws.getRow(1).getCell(2).value = 'Freq.';
+  ws.getRow(1).getCell(3).value = 'Instruction';
+  ws.getRow(1).getCell(4).value = 'Status';
+  ws.getRow(2).getCell(1).value = 1;
+  ws.getRow(2).getCell(2).value = '3M';
+  ws.getRow(2).getCell(3).value = 'A generic task';
+
+  ws.getRow(4).getCell(1).value = 'Calibration Record :';
+  const head = ws.getRow(5);
+  head.getCell(1).value = 'No';
+  head.getCell(2).value = 'Section';
+  head.getCell(3).value = 'Description';
+  head.getCell(4).value = 'Specification';
+  head.getCell(5).value = 'Reading';
+  head.getCell(6).value = 'Pass';
+  head.getCell(7).value = 'Fail';
+  if (headerRows > 1) {
+    for (let c = 1; c <= 7; c++) ws.mergeCells(5, c, 5 + headerRows - 1, c);
+  }
+
+  const first = 5 + headerRows;
+  rows.forEach((r, i) => {
+    const row = ws.getRow(first + i);
+    row.getCell(1).value = r.no ?? '';
+    row.getCell(2).value = r.section ?? '';
+    row.getCell(3).value = r.description ?? '';
+    row.getCell(4).value = r.specification ?? '';
+  });
+
+  if (footer) {
+    const footerRow = first + rows.length;
+    ws.getRow(footerRow).getCell(1).value = 'Internal Document';
+    ws.mergeCells(footerRow, 1, footerRow, 7);
+  }
+
+  const path = join(dir, name);
+  await wb.xlsx.writeFile(path);
+  return { path, headerRow: 5, firstDataRow: first };
+}
+
+test('a calibration table is read as its measurements, with the entry columns named', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'excel-parser-test-'));
+  try {
+    const { path, headerRow, firstDataRow } = await writeCalibrationWorkbook(dir, 'cal.xlsx', [
+      { no: '1', section: 'First section', description: 'Generic measurement A', specification: '0 - 10 units' },
+      { no: '', section: '', description: 'Generic measurement B', specification: '± 3 units' }
+    ]);
+    const def = await parseWorkbook(path);
+    assert.ok(def.calibration, 'a calibration table was found');
+    assert.equal(def.calibration.headerRow, headerRow);
+    assert.deepEqual(def.calibration.columns,
+      { no: 1, section: 2, description: 3, specification: 4, reading: 5, pass: 6, fail: 7 });
+    assert.equal(def.calibration.rows.length, 2);
+    assert.deepEqual(def.calibration.rows[0], {
+      row: firstDataRow, no: '1', section: 'First section',
+      description: 'Generic measurement A', specification: '0 - 10 units'
+    });
+    assert.equal(def.calibration.rows[1].description, 'Generic measurement B');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the document footer is not read as a measurement', async () => {
+  // The footer strip is one merge across the full width of the sheet, so its
+  // Description cell reports the footer's own words. Reading it as a row would
+  // add a phantom measurement — with a Reading box that does not exist — to
+  // every wire-bond record.
+  const dir = await mkdtemp(join(tmpdir(), 'excel-parser-test-'));
+  try {
+    const { path } = await writeCalibrationWorkbook(dir, 'cal-footer.xlsx', [
+      { no: '1', section: 'S', description: 'Generic measurement A', specification: '1' }
+    ], { footer: true });
+    const def = await parseWorkbook(path);
+    assert.equal(def.calibration.rows.length, 1);
+    assert.equal(def.calibration.rows[0].description, 'Generic measurement A');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a heading merged down several rows does not become measurements', async () => {
+  // One of the three documents splits its Specification column into two named
+  // limits, making the heading three rows tall. Those rows repeat the heading
+  // words through the merge; counting them would add two measurements named
+  // "Description" to the record.
+  const dir = await mkdtemp(join(tmpdir(), 'excel-parser-test-'));
+  try {
+    const { path, firstDataRow } = await writeCalibrationWorkbook(dir, 'cal-tall.xlsx', [
+      { no: '1', section: 'S', description: 'Generic measurement A', specification: '1' },
+      { no: '2', section: 'S', description: 'Generic measurement B', specification: '2' }
+    ], { headerRows: 3 });
+    const def = await parseWorkbook(path);
+    assert.equal(def.calibration.rows.length, 2);
+    assert.equal(def.calibration.rows[0].row, firstDataRow);
+    assert.deepEqual(def.calibration.rows.map((r) => r.description),
+      ['Generic measurement A', 'Generic measurement B']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a calibration heading missing a column yields no table at all', async () => {
+  // Fails closed, like every other header detection here: a Reading written
+  // into a column that was guessed is worse than a form with no calibration
+  // fields.
+  const dir = await mkdtemp(join(tmpdir(), 'excel-parser-test-'));
+  try {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Sheet1');
+    ws.getRow(1).getCell(1).value = 'No';
+    ws.getRow(1).getCell(2).value = 'Freq.';
+    ws.getRow(1).getCell(3).value = 'Instruction';
+    ws.getRow(2).getCell(1).value = 1;
+    ws.getRow(2).getCell(2).value = '3M';
+    ws.getRow(2).getCell(3).value = 'A generic task';
+    ws.getRow(4).getCell(1).value = 'Calibration Record :';
+    const head = ws.getRow(5);
+    // No "Fail" column.
+    ['No', 'Section', 'Description', 'Specification', 'Reading', 'Pass'].forEach((t, i) => {
+      head.getCell(i + 1).value = t;
+    });
+    ws.getRow(6).getCell(3).value = 'Generic measurement A';
+    const path = join(dir, 'cal-short.xlsx');
+    await wb.xlsx.writeFile(path);
+
+    const def = await parseWorkbook(path);
+    assert.equal(def.calibration, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a form with no calibration table reports none', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'excel-parser-test-'));
+  try {
+    const path = await writeSyntheticWorkbook(
+      dir, 'no-cal.xlsx',
+      { 1: 'No', 2: 'Freq.', 3: 'Instruction', 4: 'Status' },
+      { 1: 1, 2: '1M', 3: 'Machine B check', 4: 'Pass' }
+    );
+    const def = await parseWorkbook(path);
+    assert.equal(def.calibration, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the sample forms that print a calibration table are read at their full length', { skip: fx ? false : SKIP }, async () => {
+  for (const f of fx.forms) {
+    const def = await parseWorkbook(join(fx.formsDir, f.file));
+    assert.equal(def.calibration?.rows.length ?? 0, f.calRows, `${f.id} calibration rows`);
+    if (!f.calRows) {
+      assert.equal(def.calibration, null, `${f.id} has no calibration table`);
+      continue;
+    }
+    const cols = def.calibration.columns;
+    assert.deepEqual(
+      { reading: cols.reading, pass: cols.pass, fail: cols.fail }, f.calCols,
+      `${f.id} calibration entry columns`);
+    // Pass and Fail are two SEPARATE printed boxes — the whole reason the
+    // answer is a choice of two rather than free text.
+    assert.ok(cols.pass < cols.fail, `${f.id} Pass and Fail are distinct columns`);
+    assert.ok(cols.reading < cols.pass, `${f.id} Reading precedes them`);
+    // Consecutive rows: a gap would mean a measurement was silently skipped.
+    const rows = def.calibration.rows.map((r) => r.row);
+    assert.deepEqual(rows, rows.map((_, i) => rows[0] + i), `${f.id} calibration rows are consecutive`);
+    for (const r of def.calibration.rows) {
+      assert.ok(r.description, `${f.id} row ${r.row} names its measurement`);
+    }
+  }
+});

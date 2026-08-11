@@ -458,3 +458,41 @@ test('the parts helpers live at module scope, declared before renderFields uses 
   assert.ok((fieldPanelSrc.match(/^const PARTS_[A-Z_]+/gm) ?? []).length > 0,
     'expected the parts constants to exist, so this guard is not vacuous');
 });
+
+test('a field constrained to a list of answers renders as a select, not a free-text box', () => {
+  // The user asked for the Pass/Fail column to be a selection rather than free
+  // text, and the sheet backs that up: there are two printed boxes and no
+  // third one, so a typed answer could not be placed at all.
+  const panel = readFileSync(new URL('../web/js/field-panel.js', import.meta.url), 'utf8');
+  const fn = /function calGrid\([\s\S]*?\n\}\n/.exec(panel);
+  assert.ok(fn, 'calGrid exists');
+  assert.match(fn[0], /optionsOf\(f\)/, 'the allowed answers are read from the field');
+  assert.match(fn[0], /createElement\('select'\)/, 'a constrained field gets a select');
+  assert.match(fn[0], /createElement\('input'\)/, 'an unconstrained one still gets an input');
+});
+
+test('the select offers a blank, so an answer can be taken back', () => {
+  const panel = readFileSync(new URL('../web/js/field-panel.js', import.meta.url), 'utf8');
+  const fn = /function calGrid\([\s\S]*?\n\}\n/.exec(panel);
+  assert.match(fn[0], /\[''\s*,\s*\.\.\.allowed\]/,
+    'the blank option precedes the document\'s own answers');
+});
+
+test('the panel and the server agree on what a calibration field key looks like', () => {
+  // web/ shares no module with the server, so the convention is restated in
+  // both. Two copies that disagree would put a technician\'s answer on a
+  // measurement the sheet never asked about.
+  const panel = readFileSync(new URL('../web/js/field-panel.js', import.meta.url), 'utf8');
+  const server = readFileSync(new URL('../server/cell-map.js', import.meta.url), 'utf8');
+  const pattern = /\^cal_\(\\d\+\)_\(reading\|result\)\$/;
+  assert.match(panel, pattern, 'field-panel.js uses the shared key shape');
+  assert.match(server, pattern, 'cell-map.js uses the same one');
+});
+
+test('the panel and the server agree on how allowed answers are stored', () => {
+  const panel = readFileSync(new URL('../web/js/field-panel.js', import.meta.url), 'utf8');
+  const db = readFileSync(new URL('../server/db.js', import.meta.url), 'utf8');
+  for (const [name, source] of [['field-panel.js', panel], ['db.js', db]]) {
+    assert.match(source, /split\('\\n'\)/, `${name} splits the option list on newlines`);
+  }
+});

@@ -662,3 +662,38 @@ test('a form with no status column omits task statuses and still returns a valid
     } finally { server.close(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+// ---------------------------------------------------------------------------
+// Answers the document constrains
+// ---------------------------------------------------------------------------
+test('an answer the form does not offer is a 400, not a 403', async () => {
+  // A 403 would tell a technician they may not edit this record, which is both
+  // untrue and sends them looking for the wrong problem. The field-save route
+  // falls back to 403 because most of its failures ARE permission failures, so
+  // this asserts the exception is real.
+  const { db, server, call } = await boot();
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/c.xlsx','c.xlsx','xlsx','ready')`).run();
+  const formId = db.prepare('select id from form_catalog where file_path=?').get('/c.xlsx').id;
+  db.prepare(`insert into form_fields (form_id, field_key, label, section, kind, sort_order, source, options)
+    values (?,'cal_54_result','Generic measurement A','Calibration record','text',0,'parsed','Pass\nFail')`)
+    .run(formId);
+
+  await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+  const created = await call('POST', '/api/submissions', { formId, frequency: '' });
+
+  const bad = await call('PATCH', `/api/submissions/${created.body.id}`, { values: { cal_54_result: 'Marginal' } });
+  assert.equal(bad.status, 400);
+  assert.match(bad.body.error, /must be one of: Pass, Fail/);
+
+  const good = await call('PATCH', `/api/submissions/${created.body.id}`, { values: { cal_54_result: 'Fail' } });
+  assert.equal(good.status, 200);
+
+  // ...and a caller with no right to the record still gets 403, not 400: the
+  // permission check runs first and is not weakened by any of this.
+  await call('POST', '/api/login', { username: 'lead', password: 'lead' });
+  const forbidden = await call('PATCH', `/api/submissions/${created.body.id}`, { values: { cal_54_result: 'Marginal' } });
+  assert.equal(forbidden.status, 403);
+
+  server.close();
+});

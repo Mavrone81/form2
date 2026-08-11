@@ -71,8 +71,14 @@ function unreadableForm(res, formId, err) {
 // route never has to string-match a message to pick a status code.
 // FORBIDDEN is always a 403; anything else falls back to whatever this
 // specific route already used for a non-permission failure.
+//
+// INVALID is a 400 wherever it is thrown: a value the form does not accept is
+// a bad request, not a permission failure. Without it the field-save route's
+// own 403 fallback would answer "forbidden" to a technician who simply picked
+// an answer the document has no box for — which reads as "you may not edit
+// this record" and sends them looking for the wrong problem.
 const statusFor = (err, fallback) =>
-  err.code === 'FORBIDDEN' ? 403 : err.code === 'NOT_FOUND' ? 404 : fallback;
+  err.code === 'FORBIDDEN' ? 403 : err.code === 'NOT_FOUND' ? 404 : err.code === 'INVALID' ? 400 : fallback;
 
 export function makeRoutes(db) {
   const r = Router();
@@ -131,7 +137,7 @@ export function makeRoutes(db) {
     // ...and which printed option of the frequency band each interval is, so
     // the preview can ring the selected one the way a technician rings it on
     // paper. Absent for an interval the form does not offer.
-    let cellFor = {}, titleCell = null, intervalCells = {};
+    let cellFor = {}, titleCell = null, intervalCells = {}, calibrationCells = {};
     if (form.file_type === 'xlsx' && form.state === 'ready') {
       let def;
       try {
@@ -140,11 +146,11 @@ export function makeRoutes(db) {
         return unreadableForm(res, form.id, err);
       }
       tasks = def.tasks; frequencies = def.frequencies;
-      ({ cellFor, titleCell, intervalCells } = cellMapFor(def));
+      ({ cellFor, titleCell, intervalCells, calibrationCells } = cellMapFor(def));
     }
     const selected = String(req.query.frequency ?? '');
     const response = {
-      form, fields, frequencies, tasks, cellFor, titleCell, intervalCells,
+      form, fields, frequencies, tasks, cellFor, titleCell, intervalCells, calibrationCells,
       inScope: (selected ? tasksInScope(tasks, selected) : tasks).map((t) => t.row),
       summary: selected ? scopeSummary(tasks, selected) : null
     };
@@ -330,7 +336,8 @@ export function makeRoutes(db) {
       cellFor: cellMap?.cellFor ?? null, titleCell: cellMap?.titleCell ?? null,
       // The printed frequency band, so the archived record carries the same
       // ticked checkboxes the live preview shows.
-      intervalCells: cellMap?.intervalCells ?? null
+      intervalCells: cellMap?.intervalCells ?? null,
+      calibrationCells: cellMap?.calibrationCells ?? null
     });
 
     // A machine id typed into a spreadsheet cell is untrusted input reaching
@@ -420,6 +427,13 @@ export function makeRoutes(db) {
       // that unique index means a plain replace can clobber a row across
       // sources by rowid, which is exactly the data-loss shape the
       // delete-then-insert split was originally introduced to avoid.
+      //
+      // `options` is deliberately absent from both halves. The mapper does not
+      // edit which answers a field accepts, so it does not send them; leaving
+      // the column out of the update clause is what PRESERVES the ones the
+      // parser set. Adding it here — even as `options=excluded.options` — would
+      // blank the Calibration Record's Pass/Fail answers the first time an
+      // admin opened a wire-bond form and pressed Save.
       const ins = db.prepare(`insert into form_fields
         (form_id, field_key, label, section, kind, sort_order, source) values (?,?,?,?,?,?,?)
         on conflict(form_id, field_key) do update set

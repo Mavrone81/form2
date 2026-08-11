@@ -131,8 +131,30 @@ const MIGRATIONS = [
   // a reader whether the source document itself has changed since the record
   // was signed. Moving it for an app-side reason would print that warning
   // across every existing record, which would be untrue.
-  { table: 'form_catalog', column: 'fields_version', ddl: "alter table form_catalog add column fields_version integer not null default 0" }
+  { table: 'form_catalog', column: 'fields_version', ddl: "alter table form_catalog add column fields_version integer not null default 0" },
+  // The answers a field will accept, newline-separated, or '' for a field that
+  // takes free text. The calibration table's Pass/Fail column is the first
+  // user of it: the document prints two boxes and a technician ticks one, so
+  // the app must offer exactly those two answers and reject anything else.
+  //
+  // WHY A COLUMN AND NOT A NEW `kind`: `kind` carries a CHECK constraint, and
+  // SQLite cannot widen one without rebuilding the table — a destructive
+  // operation on a database holding signed records, to gain nothing a plain
+  // additive column does not already give. A constrained answer is still text:
+  // it is stored as text, rendered as text on the sheet, and compared as text.
+  // What changes is only which values are allowed, which is exactly what this
+  // column states.
+  { table: 'form_fields', column: 'options', ddl: "alter table form_fields add column options text not null default ''" }
 ];
+
+// The allowed answers for a field, as a list. '' (the default for every
+// existing row) means the field is unconstrained free text.
+export function optionsOf(field) {
+  return String(field?.options ?? '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
 function applyMigrations(db) {
   for (const { table, column, ddl } of MIGRATIONS) {

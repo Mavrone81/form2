@@ -216,6 +216,34 @@ export function checkboxMetrics(fontSize) {
 }
 
 // ---------------------------------------------------------------------------
+// Pass / Fail marks on the Calibration Record table
+// ---------------------------------------------------------------------------
+// The three wire-bond documents print Pass and Fail as two separate ruled
+// boxes per measurement, and a technician ticks one. The app stores a single
+// answer — the word "Pass" or "Fail" — and the mark goes in the matching box.
+//
+// The resolution lives here, in the module both renderers share, for the same
+// reason the checkbox geometry does: the preview and the archived record must
+// put the mark in the SAME box, and a record that shows a pass on screen and a
+// fail on paper is worse than one that shows neither.
+//
+// `marks` is server/cell-map.js's calibrationCells: sheet row -> answer word ->
+// cell. `valueOf` is asked for the stored answer of one field key, so a caller
+// can pass whatever it keeps its values in. Only an answer the document has a
+// box for yields a mark; anything else — blank, unrecognised, a stale value
+// from a form that has since changed — yields nothing, because there is
+// nowhere on the sheet it could honestly go.
+export function calibrationTicks(marks, valueOf) {
+  const out = [];
+  for (const [row, boxes] of Object.entries(marks ?? {})) {
+    const answer = String(valueOf(`cal_${row}_result`) ?? '').trim();
+    const cell = answer ? boxes?.[answer] : null;
+    if (cell) out.push({ row: Number(row), answer, cell });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // The machine ID in the printed title's blank
 // ---------------------------------------------------------------------------
 // A machine ID filled into the blank the printed title leaves for it, e.g.

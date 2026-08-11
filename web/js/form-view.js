@@ -38,7 +38,7 @@
 //
 // `fillTitleBlank` is re-exported so callers (and its tests) can keep taking
 // it from the renderer they use.
-import { layoutRow, borderPen, fillTitleBlank, imageBox, checkboxMetrics } from './sheet-layout.js';
+import { layoutRow, borderPen, fillTitleBlank, imageBox, checkboxMetrics, calibrationTicks } from './sheet-layout.js';
 export { layoutRow, borderPen, fillTitleBlank };
 
 // What an entered value looks like inside the reproduced sheet: the value
@@ -230,6 +230,45 @@ function markInterval(state, interval) {
   return marked > 0;
 }
 
+// The Pass / Fail mark on the Calibration Record table.
+//
+// The document prints an empty ruled box under Pass and another under Fail;
+// the technician ticks one. So the mark is the tick alone — no drawn box,
+// because the sheet already prints one — using the very same check shape the
+// frequency band uses, so every mark this app makes on a controlled document
+// looks like the same pen.
+//
+// Marks are painted per row through one function, and a row is always CLEARED
+// before it is marked: an answer changed from Pass to Fail must not leave two
+// ticks behind, which would state that a measurement both passed and failed.
+function tickMark() {
+  const mark = document.createElement('span');
+  mark.className = 'cal-tick';
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${UNIT.size} ${UNIT.size}`);
+  svg.setAttribute('aria-hidden', 'true');
+  const tick = document.createElementNS(SVG_NS, 'polyline');
+  tick.setAttribute('points', UNIT.tick.map(([x, y]) => `${x},${y}`).join(' '));
+  svg.append(tick);
+  mark.append(svg);
+  return mark;
+}
+
+function markCalibrationRow(state, row) {
+  const boxes = state.calibrationCells?.[row];
+  if (!boxes) return false;
+  for (const cell of Object.values(boxes)) {
+    const td = state.cells.get(at(cell));
+    if (td) td.replaceChildren();
+  }
+  const [only] = calibrationTicks({ [row]: boxes }, (key) => state.values.get(key));
+  if (!only) return false;
+  const td = state.cells.get(at(only.cell));
+  if (!td) return false;
+  td.replaceChildren(tickMark());
+  return true;
+}
+
 // The company logo, in the header box the form anchors it to. `object-fit`
 // keeps its aspect ratio inside that box, so it can never come out stretched;
 // the box itself comes from the shared geometry the archived PDF uses.
@@ -266,7 +305,7 @@ function signatureText(signature) {
 
 export function renderForm(container, form, {
   grid, inScopeRows, values, cellFor, titleCell, machineId, signatures,
-  intervalCells, selectedInterval
+  intervalCells, selectedInterval, calibrationCells
 } = {}) {
   container.replaceChildren();
   // Any preview state from a previously rendered form is stale the moment
@@ -326,7 +365,11 @@ export function renderForm(container, form, {
   // it, so a later change of interval can re-tick them in place.
   const state = {
     cellFor: map, cells: new Map(), printed: new Map(), titleTd: null, titlePrinted: '',
-    intervalCells: intervalCells ?? {}, boxes: new Map(), marked: 0
+    intervalCells: intervalCells ?? {}, boxes: new Map(), marked: 0,
+    // The calibration answers are marks rather than text, so the values they
+    // are resolved from have to outlive this call — a later change of answer
+    // re-marks one row without rebuilding the sheet.
+    calibrationCells: calibrationCells ?? {}, values: byKey
   };
 
   const inScope = inScopeRows ? new Set(inScopeRows) : null;
@@ -386,6 +429,9 @@ export function renderForm(container, form, {
   // nothing editable anywhere.
   buildBand(state);
   markInterval(state, selectedInterval);
+  // Same idea for the calibration table: mark what the record already says,
+  // through the identical path a later answer takes.
+  for (const row of Object.keys(state.calibrationCells)) markCalibrationRow(state, Number(row));
   // The task grid is a spreadsheet reproduction — it must never reflow/stack
   // on narrow screens (that would destroy its meaning). Instead it gets its
   // own horizontal scroll container, so the table can pan sideways while the
@@ -429,6 +475,15 @@ export function updatePreviewField(container, key, value) {
     if (!state.titleTd) return false;
     state.titleTd.textContent = fillTitleBlank(state.titlePrinted, value);
     return true;
+  }
+
+  // A calibration answer is a tick in one of two printed boxes, not text in a
+  // cell, so it never goes through the cellFor path below. The stored value is
+  // updated first, because the mark is resolved FROM it.
+  const cal = /^cal_(\d+)_result$/.exec(String(key ?? ''));
+  if (cal) {
+    state.values.set(key, value);
+    return markCalibrationRow(state, Number(cal[1]));
   }
 
   const cell = state.cellFor[key];

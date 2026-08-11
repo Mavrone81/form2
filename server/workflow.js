@@ -1,4 +1,5 @@
 import { tasksInScope } from './intervals.js';
+import { optionsOf } from './db.js';
 
 // `rejected` is a technician stage, not a fourth step: a rejected record has
 // come back to whoever created it, is editable by them again exactly as a
@@ -67,7 +68,7 @@ function assertStageOwnership(sub, user, messages) {
 export function createSubmission(db, { formId, userId, machineId = '', frequency = '', snapshot = null }) {
   const now = new Date().toISOString();
   const fields = snapshot ??
-    db.prepare('select field_key, label, section, kind, sort_order from form_fields where form_id=? order by sort_order').all(formId);
+    db.prepare('select field_key, label, section, kind, options, sort_order from form_fields where form_id=? order by sort_order').all(formId);
   // The controlled document's identity is captured HERE, once, alongside the
   // field snapshot. The catalog row is a live mirror of a file that can be
   // revised, rescanned or deleted at any time; a record signed against Rev E
@@ -92,6 +93,32 @@ export function saveFields(db, submissionId, values, user) {
   assertCanEdit(db, submissionId, user);
   const snapshot = JSON.parse(db.prepare('select form_snapshot from submissions where id=?').get(submissionId).form_snapshot);
   const labels = new Map(snapshot.map((f) => [f.field_key, f.label]));
+
+  // A field the form constrains to a list of answers accepts those answers and
+  // nothing else. The Calibration Record's Pass/Fail column is the first such
+  // field: the document prints two boxes, so a third answer could not be placed
+  // on the sheet at all — it would be stored, shown in the panel, and then be
+  // silently missing from the archived record, which is the worst of the three
+  // outcomes. Clearing an answer (the empty string) is always allowed: an
+  // unanswered measurement is a real state and is how a field is un-set.
+  //
+  // Enforced HERE, beside assertCanEdit, for the same reason that check is:
+  // this is the one door every route writes values through, so no future
+  // caller can bypass it. The constraint is read from the submission's OWN
+  // snapshot, so revising the source form later cannot retroactively
+  // invalidate an answer already recorded against the old one.
+  for (const f of snapshot) {
+    const allowed = optionsOf(f);
+    if (!allowed.length) continue;
+    if (!Object.prototype.hasOwnProperty.call(values, f.field_key)) continue;
+    const value = String(values[f.field_key] ?? '').trim();
+    if (value && !allowed.includes(value)) {
+      const err = new Error(`"${f.label}" must be one of: ${allowed.join(', ')}.`);
+      err.code = 'INVALID';
+      throw err;
+    }
+  }
+
   const stmt = db.prepare(`insert into submission_fields (submission_id, field_key, label, value)
     values (?,?,?,?)
     on conflict(submission_id, field_key) do update set value=excluded.value`);

@@ -10,7 +10,7 @@ import { parsePartsKey } from './cell-map.js';
 // is precisely how this renderer came to disagree with the preview: labels
 // the form prints on one line were broken mid-word down a narrow column and
 // a one-page controlled document was archived as four pages.
-import { layoutRow, borderPen, fillTitleBlank, imageBox, checkboxMetrics } from '../web/js/sheet-layout.js';
+import { layoutRow, borderPen, fillTitleBlank, imageBox, checkboxMetrics, calibrationTicks } from '../web/js/sheet-layout.js';
 
 const asset = (p) => fileURLToPath(new URL(`../assets/${p}`, import.meta.url));
 // The sheets name Aptos Narrow, Calibri and Arial. None of the three may be
@@ -80,7 +80,7 @@ const SUBSTITUTION_ALLOWANCE = 0.88;
  * licence-tracked sRGB profile — not PDFKit's bundled one — is what actually
  * ships as the record's archival OutputIntent.
  */
-export async function renderRecordPdf({ form, submission, snapshot, values, signatures, rejections = [], grid, identity = null, notice = '', cellFor = null, titleCell = null, intervalCells = null }) {
+export async function renderRecordPdf({ form, submission, snapshot, values, signatures, rejections = [], grid, identity = null, notice = '', cellFor = null, titleCell = null, intervalCells = null, calibrationCells = null }) {
   // `identity` is the controlled document as it stood WHEN THIS RECORD WAS
   // SIGNED (stamped on the submission at creation — see server/workflow.js).
   // The live catalog row is only a fallback for records created before those
@@ -114,7 +114,7 @@ export async function renderRecordPdf({ form, submission, snapshot, values, sign
   // server/cell-map.js), so the archived record and the preview show the same
   // record the same way. Anything the sheet has no box for still prints
   // below, so no recorded value can be lost by being unmappable.
-  const entries = entriesForSheet({ grid, cellFor, titleCell, submission, values, signatures });
+  const entries = entriesForSheet({ grid, cellFor, titleCell, submission, values, signatures, calibrationCells });
   const leftovers = unmappedFields(snapshot, values, entries.painted);
 
   const valuesPlan = planValues(doc, leftovers, values);
@@ -472,7 +472,15 @@ function measureSheet(doc, grid, entries, scale) {
       const spanRows = Math.max(1, cell.span?.rows ?? 1);
       maxSpanRows = Math.max(maxSpanRows, spanRows);
 
-      const item = { cell, box, spanRows, text: entries.textAt(row.index, cell), entered: entries.enteredAt(row.index, cell) };
+      const item = {
+        cell, box, spanRows,
+        text: entries.textAt(row.index, cell),
+        entered: entries.enteredAt(row.index, cell),
+        // A ticked Pass/Fail box carries no text at all, so it has to be
+        // carried as its own flag or the empty-cell short-circuit in drawCell
+        // would skip the only mark the cell has.
+        tick: entries.tickAt(row.index, cell)
+      };
       if (item.text) {
         item.fit = fitCell(doc, {
           text: item.text,
@@ -668,6 +676,10 @@ function drawCell(doc, item, top, height, cappedForm, rowIndex, options) {
   // Shading the sheet declares, under everything else the cell draws.
   if (cell.fill) doc.rect(box.x, top, box.width, height).fill(cell.fill);
   drawCellBorders(doc, cell.borders, box.x, top, box.width, height);
+  // The Pass / Fail answer on the Calibration Record table: a tick centred in
+  // the box the document already prints. Drawn before the empty-text return
+  // below, because this cell has no text — the mark IS the entry.
+  if (item.tick) drawTick(doc, box.x, top, box.width, height, (cell.size ?? 0) || 10);
   if (!item.text) return;
 
   const { font, size, wrapped, lines, width, textHeight } = item.fit;
@@ -774,6 +786,32 @@ function drawCheckboxes(doc, { options, text, font, size, x, y, lineHeight }) {
   }
 }
 
+// A tick centred in a cell, at the shared check geometry — the same shape the
+// frequency band's ticks and the preview's calibration marks are drawn from,
+// so every mark this app makes on a controlled document is the same mark.
+//
+// No box is drawn around it: unlike the frequency band, whose boxes exist only
+// as drawing shapes the grid model does not carry, the calibration table's
+// Pass and Fail boxes are ruled CELLS that drawCellBorders has already drawn.
+// Drawing another would print a box inside a box.
+//
+// The tick is fitted to the cell rather than to the type size when the cell is
+// small, so a narrow Pass column cannot take a mark wider than itself.
+function drawTick(doc, x, y, width, height, fontSize) {
+  const metrics = checkboxMetrics(Math.max(6, fontSize));
+  const size = Math.min(metrics.size, Math.max(0, width) - 2, Math.max(0, height) - 2);
+  if (!(size > 1)) return;
+  const left = x + (width - size) / 2;
+  const top = y + (height - size) / 2;
+  const scale = size / metrics.size;
+  const [first, ...rest] = metrics.tick.map(([tx, ty]) => [tx * scale, ty * scale]);
+  doc.undash().strokeColor('#000')
+    .lineWidth(Math.max(0.35, metrics.stroke * 1.6 * scale)).lineJoin('miter').lineCap('butt')
+    .moveTo(left + first[0], top + first[1]);
+  for (const [tx, ty] of rest) doc.lineTo(left + tx, top + ty);
+  doc.stroke();
+}
+
 function warnTruncation(form, rowIndex, col) {
   const label = form?.doc_number || form?.file_name || 'unknown form';
   // eslint-disable-next-line no-console -- deliberate operator-facing warning, not debug noise
@@ -818,7 +856,7 @@ function drawCellBorders(doc, borders, x, y, w, h) {
 // A coordinate the map does not name, or names outside this grid, yields
 // nothing here — and the field then prints below instead, so no recorded value
 // is ever lost to an unmappable cell.
-function entriesForSheet({ grid, cellFor, titleCell, submission, values, signatures }) {
+function entriesForSheet({ grid, cellFor, titleCell, submission, values, signatures, calibrationCells }) {
   const byCoord = new Map();
   const painted = new Set();
   const byKey = new Map((values ?? []).map((v) => [v.field_key, v.value]));
@@ -849,6 +887,18 @@ function entriesForSheet({ grid, cellFor, titleCell, submission, values, signatu
   const titleCoord = titleCell ? `${titleCell.row}:${titleCell.col}` : null;
   if (titleCoord && rendered.has(titleCoord) && String(machineId ?? '').trim()) painted.add('machine_id');
 
+  // Pass / Fail answers, resolved to the box each one is ticked in by the rule
+  // the preview uses, so the archived record marks the same box the technician
+  // saw marked on screen. An answer whose box this sheet does not actually
+  // render is dropped rather than moved somewhere it would show.
+  const ticks = new Set();
+  for (const { row, cell } of calibrationTicks(calibrationCells, (key) => byKey.get(key))) {
+    const coord = `${cell.row}:${cell.col}`;
+    if (!rendered.has(coord)) continue;
+    ticks.add(coord);
+    painted.add(`cal_${row}_result`);
+  }
+
   return {
     textAt(rowIndex, cell) {
       const coord = `${rowIndex}:${cell.col}`;
@@ -857,6 +907,9 @@ function entriesForSheet({ grid, cellFor, titleCell, submission, values, signatu
     },
     enteredAt(rowIndex, cell) {
       return byCoord.has(`${rowIndex}:${cell.col}`);
+    },
+    tickAt(rowIndex, cell) {
+      return ticks.has(`${rowIndex}:${cell.col}`);
     },
     painted
   };

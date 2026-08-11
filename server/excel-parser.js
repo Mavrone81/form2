@@ -228,6 +228,107 @@ function partsTable(ws, anchor, taskHeaderRow, covered) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// The Calibration Record table
+// ---------------------------------------------------------------------------
+// The three wire-bond documents carry a second table below the sign-off blocks:
+// a list of measurements, each with a printed specification, and two things a
+// technician enters against it — the READING they measured, and whether that
+// reading PASSED or FAILED.
+//
+// Pass and Fail are two SEPARATE printed columns, not one column with two
+// words in it. A technician ticks one of them. That is why the app records a
+// single value ("Pass" or "Fail") and the renderers put a mark in the matching
+// column: one stored answer, placed where the document prints its box.
+//
+// Everything else in the table — No, Section, Description, Specification — is
+// printed BY the document. Those columns are read here so the right-hand panel
+// can show a technician which measurement each row is asking for, and they are
+// never written to.
+const CAL_COLUMNS = [
+  { key: 'no', match: (f) => f === 'no' },
+  { key: 'section', match: (f) => f === 'section' },
+  { key: 'description', match: (f) => f.startsWith('description') },
+  { key: 'specification', match: (f) => f.startsWith('specification') || f.startsWith('spec') },
+  { key: 'reading', match: (f) => f === 'reading' || f === 'readings' },
+  { key: 'pass', match: (f) => f === 'pass' },
+  { key: 'fail', match: (f) => f === 'fail' }
+];
+
+// The seven column positions read from one candidate header row, or null.
+//
+// Fails CLOSED like every other header detection here: all seven headings must
+// be present and in ascending order. A document whose calibration table this
+// does not recognise contributes no calibration fields at all, which is
+// strictly better than a Reading written into a column that was guessed.
+function calHeaderColumns(ws, r, covered) {
+  const row = ws.getRow(r);
+  const found = new Map();
+  for (let c = 1; c <= (row.cellCount || 0); c++) {
+    if (covered.has(`${r}:${c}`)) continue;
+    const f = flat(txt(row.getCell(c)));
+    if (!f) continue;
+    for (const col of CAL_COLUMNS) {
+      if (!found.has(col.key) && col.match(f)) { found.set(col.key, c); break; }
+    }
+  }
+  if (found.size !== CAL_COLUMNS.length) return null;
+  const cols = CAL_COLUMNS.map((c) => found.get(c.key));
+  for (let i = 1; i < cols.length; i++) if (!(cols[i - 1] < cols[i])) return null;
+  return Object.fromEntries(CAL_COLUMNS.map((c, i) => [c.key, cols[i]]));
+}
+
+// The table's data rows, top to bottom.
+//
+// A row qualifies while its Reading, Pass and Fail cells are all RENDERABLE —
+// not swallowed by a merge — and it prints a description. That single test is
+// what ends the table at the document's footer strip: the footer is one merge
+// spanning the full width of the sheet, so its Reading cell is covered by a
+// master back in column A and the run stops there. Reading the footer as a
+// data row would otherwise add a phantom measurement to every record.
+//
+// One of the three documents prints a two-row sub-heading beneath the main
+// header (its Specification column is split into two named limits). Those rows
+// are part of the header's own vertical merge, so the caller skips them by the
+// header cell's row span rather than by matching their wording.
+function calDataRows(ws, headerRow, headerRows, columns, covered) {
+  const entry = [columns.reading, columns.pass, columns.fail];
+  const rows = [];
+  for (let r = headerRow + headerRows; r <= ws.rowCount; r++) {
+    if (entry.some((c) => covered.has(`${r}:${c}`))) break;
+    const description = txt(ws.getRow(r).getCell(columns.description));
+    if (!description) break;
+    rows.push({
+      row: r,
+      no: txt(ws.getRow(r).getCell(columns.no)),
+      section: txt(ws.getRow(r).getCell(columns.section)),
+      description,
+      specification: txt(ws.getRow(r).getCell(columns.specification))
+    });
+  }
+  return rows;
+}
+
+// The calibration table as structure: which columns carry what, and one entry
+// per measurement the document asks for. Null on the nine documents that do
+// not print one.
+function calibrationTable(ws, covered, spans) {
+  const anchor = findCell(ws, (v) => v.startsWith('calibration record'));
+  if (!anchor) return null;
+  const last = Math.min(anchor.row + 3, ws.rowCount);
+  for (let r = anchor.row; r <= last; r++) {
+    const columns = calHeaderColumns(ws, r, covered);
+    if (!columns) continue;
+    // How tall the heading is, taken from the vertical span of its own "No"
+    // cell rather than assumed to be one row.
+    const headerRows = spans.get(`${r}:${columns.no}`)?.rows ?? 1;
+    const rows = calDataRows(ws, r, headerRows, columns, covered);
+    if (!rows.length) return null;
+    return { headerRow: r, columns, rows };
+  }
+  return null;
+}
+
 function rightOf(ws, row, col) {
   for (let c = col + 1; c <= col + 12; c++) {
     const v = txt(ws.getRow(row).getCell(c));
@@ -304,10 +405,12 @@ export async function parseWorkbook(path) {
   // Merge coverage is needed by both the parts table below and the cell map
   // further down, and there is one definition of it (see mergeMap) so the two
   // can never disagree about which coordinates buildGrid actually renders.
-  const { covered } = mergeMap(ws);
+  const { covered, spans } = mergeMap(ws);
 
   const partsAnchor = findCell(ws, (v) => v.startsWith('parts required'));
   const parts = partsTable(ws, partsAnchor, header.r, covered);
+
+  const calibration = calibrationTable(ws, covered, spans);
 
   const ppeAnchor = findCell(ws, (v) => v.startsWith('ppe required'));
   const ppe = [];
@@ -348,6 +451,7 @@ export async function parseWorkbook(path) {
     tasks,
     cells,
     parts,
+    calibration,
     sections: {
       safety: sectionText('safety'),
       procedure: sectionText('procedure'),

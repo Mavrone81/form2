@@ -504,3 +504,91 @@ test('empty parts rows do not block signing, at any stage', () => {
   assert.equal(signAndAdvance(db, { submissionId: sub.id, user: users.lead, signaturePng: PNG }).state, 'pending_engineer');
   assert.equal(signAndAdvance(db, { submissionId: sub.id, user: users.eng, signaturePng: PNG }).state, 'approved');
 });
+
+// ---------------------------------------------------------------------------
+// Fields constrained to a list of answers
+// ---------------------------------------------------------------------------
+// The Calibration Record's Pass/Fail column is the first of these: the
+// document prints exactly two boxes, so a third answer has nowhere on the
+// sheet to go. Enforced in saveFields — the one door every route writes
+// through — so no future caller can bypass it.
+function setupConstrained() {
+  const db = openDb(':memory:');
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/f.xlsx','f.xlsx','xlsx','ready')`).run();
+  db.prepare(`insert into form_fields (form_id, field_key, label, section, kind, sort_order, source, options)
+    values (1,'cal_54_result','Generic measurement A (0 - 1 unit)','Calibration record','text',0,'parsed','Pass\nFail'),
+           (1,'cal_54_reading','Generic measurement A (0 - 1 unit)','Calibration record','text',1,'parsed',''),
+           (1,'remarks','Remarks','Record','text',2,'parsed','')`).run();
+  const tech = createUser(db, { username: 't', password: 'p', fullName: 'Tech', role: 'technician' });
+  const sub = createSubmission(db, { formId: 1, userId: tech.id, machineId: 'ED04', frequency: 'Y' });
+  return { db, tech, sub };
+}
+
+const valueOf = (db, id, key) =>
+  db.prepare('select value from submission_fields where submission_id=? and field_key=?').get(id, key)?.value;
+
+test('a constrained field accepts the answers the document prints', () => {
+  const { db, tech, sub } = setupConstrained();
+  saveFields(db, sub.id, { cal_54_result: 'Pass' }, tech);
+  assert.equal(valueOf(db, sub.id, 'cal_54_result'), 'Pass');
+  saveFields(db, sub.id, { cal_54_result: 'Fail' }, tech);
+  assert.equal(valueOf(db, sub.id, 'cal_54_result'), 'Fail');
+});
+
+test('a constrained field refuses an answer the document has no box for', () => {
+  const { db, tech, sub } = setupConstrained();
+  saveFields(db, sub.id, { cal_54_result: 'Pass' }, tech);
+  assert.throws(() => saveFields(db, sub.id, { cal_54_result: 'Marginal' }, tech), /must be one of: Pass, Fail/);
+  // ...and the whole save is refused, not half-applied: the previous answer
+  // stands rather than being replaced by something unplaceable.
+  assert.equal(valueOf(db, sub.id, 'cal_54_result'), 'Pass');
+});
+
+test('a rejected answer takes the rest of its save down with it', () => {
+  // The write is one transaction. A bad answer alongside good values must not
+  // leave the record half-updated — a reading stored against an answer that
+  // was refused would read as a measurement nobody judged.
+  const { db, tech, sub } = setupConstrained();
+  assert.throws(
+    () => saveFields(db, sub.id, { cal_54_reading: '0.5 units', cal_54_result: 'Maybe' }, tech),
+    /must be one of/);
+  assert.equal(valueOf(db, sub.id, 'cal_54_reading'), undefined);
+});
+
+test('clearing a constrained answer is always allowed', () => {
+  // An unanswered measurement is a real state, and is how a wrong answer is
+  // taken back.
+  const { db, tech, sub } = setupConstrained();
+  saveFields(db, sub.id, { cal_54_result: 'Fail' }, tech);
+  saveFields(db, sub.id, { cal_54_result: '' }, tech);
+  assert.equal(valueOf(db, sub.id, 'cal_54_result'), '');
+});
+
+test('an answer is matched exactly — not by case, and not by prefix', () => {
+  const { db, tech, sub } = setupConstrained();
+  for (const bad of ['pass', 'PASS', 'Passed', ' Pass fail', 'Pass\nFail']) {
+    assert.throws(() => saveFields(db, sub.id, { cal_54_result: bad }, tech), /must be one of/, bad);
+  }
+  // Surrounding whitespace is not a different answer, though — a value that
+  // arrives padded is the answer it reads as.
+  saveFields(db, sub.id, { cal_54_result: '  Pass  ' }, tech);
+  assert.equal(valueOf(db, sub.id, 'cal_54_result'), '  Pass  ');
+});
+
+test('unconstrained fields are unaffected', () => {
+  const { db, tech, sub } = setupConstrained();
+  saveFields(db, sub.id, { cal_54_reading: 'anything at all', remarks: 'free text' }, tech);
+  assert.equal(valueOf(db, sub.id, 'cal_54_reading'), 'anything at all');
+  assert.equal(valueOf(db, sub.id, 'remarks'), 'free text');
+});
+
+test('the constraint is read from the record own snapshot, not the live form', () => {
+  // A record is evidence. Revising the source document later must not
+  // retroactively invalidate an answer already recorded against the old one.
+  const { db, tech, sub } = setupConstrained();
+  db.prepare("update form_fields set options='Yes\nNo' where field_key='cal_54_result'").run();
+  saveFields(db, sub.id, { cal_54_result: 'Pass' }, tech);
+  assert.equal(valueOf(db, sub.id, 'cal_54_result'), 'Pass');
+  assert.throws(() => saveFields(db, sub.id, { cal_54_result: 'Yes' }, tech), /must be one of/);
+});

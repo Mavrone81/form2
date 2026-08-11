@@ -117,3 +117,35 @@ test('nothing in the left pane is an editable control', () => {
     'the left pane must never create an editable control');
   assert.doesNotMatch(src, /contentEditable/i, 'the left pane must never be contenteditable');
 });
+
+test('the Pass/Fail mark is resolved by the shared module, not by a second copy of the rule', () => {
+  // The preview and the archived PDF must tick the SAME box. Both import
+  // calibrationTicks from web/js/sheet-layout.js; a renderer that grew its own
+  // answer-to-box rule is exactly how the two would drift apart.
+  const pdfSrc = readFileSync(new URL('../server/pdf-record.js', import.meta.url), 'utf8');
+  for (const [name, source] of [['form-view.js', src], ['pdf-record.js', pdfSrc]]) {
+    assert.match(source, /import \{[^}]*calibrationTicks[^}]*\} from ['"][^'"]*sheet-layout\.js['"]/,
+      `${name} imports calibrationTicks from the shared module`);
+  }
+});
+
+test('a calibration row is cleared before it is marked', () => {
+  // An answer changed from Pass to Fail must not leave two ticks behind, which
+  // would state that one measurement both passed and failed.
+  const fn = /function markCalibrationRow\(state, row\) \{[\s\S]*?\n\}/.exec(src);
+  assert.ok(fn, 'markCalibrationRow exists');
+  const body = fn[0];
+  const clearAt = body.indexOf('replaceChildren()');
+  const markAt = body.indexOf('tickMark()');
+  assert.ok(clearAt !== -1, 'every box for the row is emptied');
+  assert.ok(markAt !== -1, 'the chosen box is then ticked');
+  assert.ok(clearAt < markAt, 'the clear happens before the mark');
+});
+
+test('changing a Pass/Fail answer never re-renders the grid', () => {
+  // Same reasoning as the interval band: this repaints one row's two boxes.
+  const fn = /export function updatePreviewField\([\s\S]*?\n\}/.exec(src);
+  assert.ok(fn, 'updatePreviewField exists');
+  assert.match(fn[0], /markCalibrationRow/, 'a calibration answer goes through the per-row mark path');
+  assert.ok(!/renderForm\(/.test(fn[0]), 'and never through a full re-render');
+});

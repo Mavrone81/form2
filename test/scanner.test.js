@@ -307,3 +307,81 @@ test('a pdf and an unparseable xlsx are still skipped on the next scan', async (
   assert.deepEqual(await scanFolder(db, dir), { added: 0, updated: 0, deactivated: 0, failed: 0 });
   rmSync(dir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// The Calibration Record table
+// ---------------------------------------------------------------------------
+// Invented, generic content only — never real form text.
+async function writeCalibrationWorkbook(path, measurements) {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Sheet1');
+  ws.getRow(1).getCell(1).value = 'No';
+  ws.getRow(1).getCell(2).value = 'Freq.';
+  ws.getRow(1).getCell(3).value = 'Instruction';
+  ws.getRow(1).getCell(4).value = 'Status';
+  ws.getRow(2).getCell(1).value = 1;
+  ws.getRow(2).getCell(2).value = '1M';
+  ws.getRow(2).getCell(3).value = 'Widget check';
+
+  ws.getRow(4).getCell(1).value = 'Calibration Record :';
+  ['No', 'Section', 'Description', 'Specification', 'Reading', 'Pass', 'Fail']
+    .forEach((t, i) => { ws.getRow(5).getCell(i + 1).value = t; });
+  measurements.forEach((m, i) => {
+    const row = ws.getRow(6 + i);
+    row.getCell(1).value = String(i + 1);
+    row.getCell(2).value = 'A section';
+    row.getCell(3).value = m.description;
+    row.getCell(4).value = m.specification ?? '';
+  });
+  await wb.xlsx.writeFile(path);
+}
+
+test('each calibration measurement generates a reading and a Pass/Fail answer', async () => {
+  const dir = tmp();
+  try {
+    await writeCalibrationWorkbook(join(dir, 'cal.xlsx'), [
+      { description: 'Generic measurement A', specification: '0 - 10 units' },
+      { description: 'Generic measurement B', specification: '' }
+    ]);
+    const db = openDb(':memory:');
+    await scanFolder(db, dir);
+    const [form] = listForms(db);
+    const fields = db.prepare('select * from form_fields where form_id=? order by sort_order').all(form.id);
+
+    const cal = fields.filter((f) => f.field_key.startsWith('cal_'));
+    assert.deepEqual(cal.map((f) => f.field_key),
+      ['cal_6_reading', 'cal_6_result', 'cal_7_reading', 'cal_7_result']);
+    for (const f of cal) assert.equal(f.section, 'Calibration record');
+
+    // The specification is carried into the label: it is the number the
+    // technician checks their reading against, and several documents repeat
+    // the same description across rows that differ only by it.
+    assert.equal(cal[0].label, 'Generic measurement A (0 - 10 units)');
+    assert.equal(cal[2].label, 'Generic measurement B');
+
+    // The answer is constrained to the two boxes the document prints; the
+    // reading beside it is free text.
+    assert.equal(cal[1].options, 'Pass\nFail');
+    assert.equal(cal[3].options, 'Pass\nFail');
+    assert.equal(cal[0].options, '');
+    assert.equal(cal[2].options, '');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a form with no calibration table generates no calibration fields', async () => {
+  const dir = tmp();
+  try {
+    await writeSyntheticWorkbook(join(dir, 'plain.xlsx'), ['Widget check']);
+    const db = openDb(':memory:');
+    await scanFolder(db, dir);
+    const [form] = listForms(db);
+    const fields = db.prepare('select * from form_fields where form_id=?').all(form.id);
+    assert.equal(fields.filter((f) => f.field_key.startsWith('cal_')).length, 0);
+    // Every other field is unconstrained free text, as before.
+    for (const f of fields) assert.equal(f.options, '');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
