@@ -8,6 +8,7 @@ import { tasksInScope, scopeSummary } from './intervals.js';
 import { cellMapFor } from './cell-map.js';
 import { createSubmission, saveFields, signAndAdvance, rejectSubmission, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
 import { renderRecordPdf } from './pdf-record.js';
+import { createLoginThrottle } from './login-throttle.js';
 
 const signedIn = requireRole(...ROLES);
 
@@ -82,11 +83,29 @@ const statusFor = (err, fallback) =>
 
 export function makeRoutes(db) {
   const r = Router();
+  // Per-app-instance counters, so one test's failures never leak into another.
+  const loginThrottle = createLoginThrottle();
   const setting = (k) => db.prepare('select value from settings where key=?').get(k)?.value ?? '';
 
   r.post('/login', (req, res) => {
-    const user = authenticate(db, req.body?.username ?? '', req.body?.password ?? '');
-    if (!user) return res.status(401).json({ error: 'Username or password is incorrect.' });
+    // 5 failed attempts per (username, IP) per 15 minutes. `req.ip` rather than
+    // the first X-Forwarded-For entry: nginx builds that header with
+    // $proxy_add_x_forwarded_for, which APPENDS the real peer to whatever the
+    // caller sent, so the first entry is attacker-supplied and a throttle keyed
+    // on it can be walked straight through. `trust proxy` is set in index.js and
+    // the app port is published on loopback only, so nginx is the sole path in.
+    const username = req.body?.username ?? '';
+    loginThrottle.sweep();
+    const throttleKey = loginThrottle.key(username, req.ip);
+    if (loginThrottle.blocked(throttleKey)) {
+      return res.status(429).json({ error: 'Too many failed attempts. Please try again in 15 minutes.' });
+    }
+    const user = authenticate(db, username, req.body?.password ?? '');
+    if (!user) {
+      loginThrottle.fail(throttleKey);
+      return res.status(401).json({ error: 'Username or password is incorrect.' });
+    }
+    loginThrottle.clear(throttleKey);
     req.session.user = user;
     res.json(user);
   });

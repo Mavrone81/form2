@@ -54,6 +54,38 @@ async function boot() {
   return { db, server, call, lastSetCookie: () => setCookie };
 }
 
+test('login locks after 5 failures for that username, and only that username', async () => {
+  const { server, call } = await boot();
+  // Five wrong passwords for one user -> the sixth attempt is refused outright.
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await call('POST', '/api/login', { username: 'tech', password: 'no' + i })).status, 401);
+  }
+  assert.equal((await call('POST', '/api/login', { username: 'tech', password: 'no5' })).status, 429,
+    'sixth failed attempt must be rate limited');
+  // Even the CORRECT password is refused while locked.
+  assert.equal((await call('POST', '/api/login', { username: 'tech', password: 'tech' })).status, 429,
+    'correct password is still refused while locked');
+  // A different account from the same place is unaffected: otherwise five wrong
+  // guesses at a known username lock out everyone else in the building.
+  assert.equal((await call('POST', '/api/login', { username: 'lead', password: 'lead' })).status, 200,
+    'a different username must not be collaterally locked');
+  server.close();
+});
+
+test('a successful login clears the failure count', async () => {
+  const { server, call } = await boot();
+  for (let i = 0; i < 4; i++) {
+    assert.equal((await call('POST', '/api/login', { username: 'tech', password: 'no' + i })).status, 401);
+  }
+  assert.equal((await call('POST', '/api/login', { username: 'tech', password: 'tech' })).status, 200);
+  // Four more failures must not trip the limit, because the counter was reset.
+  for (let i = 0; i < 4; i++) {
+    assert.equal((await call('POST', '/api/login', { username: 'tech', password: 'x' + i })).status, 401,
+      'counter was not cleared by the successful login');
+  }
+  server.close();
+});
+
 test('unauthenticated requests are refused', async () => {
   const { server, call } = await boot();
   assert.equal((await call('GET', '/api/forms')).status, 401);
