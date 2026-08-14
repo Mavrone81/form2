@@ -142,6 +142,12 @@ test('deactivating a user via the admin route revokes a device token issued to t
   const token = login.body.device_token;
   assert.ok(validateDeviceToken(db, token), 'token must be live right after issue');
 
+  // A second user's token is a control: deactivating `tech` below must not
+  // touch it.
+  const leadLogin = await call('POST', '/api/login', { username: 'lead', password: 'lead', wantDeviceToken: true });
+  const leadToken = leadLogin.body.device_token;
+  assert.ok(validateDeviceToken(db, leadToken), 'control token must be live right after issue');
+
   // Signing in as admin on the same call() re-authenticates that session
   // (login overwrites req.session.user), same as an admin taking over a
   // browser tab after a technician logged in from it.
@@ -152,5 +158,20 @@ test('deactivating a user via the admin route revokes a device token issued to t
   // No token-authed route exists yet (that's a later task), so the
   // end-to-end assertion stops at the function the route calls.
   assert.equal(validateDeviceToken(db, token), null, 'a deactivated user\'s token must stop validating');
+
+  // The assertion above passes even if the route's call to
+  // revokeUserTokens() were deleted entirely: validateDeviceToken() already
+  // gates on `active=1` in its own SQL, so a still-deactivated user's token
+  // reads as invalid regardless of whether the token row was ever deleted.
+  // Reactivating the user removes that gate, so only *this* second
+  // assertion actually depends on revokeUserTokens() having deleted the
+  // token row (rather than leaving it live for a stale, already-paired
+  // phone to keep using).
+  const reactivate = await call('PATCH', '/api/admin/users/1', { active: 1 });
+  assert.equal(reactivate.status, 200);
+  assert.equal(validateDeviceToken(db, token), null, 'a revoked token must not come back to life on reactivation');
+
+  // The control token was never touched by any of this.
+  assert.ok(validateDeviceToken(db, leadToken), "another user's token must survive an unrelated deactivation");
   server.close();
 });
