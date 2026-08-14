@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { openDb } from '../server/db.js';
 import { createUser } from '../server/auth.js';
+import { createApp } from '../server/index.js';
+import { seedDemoUsers } from '../server/seed.js';
 import { issueDeviceToken, validateDeviceToken, revokeUserTokens } from '../server/device-tokens.js';
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
@@ -91,4 +93,64 @@ test('expiry is 30 days from issue', () => {
   const delta = new Date(expires_at).getTime() - before;
   assert.ok(delta >= THIRTY_DAYS_MS, `expected at least 30 days out, got ${delta}ms`);
   assert.ok(delta <= THIRTY_DAYS_MS + (after - before) + 1000, `expected close to 30 days out, got ${delta}ms`);
+});
+
+// --- HTTP layer ---
+// The two functions above are exercised directly everywhere else in this
+// file; these tests exist to prove the two `if` branches in routes.js that
+// call them are actually wired up, following the boot()/call() pattern in
+// test/api.test.js.
+
+async function boot() {
+  const db = openDb(':memory:');
+  seedDemoUsers(db, { silent: true });
+  const app = createApp({ db });
+  const server = app.listen(0);
+  const port = server.address().port;
+  const base = `http://127.0.0.1:${port}`;
+  let cookie = '';
+  const call = async (method, path, body) => {
+    const res = await fetch(base + path, {
+      method,
+      headers: { 'content-type': 'application/json', ...(cookie ? { cookie } : {}) },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const set = res.headers.get('set-cookie');
+    if (set) cookie = set.split(';')[0];
+    return { status: res.status, body: await res.json().catch(() => null) };
+  };
+  return { db, server, call };
+}
+
+test('POST /api/login with wantDeviceToken issues a token; without it, the keys are absent', async () => {
+  const { server, call } = await boot();
+  const withToken = await call('POST', '/api/login', { username: 'tech', password: 'tech', wantDeviceToken: true });
+  assert.equal(withToken.status, 200);
+  assert.match(withToken.body.device_token, /^[0-9a-f]{64}$/);
+  assert.ok(withToken.body.device_token_expires_at);
+
+  const withoutToken = await call('POST', '/api/login', { username: 'lead', password: 'lead' });
+  assert.equal(withoutToken.status, 200);
+  assert.equal('device_token' in withoutToken.body, false);
+  assert.equal('device_token_expires_at' in withoutToken.body, false);
+  server.close();
+});
+
+test('deactivating a user via the admin route revokes a device token issued to them', async () => {
+  const { db, server, call } = await boot();
+  const login = await call('POST', '/api/login', { username: 'tech', password: 'tech', wantDeviceToken: true });
+  const token = login.body.device_token;
+  assert.ok(validateDeviceToken(db, token), 'token must be live right after issue');
+
+  // Signing in as admin on the same call() re-authenticates that session
+  // (login overwrites req.session.user), same as an admin taking over a
+  // browser tab after a technician logged in from it.
+  await call('POST', '/api/login', { username: 'admin', password: 'admin' });
+  const patch = await call('PATCH', '/api/admin/users/1', { active: 0 });
+  assert.equal(patch.status, 200);
+
+  // No token-authed route exists yet (that's a later task), so the
+  // end-to-end assertion stops at the function the route calls.
+  assert.equal(validateDeviceToken(db, token), null, 'a deactivated user\'s token must stop validating');
+  server.close();
 });

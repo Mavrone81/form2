@@ -26,6 +26,7 @@ export function issueDeviceToken(db, userId) {
 // been deactivated. password_hash is left out of the select, matching
 // authenticate()'s own safe shape in auth.js.
 export function validateDeviceToken(db, token) {
+  const hash = hashToken(token);
   const user = db.prepare(`
     select users.id, users.username, users.full_name, users.role, users.active, users.created_at
     from device_tokens
@@ -33,10 +34,10 @@ export function validateDeviceToken(db, token) {
     where device_tokens.token_hash = ?
       and device_tokens.expires_at > ?
       and users.active = 1
-  `).get(hashToken(token), new Date().toISOString());
+  `).get(hash, new Date().toISOString());
   if (!user) return null;
   db.prepare('update device_tokens set last_used_at = ? where token_hash = ?')
-    .run(new Date().toISOString(), hashToken(token));
+    .run(new Date().toISOString(), hash);
   return user;
 }
 
