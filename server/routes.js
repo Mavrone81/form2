@@ -7,7 +7,7 @@ import { buildGrid } from './grid-model.js';
 import { parseWorkbook } from './excel-parser.js';
 import { tasksInScope, scopeSummary } from './intervals.js';
 import { cellMapFor } from './cell-map.js';
-import { createSubmission, findByClientUuid, saveFields, signAndAdvance, rejectSubmission, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
+import { createSubmission, findByClientUuid, recoverFromDuplicateClientUuid, saveFields, signAndAdvance, rejectSubmission, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
 import { renderRecordPdf } from './pdf-record.js';
 import { createLoginThrottle } from './login-throttle.js';
 
@@ -99,22 +99,54 @@ function syncError(code, message) {
   return err;
 }
 
+// The generic message a device sees for anything that is not one of the
+// FORBIDDEN/NOT_FOUND/INVALID vocabulary's own (user-facing, deliberately
+// worded) messages. An uncoded throw can be anything from better-sqlite3's
+// own wording to a bug elsewhere in the request path -- it may name a
+// filesystem path or a SQL fragment -- and none of that belongs on a
+// device's screen. The real error is still logged server-side, with the
+// record's client_uuid, so it stays diagnosable.
+const SYNC_GENERIC_ERROR = 'This record could not be synced. Please try again.';
+
 // One record of a sync batch. Every failure -- a bad uuid, someone else's
 // uuid, an unknown form, an invalid answer, a bad signature -- is caught
 // HERE and turned into this record's own `error`, never allowed to escape
 // and abort the records after it: a phone replaying twenty offline records
 // must not lose the other nineteen because one had a stale formId.
 function syncOneRecord(db, user, record) {
-  const clientUuid = record?.client_uuid;
-  const out = { client_uuid: clientUuid, submissionId: null, state: null };
+  // The device's own casing is echoed straight back in `out` unchanged, so
+  // it always sees exactly what it sent -- normalization below is an
+  // internal lookup/storage detail, not something the caller needs to know
+  // about.
+  const rawUuid = record?.client_uuid;
+  const out = { client_uuid: rawUuid, submissionId: null, state: null };
   // Tracked outside the try so a failure partway through (e.g. an invalid
   // field value AFTER the submission was created-or-found) can still report
   // the id and state it reached, rather than the caller losing track of a
   // draft that genuinely exists and just needs a corrected retry.
   let sub = null;
   try {
-    if (typeof clientUuid !== 'string' || !UUID_RE.test(clientUuid)) {
+    if (typeof rawUuid !== 'string' || !UUID_RE.test(rawUuid)) {
       throw syncError('INVALID', 'client_uuid must be a UUID.');
+    }
+    // SQLite's default BINARY collation is case-sensitive, so "2FAE..." and
+    // "2fae..." are two different keys for what RFC 4122 (and any sane
+    // device) considers the SAME uuid. Left unnormalized, that let a replay
+    // with different casing create a SECOND submission for one job, and let
+    // one user reach ANOTHER user's record by upcasing its uuid past the
+    // FORBIDDEN check just below. Every lookup and every stored value from
+    // here on uses this single lowercased form.
+    const clientUuid = rawUuid.toLowerCase();
+
+    // `values` is optional (absent means no field changes this sync), but
+    // if present it must be a plain object -- an array, string or number
+    // here would reach saveFields' `Object.entries`/`hasOwnProperty` calls
+    // and either silently do nothing useful or throw a confusing,
+    // uncoded error. Caught here, before any create-or-find work, as its
+    // own clearly-worded INVALID.
+    const values = record?.values;
+    if (values !== undefined && (typeof values !== 'object' || values === null || Array.isArray(values))) {
+      throw syncError('INVALID', 'values must be an object of field values.');
     }
 
     sub = findByClientUuid(db, clientUuid);
@@ -132,13 +164,24 @@ function syncOneRecord(db, user, record) {
     if (!sub) {
       const form = db.prepare('select id from form_catalog where id=?').get(record?.formId);
       if (!form) throw syncError('NOT_FOUND', 'Form not found.');
-      sub = createSubmission(db, {
-        formId: record.formId,
-        userId: user.id,
-        machineId: record?.machineId ?? '',
-        frequency: record?.frequency ?? '',
-        clientUuid
-      });
+      try {
+        sub = createSubmission(db, {
+          formId: record.formId,
+          userId: user.id,
+          machineId: record?.machineId ?? '',
+          frequency: record?.frequency ?? '',
+          clientUuid
+        });
+      } catch (err) {
+        // See recoverFromDuplicateClientUuid (server/workflow.js) for why
+        // this exists even though this single process cannot race itself
+        // today: it recovers the row a genuinely concurrent winner already
+        // created, rather than surfacing a bare error for a record the
+        // database already has.
+        const recovered = recoverFromDuplicateClientUuid(db, err, clientUuid);
+        if (!recovered) throw err;
+        sub = recovered;
+      }
     }
 
     // Idempotent replay: a record already advanced past `draft` carries the
@@ -159,7 +202,7 @@ function syncOneRecord(db, user, record) {
     // on a records system any more than its camera is trusted for the
     // signature ink itself.
     if (sub.state === 'draft') {
-      saveFields(db, sub.id, record?.values ?? {}, user);
+      saveFields(db, sub.id, values ?? {}, user);
       sub = signAndAdvance(db, {
         submissionId: sub.id,
         user,
@@ -167,7 +210,17 @@ function syncOneRecord(db, user, record) {
       });
     }
   } catch (err) {
-    out.error = { code: err.code ?? 'ERROR', message: err.message };
+    // The FORBIDDEN/NOT_FOUND/INVALID vocabulary is written for a caller to
+    // read -- pass those messages through unchanged. Anything else is an
+    // internal failure (a SQLite message, a bug) that must never reach the
+    // device verbatim; log the real thing, with the uuid to correlate it
+    // against server logs, and answer with a fixed, generic message instead.
+    if (err.code === 'FORBIDDEN' || err.code === 'NOT_FOUND' || err.code === 'INVALID') {
+      out.error = { code: err.code, message: err.message };
+    } else {
+      console.error(`Sync: record ${rawUuid ?? '(missing client_uuid)'} failed:`, err);
+      out.error = { code: 'ERROR', message: SYNC_GENERIC_ERROR };
+    }
   }
   if (sub) { out.submissionId = sub.id; out.state = sub.state; }
   return out;
@@ -451,13 +504,19 @@ export function makeRoutes(db) {
     if (user.role !== 'technician') {
       return res.status(403).json({ error: 'Your role cannot sync records.' });
     }
-    const records = Array.isArray(req.body?.records) ? req.body.records : [];
-    // Every record is independent: syncOneRecord catches its own failures,
-    // so one bad record in a batch of twenty can never abort the other
-    // nineteen, and the batch itself always answers 200 -- per-record
-    // success or failure is carried in each result's own `error`, never in
-    // the HTTP status of the call as a whole.
-    res.json({ results: records.map((record) => syncOneRecord(db, user, record)) });
+    // A missing or malformed `records` is the WHOLE request being malformed,
+    // not a per-record problem -- answering 200 with an empty result set
+    // would read to a buggy client as "nothing to sync, safe to flush the
+    // offline queue," which is exactly backwards.
+    if (!Array.isArray(req.body?.records)) {
+      return res.status(400).json({ error: 'records must be an array.' });
+    }
+    // Every record is independent from here on: syncOneRecord catches its
+    // own failures, so one bad record in a batch of twenty can never abort
+    // the other nineteen, and the batch itself always answers 200 -- per-
+    // record success or failure is carried in each result's own `error`,
+    // never in the HTTP status of the call as a whole.
+    res.json({ results: req.body.records.map((record) => syncOneRecord(db, user, record)) });
   });
 
   r.post('/submissions', requireRole('technician'), (req, res) => {

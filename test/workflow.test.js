@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb } from '../server/db.js';
 import { createUser } from '../server/auth.js';
-import { createSubmission, signAndAdvance, queueFor, saveFields, assertCanEdit, completenessFor, rejectSubmission } from '../server/workflow.js';
+import { createSubmission, findByClientUuid, recoverFromDuplicateClientUuid, signAndAdvance, queueFor, saveFields, assertCanEdit, completenessFor, rejectSubmission } from '../server/workflow.js';
 
 const PNG = 'data:image/png;base64,iVBORw0KGgo=';
 
@@ -591,4 +591,116 @@ test('the constraint is read from the record own snapshot, not the live form', (
   saveFields(db, sub.id, { cal_54_result: 'Pass' }, tech);
   assert.equal(valueOf(db, sub.id, 'cal_54_result'), 'Pass');
   assert.throws(() => saveFields(db, sub.id, { cal_54_result: 'Yes' }, tech), /must be one of/);
+});
+
+// ---------------------------------------------------------------------------
+// Form readiness (a record may only be started against a mapped, ready xlsx)
+// ---------------------------------------------------------------------------
+// Without this check, POST /api/sync (or the browser's POST /api/submissions)
+// could start a SIGNED, approved-looking record against a form with no field
+// list at all -- checked in createSubmission itself, the one function every
+// caller creates a submission through, so neither route can bypass it.
+
+test('createSubmission refuses a needs_setup form', () => {
+  const db = openDb(':memory:');
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/needs-setup.xlsx','needs-setup.xlsx','xlsx','needs_setup')`).run();
+  const tech = createUser(db, { username: 't', password: 'p', fullName: 'Tech', role: 'technician' });
+  assert.throws(
+    () => createSubmission(db, { formId: 1, userId: tech.id }),
+    (err) => err.code === 'INVALID' && /not ready/i.test(err.message)
+  );
+  assert.equal(db.prepare('select count(*) n from submissions').get().n, 0);
+});
+
+test('createSubmission refuses an inactive form', () => {
+  const db = openDb(':memory:');
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/gone.xlsx','gone.xlsx','xlsx','inactive')`).run();
+  const tech = createUser(db, { username: 't', password: 'p', fullName: 'Tech', role: 'technician' });
+  assert.throws(
+    () => createSubmission(db, { formId: 1, userId: tech.id }),
+    (err) => err.code === 'INVALID'
+  );
+});
+
+test('createSubmission refuses a pdf form (no field list to snapshot)', () => {
+  const db = openDb(':memory:');
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/manual.pdf','manual.pdf','pdf','ready')`).run();
+  const tech = createUser(db, { username: 't', password: 'p', fullName: 'Tech', role: 'technician' });
+  assert.throws(
+    () => createSubmission(db, { formId: 1, userId: tech.id }),
+    (err) => err.code === 'INVALID'
+  );
+});
+
+test('createSubmission refuses a formId with no catalog row at all', () => {
+  const db = openDb(':memory:');
+  const tech = createUser(db, { username: 't', password: 'p', fullName: 'Tech', role: 'technician' });
+  assert.throws(
+    () => createSubmission(db, { formId: 999999, userId: tech.id }),
+    (err) => err.code === 'INVALID'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// recoverFromDuplicateClientUuid: closing the check-then-insert race window
+// ---------------------------------------------------------------------------
+// POST /api/sync (server/routes.js) checks findByClientUuid, finds nothing,
+// and only then calls createSubmission -- so two requests for a never-before-
+// seen client_uuid could both pass the check before either inserts, and the
+// loser's insert hits the idx_sub_uuid unique index. This process is
+// single-threaded and cannot race itself for real (see the comment on
+// recoverFromDuplicateClientUuid itself), so these tests exercise the two
+// pieces directly: that a duplicate clientUuid really does throw a
+// unique-constraint violation, and that the recovery helper turns that
+// specific violation back into the row that already exists.
+
+test('createSubmission throws a unique-constraint violation for a duplicate clientUuid', () => {
+  const db = openDb(':memory:');
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/f.xlsx','f.xlsx','xlsx','ready')`).run();
+  const tech = createUser(db, { username: 't', password: 'p', fullName: 'Tech', role: 'technician' });
+  const uuid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  createSubmission(db, { formId: 1, userId: tech.id, clientUuid: uuid });
+  assert.throws(
+    () => createSubmission(db, { formId: 1, userId: tech.id, clientUuid: uuid }),
+    (err) => err.code === 'SQLITE_CONSTRAINT_UNIQUE' || /UNIQUE constraint failed/i.test(err.message)
+  );
+});
+
+test('recoverFromDuplicateClientUuid returns the row that already exists for that uuid', () => {
+  const db = openDb(':memory:');
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/f.xlsx','f.xlsx','xlsx','ready')`).run();
+  const tech = createUser(db, { username: 't', password: 'p', fullName: 'Tech', role: 'technician' });
+  const uuid = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+  const original = createSubmission(db, { formId: 1, userId: tech.id, clientUuid: uuid });
+
+  let thrown;
+  try {
+    createSubmission(db, { formId: 1, userId: tech.id, clientUuid: uuid });
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown, 'the second insert must actually throw for this test to mean anything');
+
+  const recovered = recoverFromDuplicateClientUuid(db, thrown, uuid);
+  assert.ok(recovered);
+  assert.equal(recovered.id, original.id);
+  assert.equal(findByClientUuid(db, uuid).id, original.id, 'exactly one row must exist for this uuid');
+});
+
+test('recoverFromDuplicateClientUuid returns null for an unrelated error', () => {
+  const db = openDb(':memory:');
+  const err = new Error('some other failure entirely');
+  assert.equal(recoverFromDuplicateClientUuid(db, err, 'whatever-uuid'), null);
+});
+
+test('recoverFromDuplicateClientUuid returns null when no clientUuid was given', () => {
+  const db = openDb(':memory:');
+  const err = new Error('UNIQUE constraint failed: submissions.client_uuid');
+  err.code = 'SQLITE_CONSTRAINT_UNIQUE';
+  assert.equal(recoverFromDuplicateClientUuid(db, err, null), null);
 });

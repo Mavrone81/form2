@@ -86,6 +86,12 @@ test('happy path: one record creates a submission with fields, technician signat
     const sigs = db.prepare('select * from signatures where submission_id=?').all(r.submissionId);
     assert.equal(sigs.length, 1);
     assert.equal(sigs[0].stage, 'technician');
+    // signedAtDevice ('2020-01-01T00:00:00Z' in the request above) must be
+    // completely ignored: signed_at always comes from the SERVER clock, a
+    // device's clock being no more trusted here than it is for the browser
+    // sign-off path.
+    assert.notEqual(new Date(sigs[0].signed_at).getUTCFullYear(), 2020);
+    assert.ok(new Date(sigs[0].signed_at).getUTCFullYear() >= 2026);
   } finally {
     server.close();
   }
@@ -184,7 +190,7 @@ test('no auth at all is refused with 401', async () => {
   }
 });
 
-test('a signature that fails PNG validation is refused per-record', async () => {
+test('a signature that fails PNG validation is refused per-record, with a generic message (assertValidSignature throws uncoded)', async () => {
   const { db, server, call } = await boot();
   try {
     setupForm(db);
@@ -195,7 +201,13 @@ test('a signature that fails PNG validation is refused per-record', async () => 
     assert.equal(res.status, 200);
     const r = res.body.results[0];
     assert.ok(r.error);
-    assert.match(r.error.message, /signature/i);
+    // assertValidSignature (server/workflow.js) throws WITHOUT a `.code`, by
+    // design -- so this falls into the uncoded branch of the route's catch,
+    // which never relays the raw exception's own wording to a device. It
+    // must NOT read "please try again" as "your signature was fine" —
+    // that's covered by the code + submissionId/state assertions below.
+    assert.equal(r.error.code, 'ERROR');
+    assert.match(r.error.message, /try again/i);
     // The submission was still created (create-or-find happens before
     // signing), so it must be visible for the app to retry with a real
     // signature on the next sync.
@@ -319,6 +331,251 @@ test('a repeat sync of an already-advanced record reports its state with no erro
     assert.equal(sigs.length, 1);
     const value = db.prepare('select value from submission_fields where submission_id=? and field_key=?').get(submissionId, 'result');
     assert.equal(value.value, 'Pass');
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// client_uuid case normalization (Critical 1)
+// ---------------------------------------------------------------------------
+// SQLite's default BINARY collation is case-sensitive, so an unnormalized
+// lookup/store would treat "2fae..." and "2FAE..." as different keys for
+// what RFC 4122 (and any sane device) considers the same uuid.
+
+test('replaying a batch with the uuid upper-cased resolves to the SAME submission, exactly one signature', async () => {
+  const { db, server, call } = await boot();
+  try {
+    setupForm(db);
+    const { token } = issueDeviceToken(db, userId(db, 'tech'));
+    const uuid = randomUUID();
+
+    const first = await call('POST', '/api/sync', {
+      records: [{ client_uuid: uuid, formId: 1, values: { result: 'Pass' }, signaturePng: PNG }]
+    }, authHeader(token));
+    assert.equal(first.body.results[0].error, undefined);
+    const submissionId = first.body.results[0].submissionId;
+
+    const second = await call('POST', '/api/sync', {
+      records: [{ client_uuid: uuid.toUpperCase(), formId: 1, values: { result: 'Pass' }, signaturePng: PNG }]
+    }, authHeader(token));
+
+    assert.equal(second.status, 200);
+    const r = second.body.results[0];
+    assert.equal(r.error, undefined);
+    assert.equal(r.submissionId, submissionId, 'an upper-cased replay must resolve to the SAME submission');
+    assert.equal(r.state, 'pending_lead');
+    // The echoed client_uuid preserves whatever casing the caller sent.
+    assert.equal(r.client_uuid, uuid.toUpperCase());
+
+    const sigs = db.prepare('select * from signatures where submission_id=?').all(submissionId);
+    assert.equal(sigs.length, 1, 'must not produce a second signature for a case-shifted replay');
+    const rows = db.prepare('select count(*) n from submissions where client_uuid=?').get(uuid);
+    assert.equal(rows.n, 1, 'must not create a second submission for a case-shifted replay');
+  } finally {
+    server.close();
+  }
+});
+
+test('a cross-user probe using a case-shifted uuid is refused as FORBIDDEN, revealing nothing', async () => {
+  const { db, server, call } = await boot();
+  try {
+    setupForm(db);
+    const owner = userId(db, 'tech');
+    const stranger = createUser(db, { username: 'tech3', password: 'p', fullName: 'Tech Three', role: 'technician' });
+    const { token: ownerToken } = issueDeviceToken(db, owner);
+    const { token: strangerToken } = issueDeviceToken(db, stranger.id);
+    const uuid = randomUUID();
+
+    const created = await call('POST', '/api/sync', {
+      records: [{ client_uuid: uuid, formId: 1, values: { result: 'Pass' }, signaturePng: PNG }]
+    }, authHeader(ownerToken));
+    assert.equal(created.body.results[0].error, undefined);
+
+    // The stranger sends the SAME uuid, upcased -- exploiting a naive
+    // case-sensitive lookup would let this land as "not found" and be
+    // silently accepted as a brand-new record (or worse, collide once
+    // normalized elsewhere). It must be recognized as the owner's record and
+    // refused, exactly like the exact-case probe.
+    const res = await call('POST', '/api/sync', {
+      records: [{ client_uuid: uuid.toUpperCase(), formId: 1, values: { result: 'Fail' }, signaturePng: PNG }]
+    }, authHeader(strangerToken));
+
+    assert.equal(res.status, 200);
+    const r = res.body.results[0];
+    assert.ok(r.error);
+    assert.equal(r.error.code, 'FORBIDDEN');
+    assert.equal(r.submissionId, null);
+    assert.equal(r.state, null);
+
+    // Exactly one submission exists for this uuid -- the stranger's
+    // upcased probe must not have been treated as a distinct, new record.
+    const rows = db.prepare('select count(*) n from submissions where client_uuid=?').get(uuid);
+    assert.equal(rows.n, 1);
+    const sub = db.prepare('select * from submissions where client_uuid=?').get(uuid);
+    assert.equal(sub.created_by, owner);
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Form readiness (Important 2)
+// ---------------------------------------------------------------------------
+// createSubmission (server/workflow.js) now refuses to start a record
+// against a form that is not a ready, mapped xlsx -- checked in the one
+// function every caller creates a submission through, so POST /api/sync
+// cannot bypass the rule any more than the browser's POST /api/submissions
+// can.
+
+test('a record against a needs_setup form reports INVALID', async () => {
+  const { db, server, call } = await boot();
+  try {
+    db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+      values ('/needs-setup.xlsx','needs-setup.xlsx','xlsx','needs_setup')`).run();
+    const { id: formId } = db.prepare("select id from form_catalog where file_name='needs-setup.xlsx'").get();
+    const { token } = issueDeviceToken(db, userId(db, 'tech'));
+
+    const res = await call('POST', '/api/sync', {
+      records: [{ client_uuid: randomUUID(), formId, values: {}, signaturePng: PNG }]
+    }, authHeader(token));
+
+    assert.equal(res.status, 200);
+    const r = res.body.results[0];
+    assert.ok(r.error);
+    assert.equal(r.error.code, 'INVALID');
+    assert.match(r.error.message, /not ready/i);
+    assert.equal(r.submissionId, null);
+    assert.equal(db.prepare('select count(*) n from submissions').get().n, 0,
+      'no submission row must be left behind for a refused create');
+  } finally {
+    server.close();
+  }
+});
+
+test('a record against an inactive form reports INVALID', async () => {
+  const { db, server, call } = await boot();
+  try {
+    db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+      values ('/gone.xlsx','gone.xlsx','xlsx','inactive')`).run();
+    const { id: formId } = db.prepare("select id from form_catalog where file_name='gone.xlsx'").get();
+    const { token } = issueDeviceToken(db, userId(db, 'tech'));
+
+    const res = await call('POST', '/api/sync', {
+      records: [{ client_uuid: randomUUID(), formId, values: {}, signaturePng: PNG }]
+    }, authHeader(token));
+
+    assert.equal(res.status, 200);
+    const r = res.body.results[0];
+    assert.ok(r.error);
+    assert.equal(r.error.code, 'INVALID');
+    assert.equal(r.submissionId, null);
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// records validation (Minor 7)
+// ---------------------------------------------------------------------------
+
+test('a missing records field is a 400, not a silent empty 200', async () => {
+  const { db, server, call } = await boot();
+  try {
+    setupForm(db);
+    const { token } = issueDeviceToken(db, userId(db, 'tech'));
+    const res = await call('POST', '/api/sync', {}, authHeader(token));
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /records/i);
+  } finally {
+    server.close();
+  }
+});
+
+test('a non-array records field is a 400', async () => {
+  const { db, server, call } = await boot();
+  try {
+    setupForm(db);
+    const { token } = issueDeviceToken(db, userId(db, 'tech'));
+    const res = await call('POST', '/api/sync', { records: 'nope' }, authHeader(token));
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test('a record whose values is not a plain object is refused as INVALID, per-record, without calling saveFields', async () => {
+  const { db, server, call } = await boot();
+  try {
+    setupForm(db);
+    const { token } = issueDeviceToken(db, userId(db, 'tech'));
+    const res = await call('POST', '/api/sync', {
+      records: [
+        { client_uuid: randomUUID(), formId: 1, values: ['not', 'an', 'object'], signaturePng: PNG },
+        { client_uuid: randomUUID(), formId: 1, values: 'also not an object', signaturePng: PNG }
+      ]
+    }, authHeader(token));
+    assert.equal(res.status, 200);
+    for (const r of res.body.results) {
+      assert.ok(r.error);
+      assert.equal(r.error.code, 'INVALID');
+      assert.match(r.error.message, /values/i);
+      assert.equal(r.submissionId, null, 'a bad values shape must be caught before create-or-find');
+    }
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Half-applied replay (Minor 5)
+// ---------------------------------------------------------------------------
+
+test('a half-applied replay (draft with saved fields but no signature yet) is completed, not doubled, by a corrected retry', async () => {
+  const { db, server, call } = await boot();
+  try {
+    setupForm(db);
+    const { token } = issueDeviceToken(db, userId(db, 'tech'));
+    const uuid = randomUUID();
+
+    // First attempt: a bad signature. saveFields succeeds (it runs before
+    // signAndAdvance), but signAndAdvance throws, so the record is left
+    // sitting in `draft` with its fields already saved -- exactly the
+    // "half-applied sync" the interface calls out.
+    const firstAttempt = await call('POST', '/api/sync', {
+      records: [{ client_uuid: uuid, formId: 1, values: { result: 'Pass', remarks: 'first pass' }, signaturePng: 'not-a-png' }]
+    }, authHeader(token));
+    const firstResult = firstAttempt.body.results[0];
+    assert.ok(firstResult.error);
+    assert.equal(firstResult.state, 'draft');
+    const submissionId = firstResult.submissionId;
+    assert.ok(submissionId);
+    assert.equal(
+      db.prepare('select value from submission_fields where submission_id=? and field_key=?').get(submissionId, 'result').value,
+      'Pass'
+    );
+
+    // Retry with a corrected signature and a (deliberately) changed field
+    // value -- the retry's values must UPSERT over the half-applied save,
+    // not add to it, and the submission must finish exactly once.
+    const retry = await call('POST', '/api/sync', {
+      records: [{ client_uuid: uuid, formId: 1, values: { result: 'Fail', remarks: 'corrected' }, signaturePng: PNG }]
+    }, authHeader(token));
+    const retryResult = retry.body.results[0];
+    assert.equal(retryResult.error, undefined);
+    assert.equal(retryResult.submissionId, submissionId);
+    assert.equal(retryResult.state, 'pending_lead');
+
+    const fields = db.prepare('select field_key, value from submission_fields where submission_id=?').all(submissionId);
+    assert.equal(fields.length, 2, 'values are upserted, not duplicated');
+    assert.ok(fields.some((f) => f.field_key === 'result' && f.value === 'Fail'));
+    assert.ok(fields.some((f) => f.field_key === 'remarks' && f.value === 'corrected'));
+
+    const sigs = db.prepare('select * from signatures where submission_id=?').all(submissionId);
+    assert.equal(sigs.length, 1);
+
+    const rows = db.prepare('select count(*) n from submissions where client_uuid=?').get(uuid);
+    assert.equal(rows.n, 1);
   } finally {
     server.close();
   }

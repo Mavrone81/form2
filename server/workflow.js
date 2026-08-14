@@ -67,14 +67,33 @@ function assertStageOwnership(sub, user, messages) {
 
 export function createSubmission(db, { formId, userId, machineId = '', frequency = '', snapshot = null, clientUuid = null }) {
   const now = new Date().toISOString();
-  const fields = snapshot ??
-    db.prepare('select field_key, label, section, kind, options, sort_order from form_fields where form_id=? order by sort_order').all(formId);
   // The controlled document's identity is captured HERE, once, alongside the
   // field snapshot. The catalog row is a live mirror of a file that can be
   // revised, rescanned or deleted at any time; a record signed against Rev E
   // must keep saying Rev E forever, so the archival PDF reads these columns
   // and never the catalog (server/routes.js, the /pdf route).
-  const form = db.prepare('select doc_number, revision, content_hash from form_catalog where id=?').get(formId);
+  const form = db.prepare('select doc_number, revision, content_hash, state, file_type from form_catalog where id=?').get(formId);
+  // A record may only be started against a form an admin has actually
+  // mapped: `needs_setup` has no field list to snapshot at all, `inactive`
+  // is a form withdrawn from use, and a `pdf` form has no fields table
+  // entries by construction (server/scanner.js never populates one). Without
+  // this, any of those produced a SIGNED, approved-looking record with an
+  // empty field snapshot and no document identity — every rule downstream
+  // (saveFields, signAndAdvance, the PDF route) would run against it
+  // successfully, because none of them re-check the form's own state; they
+  // trust the submission that already exists. Checked HERE, in the one
+  // function every caller creates a submission through (POST /submissions
+  // for the browser, POST /api/sync for the device), so neither can bypass
+  // it. A missing formId and an existing-but-not-ready one are reported
+  // identically: from the caller's side both mean "you cannot start a record
+  // against this form right now."
+  if (!form || form.state !== 'ready' || form.file_type !== 'xlsx') {
+    const err = new Error('This form is not ready for records — it must be scanned and mapped by an admin first.');
+    err.code = 'INVALID';
+    throw err;
+  }
+  const fields = snapshot ??
+    db.prepare('select field_key, label, section, kind, options, sort_order from form_fields where form_id=? order by sort_order').all(formId);
   // `clientUuid` is the Android app's offline id for a record created before
   // it ever reached the server — see the client_uuid comment in
   // server/db.js. Null for every browser-created submission, which has no
@@ -96,6 +115,34 @@ export function createSubmission(db, { formId, userId, machineId = '', frequency
 // exactly like better-sqlite3's own `.get()`.
 export function findByClientUuid(db, clientUuid) {
   return db.prepare('select * from submissions where client_uuid=?').get(clientUuid);
+}
+
+// Closes the one race a check-then-insert pattern cannot close by itself:
+// POST /api/sync (server/routes.js) calls findByClientUuid, finds nothing,
+// and only THEN calls createSubmission — so two requests for the same
+// never-before-seen client_uuid can both pass the check before either has
+// inserted, and the loser's insert hits the `idx_sub_uuid` partial unique
+// index (server/db.js) and throws instead of succeeding.
+//
+// This server is a single Node process with one better-sqlite3 connection —
+// synchronous, one JS thread — so that interleaving cannot actually happen
+// here today; nothing in this codebase can race itself. It is handled anyway
+// because the same database file may one day sit behind more than one
+// process, and the failure mode if it isn't is bad: the LOSING request's
+// insert would surface as a bare, uncoded error, and a device that reads
+// that as "try again" would retry the exact same record forever, even
+// though the database already has it. The winner's row is the correct
+// answer for the loser to report right back, exactly as if it had never
+// tried to create anything and had found it on the very first check.
+//
+// Returns the pre-existing submission when `err` is that unique-constraint
+// violation and one truly exists for `clientUuid`; otherwise null, so the
+// caller knows to let the original error stand.
+export function recoverFromDuplicateClientUuid(db, err, clientUuid) {
+  const isUniqueViolation = err?.code === 'SQLITE_CONSTRAINT_UNIQUE'
+    || /UNIQUE constraint failed/i.test(err?.message ?? '');
+  if (!isUniqueViolation || !clientUuid) return null;
+  return findByClientUuid(db, clientUuid) ?? null;
 }
 
 // The whole point of this module is that no future HTTP route can bypass the
