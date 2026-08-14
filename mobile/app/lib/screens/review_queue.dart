@@ -20,7 +20,13 @@ import 'review_record.dart';
 /// empty state -- worded for whichever is actually true, offline or a
 /// server-side failure while online, never guessed.
 class ReviewQueueScreen extends StatefulWidget {
-  const ReviewQueueScreen({super.key, required this.api, required this.connectivity, this.onSignOut});
+  const ReviewQueueScreen({
+    super.key,
+    required this.api,
+    required this.connectivity,
+    this.onSignOut,
+    this.onAuthExpired,
+  });
 
   final ApiClient api;
   final ConnectivitySource connectivity;
@@ -29,6 +35,14 @@ class ReviewQueueScreen extends StatefulWidget {
   /// action. `null` (the default, and what every existing caller/test still
   /// passes) renders exactly as before -- no action, no behaviour change.
   final VoidCallback? onSignOut;
+
+  /// Invoked when the server answers 401 -- this screen's whole content
+  /// comes from session-authenticated calls, so a lost session means there
+  /// is nothing here to show or retry until the reviewer signs in again.
+  /// The shell wires this to its own "back to the login stage" transition
+  /// (see `AppShellState._onAuthExpired`); `null` leaves this screen simply
+  /// saying so, which is what a standalone test sees.
+  final VoidCallback? onAuthExpired;
 
   @override
   State<ReviewQueueScreen> createState() => ReviewQueueScreenState();
@@ -43,6 +57,14 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
   /// from an earlier, successful one -- the signal for the "as of last
   /// connection" banner. Cleared the moment a refresh succeeds again.
   bool _stale = false;
+
+  /// True once a [refresh] has come back 401. Distinct from [_stale]: a
+  /// stale list is still worth reading and will refresh itself the moment
+  /// the connection (or the server) recovers, whereas an expired session
+  /// recovers from nothing but a fresh sign-in -- so it gets its own,
+  /// actionable copy instead of "couldn't refresh", which would send a
+  /// reviewer pulling to refresh forever.
+  bool _authExpired = false;
 
   StreamSubscription<bool>? _sub;
 
@@ -71,19 +93,41 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
       setState(() {
         _rows = rows;
         _stale = false;
+        _authExpired = false;
         _loading = false;
       });
-    } catch (_) {
-      // A failed fetch -- offline, or the server refusing -- leaves [_rows]
-      // untouched: whatever was fetched last stays on screen, marked stale
-      // by the banner below, instead of being cleared to make room for an
-      // error dump.
+    } on ApiException catch (e) {
       if (!mounted) return;
-      setState(() {
-        _stale = _rows != null;
-        _loading = false;
-      });
+      // 401 is not "couldn't refresh": the credential itself is gone, and no
+      // amount of retrying from this screen will bring it back. It is
+      // branched out of the blanket catch below so the reviewer is told what
+      // is actually wrong -- and so the shell can take them somewhere they
+      // can fix it.
+      if (e.statusCode == 401) {
+        setState(() {
+          _authExpired = true;
+          _stale = false;
+          _loading = false;
+        });
+        widget.onAuthExpired?.call();
+        return;
+      }
+      _markStale();
+    } catch (_) {
+      // Anything else -- a timeout, a socket failure, a malformed body --
+      // leaves [_rows] untouched: whatever was fetched last stays on screen,
+      // marked stale by the banner below, instead of being cleared to make
+      // room for an error dump.
+      if (!mounted) return;
+      _markStale();
     }
+  }
+
+  void _markStale() {
+    setState(() {
+      _stale = _rows != null;
+      _loading = false;
+    });
   }
 
   Future<void> _open(int id) async {
@@ -139,10 +183,12 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
 
     if (rows == null) {
       // Never fetched successfully at all: nothing cached to fall back to.
-      // The copy branches on [_online] -- an ONLINE reviewer hit by, say, a
-      // server 500 must not be told they're offline (that sends them
-      // chasing the wrong problem); only a genuinely offline device gets
-      // the offline-specific copy.
+      // The copy branches on the actual cause -- an expired session first
+      // (nothing here can recover from that but signing in again), then on
+      // [_online], because an ONLINE reviewer hit by, say, a server 500 must
+      // not be told they're offline (that sends them chasing the wrong
+      // problem); only a genuinely offline device gets the offline-specific
+      // copy.
       return ListView(
         children: [
           Padding(
@@ -150,9 +196,11 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
             child: Column(
               children: [
                 Text(
-                  _online
-                      ? 'The queue could not be loaded. Pull to refresh to try again.'
-                      : "You're offline, and this queue has never loaded on this device.",
+                  _authExpired
+                      ? sessionExpiredMessage
+                      : _online
+                          ? 'The queue could not be loaded. Pull to refresh to try again.'
+                          : "You're offline, and this queue has never loaded on this device.",
                   textAlign: TextAlign.center,
                   style: const TextStyle(color: AppColors.mute, fontSize: 13),
                 ),
@@ -168,7 +216,7 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
     if (rows.isEmpty) {
       return ListView(
         children: [
-          if (_stale) _StaleBanner(online: _online),
+          if (_authExpired) const _SessionExpiredBanner() else if (_stale) _StaleBanner(online: _online),
           const Padding(
             padding: EdgeInsets.all(24),
             child: Text(
@@ -181,17 +229,46 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
       );
     }
 
+    // At most ONE banner is ever shown, and an expired session outranks a
+    // stale list: it is both the more actionable fact and the reason the
+    // list went stale in the first place.
+    final banner = _authExpired
+        ? const _SessionExpiredBanner()
+        : _stale
+            ? _StaleBanner(online: _online)
+            : null;
     return ListView.separated(
       padding: const EdgeInsets.all(12),
-      itemCount: rows.length + (_stale ? 1 : 0),
+      itemCount: rows.length + (banner != null ? 1 : 0),
       separatorBuilder: (context, index) => const SizedBox(height: 8),
       itemBuilder: (context, i) {
-        if (_stale) {
-          if (i == 0) return _StaleBanner(online: _online);
+        if (banner != null) {
+          if (i == 0) return banner;
           return _Row(row: Map<String, dynamic>.from(rows[i - 1] as Map), onTap: _open);
         }
         return _Row(row: Map<String, dynamic>.from(rows[i] as Map), onTap: _open);
       },
+    );
+  }
+}
+
+/// Shown in place of [_StaleBanner] when the last refresh came back 401 --
+/// the list on screen is not merely stale, it is the last thing this device
+/// will ever be shown until someone signs in again, and pulling to refresh
+/// cannot change that.
+class _SessionExpiredBanner extends StatelessWidget {
+  const _SessionExpiredBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: AppColors.tint, border: Border.all(color: AppColors.rule)),
+      child: const Text(
+        sessionExpiredMessage,
+        style: TextStyle(color: AppColors.stamp, fontSize: 12.5, fontWeight: FontWeight.w600),
+      ),
     );
   }
 }

@@ -232,13 +232,39 @@ class AppShellState extends State<AppShell> {
   }
 
   Future<void> _onLoginSuccess(LoginResult result) async {
+    final role = (result.user['role'] ?? '').toString();
+    // The login call always asks for a device token, because the role is not
+    // known until the response comes back -- but only a TECHNICIAN has any
+    // use for one. The two token-authed routes (`GET /bundle`, `POST /sync`)
+    // exist for the offline record queue, which no other role has; a lead,
+    // engineer or admin works exclusively through the session cookie. So a
+    // token minted for one of them is persisted nowhere and dropped from
+    // memory here, before it can be written to secure storage or attached to
+    // a single request: a reviewer's phone never holds a 30-day bearer
+    // credential it would never use, and the "sign out on a shared handset"
+    // story gets that much smaller.
+    //
+    // `clearDeviceToken` as well as simply not saving one: `save` leaves an
+    // already-stored token untouched when passed null (deliberately -- see
+    // its doc), so on a shared device a lead signing in after a technician
+    // would otherwise inherit the technician's token.
+    //
+    // The server row minted for that dropped token is left to die on its own
+    // 30-day expiry (and to be swept by the next `issueDeviceToken` for the
+    // same account -- see server/device-tokens.js). Nothing can use it in the
+    // meantime: the raw token exists only in the response this method just
+    // discarded.
+    final isTechnician = role == 'technician';
     await widget.session.save(
       user: result.user,
-      deviceToken: result.deviceToken,
-      deviceTokenExpiresAt: result.deviceTokenExpiresAt,
+      deviceToken: isTechnician ? result.deviceToken : null,
+      deviceTokenExpiresAt: isTechnician ? result.deviceTokenExpiresAt : null,
     );
+    if (!isTechnician) {
+      await widget.session.clearDeviceToken();
+      widget.api.setDeviceToken(null);
+    }
     _user = result.user;
-    final role = (result.user['role'] ?? '').toString();
     final username = (result.user['username'] ?? '').toString();
     if (role == 'technician' && await _needsPinSetup(username)) {
       setState(() => _stage = _Stage.pinSetup);
@@ -254,6 +280,14 @@ class AppShellState extends State<AppShell> {
       // technician home screen, never fatal to signing in (the brief: "on
       // each successful online login... failures non-fatal with a visible
       // notice").
+      //
+      // Deliberately NOT routed through [_onAuthExpired], unlike every other
+      // 401 in the app: this runs microseconds after a login the server
+      // itself just accepted, so bouncing straight back to the login screen
+      // would be a loop the technician cannot break out of. A 401 here is
+      // reported like any other refresh failure and the technician reaches
+      // their records; the next manual refresh (or queue replay) will route
+      // them properly if the credential really is gone.
       try {
         await refreshBundle(widget.api, widget.db);
         _bundleNotice = null;
@@ -291,6 +325,27 @@ class AppShellState extends State<AppShell> {
     _loginNotice = null;
     if (!mounted) return;
     setState(() => _stage = _Stage.login);
+  }
+
+  /// Somewhere in the app, a call the server should have honoured came back
+  /// 401: the browser-style session behind it is gone (server restart,
+  /// session expiry, an admin deactivating and reactivating the account).
+  /// The only way out is a fresh online sign-in, so the shell says so and
+  /// goes there directly, rather than leaving the screen that hit it to
+  /// retry a call that can only fail again.
+  ///
+  /// Emphatically NOT a sign-out: [SessionStore] (the stored user and the
+  /// device token) and the PIN both survive, as does every local record --
+  /// a technician holding unsynced work must never lose it because a cookie
+  /// aged out. Only the dead cookie jar is emptied, so the next sign-in
+  /// cannot replay it.
+  void _onAuthExpired() {
+    widget.api.clearCookies();
+    if (!mounted) return;
+    setState(() {
+      _stage = _Stage.login;
+      _loginNotice = sessionExpiredMessage;
+    });
   }
 
   /// The PIN gate's escape hatch: abandons the PIN attempt entirely and
@@ -359,11 +414,17 @@ class AppShellState extends State<AppShell> {
           username: username,
           userFullName: fullName,
           onSignOut: _signOut,
+          onAuthExpired: _onAuthExpired,
           bundleNotice: _bundleNotice,
         );
       case 'team_leader':
       case 'engineer':
-        return ReviewQueueScreen(api: widget.api, connectivity: widget.connectivity, onSignOut: _signOut);
+        return ReviewQueueScreen(
+          api: widget.api,
+          connectivity: widget.connectivity,
+          onSignOut: _signOut,
+          onAuthExpired: _onAuthExpired,
+        );
       case 'admin':
         return AdminNoticeScreen(onSignOut: _signOut);
       default:

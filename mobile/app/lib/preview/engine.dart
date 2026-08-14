@@ -319,8 +319,31 @@ class WebViewEngineTransport implements EngineTransport {
     // harness.js), and this avoids a second, pointless encode/decode of a
     // whole record -- including signature ink -- through a string argument.
     final payload = jsonEncode({'type': 'render', 'id': id, 'record': input});
+    // targetOrigin is deliberately "*", not `window.location.origin`.
+    //
+    // A mismatched targetOrigin does not fail loudly: the browser silently
+    // drops the message, harness.js never sees a render request, and the one
+    // observable symptom is this transport's Future never completing -- i.e.
+    // every preview turning into a 35-second timeout with no clue as to why.
+    // The harness is loaded from a Flutter asset over file:// (or an
+    // implementation-defined internal scheme), and what `location.origin`
+    // evaluates to there varies by WebView build -- "null", the empty
+    // string, or something the same page's own postMessage will not match --
+    // so pinning it is a coin flip that costs the whole feature when it
+    // loses.
+    //
+    // Nothing is given up by widening it. The security boundary is
+    // harness.js's own INBOUND sender check, not this argument: the harness
+    // ignores anything that is not the expected message shape, and it
+    // addresses its reply to `event.source` (this page), never broadcasting
+    // it. The page is a hidden, app-owned asset with no other frames and no
+    // remote content, so there is no third party in the room to overhear a
+    // "*" post in the first place.
+    //
+    // The real end-to-end check for this path stays the device pass -- this
+    // transport is not reachable from `flutter test` (see the class doc).
     await _controller!.runJavaScript(
-      'window.postMessage($payload, window.location.origin || "*");',
+      'window.postMessage($payload, "*");',
     );
     return completer.future;
   }
@@ -374,7 +397,15 @@ class PreviewEngine {
       // error. Wrapped rather than left to escape as a raw platform
       // exception, so the preview screen's single catch clause covers every
       // failure mode with the same "message + retry" treatment.
-      throw PreviewRenderException(e.toString());
+      //
+      // A StateError contributes its `message` rather than its toString():
+      // the two asset-load failures this transport raises are StateErrors
+      // whose messages are already written FOR the technician ("PDF engine
+      // asset missing from this build — reinstall the app / report this
+      // build."), and toString() would print them behind a "Bad state: "
+      // prefix that means nothing to anyone holding the phone. Every other
+      // error keeps toString(), which is all there is to say about it.
+      throw PreviewRenderException(e is StateError ? e.message : e.toString());
     }
 
     if (reply['type'] == 'error') {

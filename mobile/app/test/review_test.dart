@@ -499,4 +499,112 @@ void main() {
       },
     );
   });
+
+  // I2: a 401 is not a refresh failure and not an outage. The session behind
+  // every call this screen makes is gone, and nothing here can recover it --
+  // so it gets its own copy, and the shell gets told.
+  group('ReviewQueueScreen session expiry (I2)', () {
+    testWidgets('a 401 with no cache shows the session-expired copy, never the offline or server-failure copy',
+        (tester) async {
+      final api = _FakeApi()..queueError = ApiException(401, 'Sign in to continue.');
+      // Deliberately OFFLINE, to prove the 401 branch is chosen on the
+      // status code and not on connectivity: this is precisely the case
+      // that would otherwise show "You're offline".
+      final connectivity = _FakeConnectivity(false);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(home: ReviewQueueScreen(api: api, connectivity: connectivity)));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Session expired'), findsOneWidget);
+      expect(find.textContaining("You're offline"), findsNothing);
+      expect(find.textContaining('The queue could not be loaded'), findsNothing);
+    });
+
+    testWidgets('a 401 invokes onAuthExpired exactly once', (tester) async {
+      final api = _FakeApi()..queueError = ApiException(401, 'Sign in to continue.');
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+      var expiredCalls = 0;
+
+      await tester.pumpWidget(MaterialApp(
+        home: ReviewQueueScreen(
+          api: api,
+          connectivity: connectivity,
+          onAuthExpired: () => expiredCalls++,
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      expect(expiredCalls, 1);
+    });
+
+    testWidgets('a non-401 failure never routes to the auth path', (tester) async {
+      final api = _FakeApi()..queueError = ApiException(500, 'Internal error');
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+      var expiredCalls = 0;
+
+      await tester.pumpWidget(MaterialApp(
+        home: ReviewQueueScreen(
+          api: api,
+          connectivity: connectivity,
+          onAuthExpired: () => expiredCalls++,
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      expect(expiredCalls, 0);
+      expect(find.textContaining('Session expired'), findsNothing);
+      expect(find.textContaining('The queue could not be loaded'), findsOneWidget);
+    });
+
+    testWidgets('a 401 on a LATER refresh keeps the cached rows and swaps the stale banner for the expiry one',
+        (tester) async {
+      final api = _FakeApi()
+        ..queueRows = [
+          {'id': 1, 'doc_number': 'DOC-001', 'revision': 'A', 'machine_id': 'GEN-1', 'frequency': 'Y', 'state': 'pending_lead'},
+        ];
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(home: ReviewQueueScreen(api: api, connectivity: connectivity)));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('DOC-001'), findsOneWidget);
+
+      api.queueError = ApiException(401, 'Sign in to continue.');
+      final state = tester.state<ReviewQueueScreenState>(find.byType(ReviewQueueScreen));
+      await state.refresh();
+      await tester.pumpAndSettle();
+
+      // The list a reviewer was already reading is not snatched away...
+      expect(find.textContaining('DOC-001'), findsOneWidget);
+      // ...but they are told the one thing that is actually actionable, and
+      // not "couldn't refresh", which would have them pulling for ever.
+      expect(find.textContaining('Session expired'), findsOneWidget);
+      expect(find.textContaining("Couldn't refresh"), findsNothing);
+    });
+
+    testWidgets('a successful refresh after a 401 clears the expiry banner', (tester) async {
+      final api = _FakeApi()
+        ..queueRows = [
+          {'id': 1, 'doc_number': 'DOC-001', 'revision': 'A', 'machine_id': 'GEN-1', 'frequency': 'Y', 'state': 'pending_lead'},
+        ]
+        ..queueError = ApiException(401, 'Sign in to continue.');
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(home: ReviewQueueScreen(api: api, connectivity: connectivity)));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Session expired'), findsOneWidget);
+
+      api.queueError = null; // signed in again elsewhere
+      final state = tester.state<ReviewQueueScreenState>(find.byType(ReviewQueueScreen));
+      await state.refresh();
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Session expired'), findsNothing);
+      expect(find.textContaining('DOC-001'), findsOneWidget);
+    });
+  });
 }

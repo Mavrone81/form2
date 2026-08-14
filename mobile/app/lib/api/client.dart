@@ -18,6 +18,14 @@ class ApiException implements Exception {
   String toString() => 'ApiException($statusCode): $message';
 }
 
+/// The one wording the whole app uses when a call the server should have
+/// honoured comes back 401 -- shown on the screen that hit it, in the sync
+/// banner, and as the login screen's notice once the shell has routed there.
+/// Kept here, beside [ApiException] (where a 401 is actually born), so those
+/// three cannot drift into telling a technician three different things about
+/// the same event.
+const sessionExpiredMessage = 'Session expired — sign in again.';
+
 /// The result of a successful `POST /api/login`. `user` is every field the
 /// server returned except the two device-token fields, which are split out
 /// here so a caller never has to know the server flattens them into the

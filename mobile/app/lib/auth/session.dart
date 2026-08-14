@@ -45,6 +45,18 @@ class SessionStore {
 
   Future<String?> loadDeviceTokenExpiresAt() => _storage.read(_tokenExpiresKey);
 
+  /// Forgets ONLY the device token and its expiry, leaving the stored user
+  /// in place. This is what a non-technician sign-in does (see
+  /// `AppShellState._onLoginSuccess`): the server mints a token for whoever
+  /// asks, but only a technician has any use for one, so a lead's or
+  /// engineer's phone must not come away holding a long-lived bearer
+  /// credential -- including one a PREVIOUS technician left on this same
+  /// device, which [save] would otherwise leave untouched.
+  Future<void> clearDeviceToken() async {
+    await _storage.delete(_tokenKey);
+    await _storage.delete(_tokenExpiresKey);
+  }
+
   /// Full sign-out: forgets the user, the device token and its expiry.
   Future<void> clear() async {
     await _storage.delete(_userKey);

@@ -29,6 +29,7 @@ class _FakeApi extends ApiClient {
   _FakeApi() : super(baseUrl: 'http://localhost');
 
   List<dynamic> queueRows = const [];
+  Object? queueError;
 
   LoginResult? loginResult;
   Object? loginError;
@@ -46,14 +47,24 @@ class _FakeApi extends ApiClient {
   Map<String, SyncResult> syncResultsFor = const {};
 
   @override
-  Future<List<dynamic>> queue() async => queueRows;
+  Future<List<dynamic>> queue() async {
+    final err = queueError;
+    if (err != null) throw err;
+    return queueRows;
+  }
 
   @override
   Future<LoginResult> login(String username, String password, {bool wantDeviceToken = false}) async {
     loginCalls++;
     final err = loginError;
     if (err != null) throw err;
-    return loginResult!;
+    final result = loginResult!;
+    // Mirrors the real client, which adopts a minted token immediately (see
+    // ApiClient.login). Without this the "a non-technician's token is
+    // dropped" assertions below would pass on a client that never held one
+    // in the first place.
+    if (result.deviceToken != null) setDeviceToken(result.deviceToken);
+    return result;
   }
 
   @override
@@ -112,6 +123,20 @@ class _CountingSyncQueue extends SyncQueue {
   Future<SyncReplayResult> replay(ApiClient api, {bool Function(LocalRecord record)? include}) async {
     replayCalls++;
     return const SyncReplayResult.empty();
+  }
+}
+
+/// A queue whose whole-batch replay always fails -- the shape SyncQueue
+/// itself produces when the server refuses the batch outright (see its own
+/// doc: every record stays queued).
+class _FailingSyncQueue extends SyncQueue {
+  _FailingSyncQueue(super.db, this.error);
+
+  final Object error;
+
+  @override
+  Future<SyncReplayResult> replay(ApiClient api, {bool Function(LocalRecord record)? include}) async {
+    throw error;
   }
 }
 
@@ -613,6 +638,239 @@ void main() {
       expect(find.byType(TechnicianHomeScreen), findsOneWidget);
       expect(find.textContaining('Could not refresh forms'), findsOneWidget);
       expect(find.textContaining('Internal error'), findsOneWidget);
+    });
+  });
+
+  // I3: a whole-batch failure leaves every record queued, so the count alone
+  // says nothing about what happened. The reason belongs on screen.
+  group('SyncBanner whole-batch failure (I3)', () {
+    testWidgets('a server error shows its message inline, keeps the count, and never routes to auth', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      await db.insertRecord(_record('11111111-1111-4111-8111-111111111111', RecordStatus.queued));
+
+      final api = _FakeApi();
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+      var expiredCalls = 0;
+
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: SyncBanner(
+            db: db,
+            api: api,
+            syncQueue: _FailingSyncQueue(db, ApiException(500, 'Internal error')),
+            connectivity: connectivity,
+            username: 'tech1',
+            onAuthExpired: () => expiredCalls++,
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.state<SyncBannerState>(find.byType(SyncBanner)).syncNow();
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Sync failed: Internal error'), findsOneWidget);
+      expect(find.textContaining('1 records waiting to sync'), findsOneWidget);
+      expect(expiredCalls, 0);
+      // The record itself is untouched -- still queued, ready for the next try.
+      expect((await db.getRecord('11111111-1111-4111-8111-111111111111'))!.status, RecordStatus.queued);
+    });
+
+    testWidgets('a 401 routes through onAuthExpired and says so inline', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      await db.insertRecord(_record('11111111-1111-4111-8111-111111111111', RecordStatus.queued));
+
+      final api = _FakeApi();
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+      var expiredCalls = 0;
+
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: SyncBanner(
+            db: db,
+            api: api,
+            syncQueue: _FailingSyncQueue(db, ApiException(401, 'Invalid or expired device token.')),
+            connectivity: connectivity,
+            username: 'tech1',
+            onAuthExpired: () => expiredCalls++,
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.state<SyncBannerState>(find.byType(SyncBanner)).syncNow();
+      await tester.pumpAndSettle();
+
+      expect(expiredCalls, 1);
+      expect(find.textContaining('Session expired'), findsOneWidget);
+      expect(find.textContaining('1 records waiting to sync'), findsOneWidget);
+    });
+
+    testWidgets('a timeout shows the timeout copy, not a bare failure', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      await db.insertRecord(_record('11111111-1111-4111-8111-111111111111', RecordStatus.queued));
+
+      final api = _FakeApi();
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: SyncBanner(
+            db: db,
+            api: api,
+            // Exactly what ApiClient turns a TimeoutException into.
+            syncQueue: _FailingSyncQueue(db, ApiException(0, 'The request timed out. Check your connection and try again.')),
+            connectivity: connectivity,
+            username: 'tech1',
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.state<SyncBannerState>(find.byType(SyncBanner)).syncNow();
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Sync failed: The request timed out'), findsOneWidget);
+    });
+  });
+
+  group('AppShell session expiry (I2)', () {
+    testWidgets('a 401 from the review queue lands the reviewer back on login, with the reason', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final storage = InMemorySecureStorage();
+      final session = SessionStore(storage);
+      await session.save(user: _user(role: 'team_leader', username: 'lead1', fullName: 'Lead One'));
+      final pin = PinLock(storage);
+      final api = _FakeApi()..queueError = ApiException(401, 'Sign in to continue.');
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(ReviewQueueScreen), findsNothing);
+      expect(find.byType(LoginScreen), findsOneWidget);
+      expect(find.textContaining('Session expired'), findsOneWidget);
+    });
+
+    testWidgets('an expired session is not a sign-out: the PIN and local records survive', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      const uuid = '66666666-6666-4666-8666-666666666666';
+      await db.insertRecord(_record(uuid, RecordStatus.draft));
+      await db.setRecordOwner(uuid, 'tech1');
+
+      final storage = InMemorySecureStorage();
+      final session = SessionStore(storage);
+      await session.save(user: _user(role: 'team_leader', username: 'lead1', fullName: 'Lead One'));
+      final pin = PinLock(storage);
+      await pin.setPin('1234', owner: 'tech1');
+      final api = _FakeApi()..queueError = ApiException(401, 'Sign in to continue.');
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(LoginScreen), findsOneWidget);
+      expect(await pin.hasPin(), isTrue);
+      expect(await db.getRecord(uuid), isNotNull);
+    });
+  });
+
+  // I6a: the login call always asks for a device token (the role is unknown
+  // until the response), but only a technician can use one -- the two
+  // token-authed routes are the bundle and the offline sync queue.
+  group('AppShell device-token scope by role (I6a)', () {
+    testWidgets('a technician login stores the minted token', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final storage = InMemorySecureStorage();
+      final session = SessionStore(storage);
+      final pin = PinLock(storage);
+      final api = _FakeApi()
+        ..loginResult = LoginResult(
+          user: _user(role: 'technician'),
+          deviceToken: 'tok-tech',
+          deviceTokenExpiresAt: DateTime.now().add(const Duration(days: 30)).toIso8601String(),
+        );
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.widgetWithText(TextField, 'Username'), 'tech1');
+      await tester.enterText(find.widgetWithText(TextField, 'Password'), 'secret');
+      await tester.tap(find.widgetWithText(FilledButton, 'Sign in'));
+      await tester.pumpAndSettle();
+
+      // First-time PIN setup runs before home; the token is already stored
+      // by then (it is persisted at login, not at PIN setup).
+      expect(find.byType(PinSetupScreen), findsOneWidget);
+      expect(await session.loadDeviceToken(), 'tok-tech');
+      expect(api.deviceToken, 'tok-tech');
+    });
+
+    testWidgets('a team-leader login persists no token and drops it from the client immediately', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final storage = InMemorySecureStorage();
+      final session = SessionStore(storage);
+      // A shared device: a technician was signed in here before, and their
+      // token is still in storage. SessionStore.save deliberately leaves an
+      // existing token alone when passed null, so this is exactly the case
+      // that needs clearing outright rather than merely "not saving".
+      await session.save(
+        user: _user(role: 'technician'),
+        deviceToken: 'previous-tech-token',
+        deviceTokenExpiresAt: DateTime.now().add(const Duration(days: 30)).toIso8601String(),
+      );
+      final pin = PinLock(storage);
+      await pin.setPin('1234', owner: 'tech1');
+      final api = _FakeApi()
+        ..loginResult = LoginResult(
+          user: _user(role: 'team_leader', username: 'lead1', fullName: 'Lead One'),
+          deviceToken: 'tok-lead',
+          deviceTokenExpiresAt: DateTime.now().add(const Duration(days: 30)).toIso8601String(),
+        );
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
+      ));
+      await tester.pumpAndSettle();
+
+      // The technician's PIN gate is on screen; the lead takes the password
+      // escape hatch, exactly as they would on a borrowed handset.
+      expect(find.byType(PinGateScreen), findsOneWidget);
+      await tester.tap(find.widgetWithText(TextButton, 'Sign in with password instead'));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.widgetWithText(TextField, 'Username'), 'lead1');
+      await tester.enterText(find.widgetWithText(TextField, 'Password'), 'secret');
+      await tester.tap(find.widgetWithText(FilledButton, 'Sign in'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(ReviewQueueScreen), findsOneWidget);
+      expect(await session.loadDeviceToken(), isNull,
+          reason: 'a non-technician must never leave a bearer token in secure storage -- not even an inherited one');
+      expect(await session.loadDeviceTokenExpiresAt(), isNull);
+      expect(api.deviceToken, isNull, reason: 'the minted token must be dropped from the client too, unused');
     });
   });
 

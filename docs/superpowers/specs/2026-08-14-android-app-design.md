@@ -54,9 +54,23 @@ bytes: fidelity to the controlled documents is preserved by construction, not
 re-implemented on a second platform.
 
 The engine consumes the same inputs the server route assembles (grid, cell
-map, values, signatures), which the bundle provides per form. If the embedded
-engine ever fails on a device, the app falls back to the server-rendered PDF
-when online and says plainly that preview needs a connection when not.
+map, values, signatures), which the bundle provides per form.
+
+If the embedded engine ever fails on a device, what the app can offer depends
+entirely on whether the record has been synced yet:
+
+- **An unsynced record exists nowhere but that phone.** The on-device engine
+  is therefore its *only* possible renderer — there is no server copy to fall
+  back to, online or not. When the engine fails, the app says so plainly, with
+  the engine's own message and a retry, and the record's data remains safe and
+  still queued to sync. A preview failure is never allowed to look like data
+  loss, and the app never suggests a connection would fix it.
+- **A synced record is also held by the server**, whose archival PDF is
+  produced by the very renderer the on-device engine is a build of. For those
+  records the preview screen offers "View server copy" when the device is
+  online — a real second source, not a re-render. (This is what
+  `GET /api/submissions/:id/pdf` allowing a technician to read their *own*
+  record, in any state, exists to make possible.)
 
 ## Authentication on the device
 

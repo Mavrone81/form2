@@ -3,9 +3,19 @@ import 'package:sqflite/sqflite.dart';
 import 'models.dart';
 
 /// SQLite-backed local storage for the offline-first app: the cached form
-/// `bundle` (one row per form, replaced wholesale on every successful
-/// `GET /bundle`) and the `records` queue (one row per technician-filled
-/// record, from first draft through terminal `synced`/`error`).
+/// `bundle` (one row per form) and the `records` queue (one row per
+/// technician-filled record, from first draft through terminal
+/// `synced`/`error`).
+///
+/// The bundle is replaced wholesale on every successful `GET /bundle` --
+/// see [replaceBundle], which upserts the fetched forms AND deletes the rows
+/// for forms the server no longer offers, in one transaction. That deletion
+/// is the point: a form withdrawn, made `inactive`, or unmapped server-side
+/// used to linger on the device for ever, still offered to a technician as
+/// something to start a record against. Records are a separate table and are
+/// never touched by it -- a draft against a form that has since disappeared
+/// survives intact; it simply cannot be joined to a form definition any
+/// more, and no NEW record can be started against one.
 ///
 /// The [DatabaseFactory] and [path] are both constructor parameters, never
 /// hard-coded, specifically so tests can point this at
@@ -112,6 +122,51 @@ class LocalDb {
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
+  }
+
+  /// Makes the cached bundle exactly match one `GET /bundle` response, in a
+  /// single transaction: every form in [jsonByFormId] is upserted (same
+  /// semantics as [upsertBundle]), and every bundle row whose `form_id` is
+  /// neither in it nor in [keep] is deleted.
+  ///
+  /// [keep] is for the server's own `skipped` list -- a form whose file the
+  /// server could not read this time is NOT gone, it is temporarily
+  /// unreadable, and dropping the copy this device already has (the only
+  /// copy it has) over a transient server-side file problem would take a
+  /// form away from a technician for no reason. Those ids are therefore
+  /// spared without being refreshed.
+  ///
+  /// An empty [jsonByFormId] and [keep] deletes everything: a server that
+  /// genuinely offers no ready forms is a real answer, and the device
+  /// showing forms the server has withdrawn is exactly the state this
+  /// replaces. (A failed fetch never gets here at all -- `refreshBundle`
+  /// throws before calling this, leaving the cache untouched.)
+  Future<void> replaceBundle(
+    Map<int, String> jsonByFormId, {
+    Set<int> keep = const {},
+    DateTime? fetchedAt,
+  }) async {
+    final db = await _database;
+    final stamp = (fetchedAt ?? DateTime.now()).toIso8601String();
+    final keepIds = <int>{...jsonByFormId.keys, ...keep}.toList();
+    await db.transaction((txn) async {
+      for (final entry in jsonByFormId.entries) {
+        await txn.insert(
+          'bundle',
+          {'form_id': entry.key, 'json': entry.value, 'fetched_at': stamp},
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      if (keepIds.isEmpty) {
+        await txn.delete('bundle');
+      } else {
+        // Built from the ids' own count, and every id bound as a parameter --
+        // never interpolated -- so this stays a parameterised statement no
+        // matter what the server sent.
+        final placeholders = List.filled(keepIds.length, '?').join(',');
+        await txn.delete('bundle', where: 'form_id NOT IN ($placeholders)', whereArgs: keepIds);
+      }
+    });
   }
 
   Future<Map<String, Object?>?> getBundle(int formId) async {

@@ -29,6 +29,7 @@ class TechnicianHomeScreen extends StatefulWidget {
     required this.username,
     required this.userFullName,
     this.onSignOut,
+    this.onAuthExpired,
     this.bundleNotice,
   });
 
@@ -39,6 +40,12 @@ class TechnicianHomeScreen extends StatefulWidget {
   final String username;
   final String userFullName;
   final VoidCallback? onSignOut;
+
+  /// Invoked when a call from this screen (the manual forms refresh, or the
+  /// sync banner's replay) is refused with 401 -- the shell routes to the
+  /// login stage, keeping the PIN and every local record. `null` (a
+  /// standalone test) leaves the failure shown inline and nothing else.
+  final VoidCallback? onAuthExpired;
 
   /// A one-shot notice from the login flow's own bundle refresh (e.g. "could
   /// not refresh forms: `server message here`") -- shown once, then cleared
@@ -136,12 +143,24 @@ class TechnicianHomeScreenState extends State<TechnicianHomeScreen> {
   Future<void> _refreshBundle() async {
     if (!_online || _refreshingBundle) return;
     setState(() => _refreshingBundle = true);
+    var authExpired = false;
     try {
       final result = await refreshBundle(widget.api, widget.db);
       _bundleNotice = result.skippedCount > 0 ? '${result.skippedCount} form(s) could not be refreshed.' : null;
+    } on ApiException catch (e) {
+      // 401 means this device's credential is gone -- pressing refresh again
+      // can only fail again, so it is branched out and handed to the shell
+      // rather than reported as one more "could not refresh forms".
+      if (e.statusCode == 401) {
+        authExpired = true;
+        _bundleNotice = sessionExpiredMessage;
+      } else {
+        _bundleNotice = 'Could not refresh forms: ${e.message}';
+      }
     } catch (e) {
-      _bundleNotice = 'Could not refresh forms: ${e is ApiException ? e.message : e.toString()}';
+      _bundleNotice = 'Could not refresh forms: $e';
     }
+    if (authExpired) widget.onAuthExpired?.call();
     await _load();
     if (!mounted) return;
     setState(() => _refreshingBundle = false);
@@ -212,6 +231,7 @@ class TechnicianHomeScreenState extends State<TechnicianHomeScreen> {
               syncQueue: widget.syncQueue,
               connectivity: widget.connectivity,
               username: widget.username,
+              onAuthExpired: widget.onAuthExpired,
             ),
             if (_bundleNotice != null)
               _Notice(text: _bundleNotice!, onDismiss: () => setState(() => _bundleNotice = null)),

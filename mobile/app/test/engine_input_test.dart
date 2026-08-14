@@ -336,6 +336,41 @@ void main() {
       expect(result, bytes);
     });
 
+    // M4: the two asset-load failures WebViewEngineTransport raises are
+    // StateErrors whose messages are already written for the technician
+    // holding the phone. toString() would print them behind Dart's "Bad
+    // state: " prefix, which means nothing to that reader.
+    test('a StateError from the transport surfaces its own message, without the "Bad state:" prefix', () async {
+      const written = 'PDF engine asset missing from this build — reinstall the app / report this build.';
+      final engine = PreviewEngine(transport: _ThrowingTransport(StateError(written)));
+      await expectLater(
+        engine.render(
+          bundleForm: _bundleForm(),
+          record: _draftRecord(),
+          userFullName: 'Alex Tech',
+        ),
+        throwsA(isA<PreviewRenderException>().having((e) => e.message, 'message', written)),
+      );
+    });
+
+    test('any other error keeps its toString() -- only StateError is unwrapped', () async {
+      final engine = PreviewEngine(transport: _ThrowingTransport(const FormatException('bad json')));
+      await expectLater(
+        engine.render(
+          bundleForm: _bundleForm(),
+          record: _draftRecord(),
+          userFullName: 'Alex Tech',
+        ),
+        throwsA(
+          isA<PreviewRenderException>().having(
+            (e) => e.message,
+            'message',
+            const FormatException('bad json').toString(),
+          ),
+        ),
+      );
+    });
+
     test('throws PreviewRenderException for a reply that is neither rendered nor error', () async {
       final engine = PreviewEngine(
         transport: _RawReplyTransport({'type': 'huh'}),
@@ -421,6 +456,18 @@ class _SuccessTransport implements EngineTransport {
     'pdf': base64Pdf,
     'bytes': base64Pdf.length,
   };
+}
+
+/// A transport that fails the way the real one does when the harness page
+/// (or the engine script inside it) is missing from the build: by throwing,
+/// not by replying.
+class _ThrowingTransport implements EngineTransport {
+  _ThrowingTransport(this.error);
+  final Object error;
+
+  @override
+  Future<Map<String, dynamic>> render(Map<String, dynamic> input) async =>
+      throw error;
 }
 
 class _RawReplyTransport implements EngineTransport {

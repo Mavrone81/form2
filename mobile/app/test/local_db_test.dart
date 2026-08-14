@@ -83,6 +83,71 @@ void main() {
     });
   });
 
+  // I5: the bundle is a full snapshot of what the server offers, so applying
+  // one must also remove what it no longer does -- otherwise a withdrawn or
+  // unmapped form lives on this device for ever and keeps being offered as
+  // something to start a record against.
+  group('LocalDb replaceBundle (I5 pruning)', () {
+    test('upserts the fetched forms and deletes the ones no longer offered', () async {
+      final db = _newDb();
+      addTearDown(db.close);
+      await db.upsertBundle(1, jsonEncode({'v': 'old'}));
+      await db.upsertBundle(2, jsonEncode({'v': 'gone'}));
+
+      await db.replaceBundle({
+        1: jsonEncode({'v': 'new'}),
+        3: jsonEncode({'v': 'fresh'}),
+      }, fetchedAt: DateTime.utc(2026, 8, 14));
+
+      expect(jsonDecode((await db.getBundle(1))!['json'] as String), {'v': 'new'});
+      expect(await db.getBundle(2), isNull, reason: 'a form absent from the fetch must be dropped');
+      expect(jsonDecode((await db.getBundle(3))!['json'] as String), {'v': 'fresh'});
+      expect(await db.getAllBundles(), hasLength(2));
+      expect((await db.getBundle(1))!['fetched_at'], DateTime.utc(2026, 8, 14).toIso8601String());
+    });
+
+    test('a kept id (the server`s own `skipped`) survives without being refreshed', () async {
+      final db = _newDb();
+      addTearDown(db.close);
+      await db.upsertBundle(1, jsonEncode({'v': 'cached'}), fetchedAt: DateTime.utc(2026, 1, 1));
+
+      await db.replaceBundle(const {}, keep: {1}, fetchedAt: DateTime.utc(2026, 8, 14));
+
+      final row = await db.getBundle(1);
+      expect(row, isNotNull, reason: 'a form the server merely could not READ must not be deleted');
+      expect(jsonDecode(row!['json'] as String), {'v': 'cached'});
+      expect(row['fetched_at'], DateTime.utc(2026, 1, 1).toIso8601String(),
+          reason: 'a kept form is not re-stamped -- it was not actually refreshed');
+    });
+
+    test('an empty payload with nothing to keep clears the cache', () async {
+      final db = _newDb();
+      addTearDown(db.close);
+      await db.upsertBundle(1, jsonEncode({'v': 1}));
+      await db.upsertBundle(2, jsonEncode({'v': 2}));
+
+      await db.replaceBundle(const {});
+
+      expect(await db.getAllBundles(), isEmpty);
+    });
+
+    test('records are never touched by a bundle replacement -- a draft for a dropped form survives', () async {
+      final db = _newDb();
+      addTearDown(db.close);
+      await db.upsertBundle(5, jsonEncode({'v': 'about to vanish'}));
+      await db.insertRecord(_draftRecord(formId: 5));
+
+      await db.replaceBundle({7: jsonEncode({'v': 'the only form now'})});
+
+      expect(await db.getBundle(5), isNull);
+      final record = await db.getRecord('11111111-1111-4111-8111-111111111111');
+      expect(record, isNotNull,
+          reason: 'a technician`s own work is never collateral of a form being withdrawn');
+      expect(record!.formId, 5);
+      expect(record.status, RecordStatus.draft);
+    });
+  });
+
   group('LocalDb records CRUD', () {
     test('insertRecord then getRecord round-trips every field', () async {
       final db = _newDb();
