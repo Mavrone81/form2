@@ -64,6 +64,22 @@ class LocalDb {
               error TEXT
             )
           ''');
+          // Records a record's creating username, purely device-local -- never
+          // sent to the server (a record's sync payload is exactly
+          // `LocalRecord.toSyncRecord()`, which does not include this). This
+          // is what lets a shared device tell "my queued records" from
+          // "the previous technician's queued records" apart once a
+          // different username signs in: see [getRecordOwner] /
+          // [setRecordOwner] / [getRecordsByStatusOwnedBy]. A row with no
+          // entry here (older data, or a record inserted before this table
+          // existed) is treated as unowned -- visible/syncable under any
+          // signed-in technician -- rather than orphaned.
+          await db.execute('''
+            CREATE TABLE record_owners (
+              client_uuid TEXT PRIMARY KEY,
+              username TEXT NOT NULL
+            )
+          ''');
         },
       ),
     );
@@ -219,5 +235,58 @@ class LocalDb {
     if (!isValidRecordTransition(from, to)) {
       throw InvalidRecordTransition(from, to, clientUuid);
     }
+  }
+
+  // -------------------------------------------------------------------
+  // record ownership (device-local only; see the `record_owners` doc above)
+  // -------------------------------------------------------------------
+
+  Future<void> setRecordOwner(String clientUuid, String username) async {
+    final db = await _database;
+    await db.insert(
+      'record_owners',
+      {'client_uuid': clientUuid, 'username': username},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<String?> getRecordOwner(String clientUuid) async {
+    final db = await _database;
+    final rows = await db.query('record_owners', where: 'client_uuid = ?', whereArgs: [clientUuid], limit: 1);
+    return rows.isEmpty ? null : rows.first['username'] as String?;
+  }
+
+  /// Every [status] record either unowned (no `record_owners` row -- legacy
+  /// or pre-ownership data) or owned by [username] -- i.e. every record
+  /// [username] may safely view, edit, or sync. A record owned by a
+  /// DIFFERENT username is excluded: it stays in `records` untouched
+  /// (nothing here mutates it), simply invisible to this query, so it can
+  /// neither be replayed to the server under the wrong device token nor
+  /// edited by the wrong technician.
+  Future<List<LocalRecord>> getRecordsByStatusOwnedBy(RecordStatus status, String username) async {
+    final rows = await getRecordsByStatus(status);
+    final result = <LocalRecord>[];
+    for (final r in rows) {
+      final owner = await getRecordOwner(r.clientUuid);
+      if (owner == null || owner == username) result.add(r);
+    }
+    return result;
+  }
+
+  Future<List<LocalRecord>> getQueuedRecordsOwnedBy(String username) =>
+      getRecordsByStatusOwnedBy(RecordStatus.queued, username);
+
+  /// Every record on this device (any status) NOT owned by [username] --
+  /// i.e. left behind by a previously signed-in technician. Used to show a
+  /// "N records belong to another technician" notice; never used to decide
+  /// what to sync (see [getQueuedRecordsOwnedBy] for that).
+  Future<int> countRecordsOwnedByOthers(String username) async {
+    final all = await getAllRecords();
+    var count = 0;
+    for (final r in all) {
+      final owner = await getRecordOwner(r.clientUuid);
+      if (owner != null && owner != username) count++;
+    }
+    return count;
   }
 }

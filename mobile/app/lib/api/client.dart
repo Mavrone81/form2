@@ -190,6 +190,19 @@ class ApiClient {
     return LoginResult(user: body, deviceToken: token, deviceTokenExpiresAt: expiresAt);
   }
 
+  /// Best-effort server-side sign-out: destroys the session this client's
+  /// cookie jar is holding. Deliberately does NOT touch [_deviceToken] --
+  /// that is a separate credential the device keeps for its own later
+  /// syncing, and this call has no opinion on it; a caller that wants the
+  /// token forgotten too (a full local sign-out) clears [SessionStore] and
+  /// calls [setDeviceToken] `null` itself, same as sign-in never assumes a
+  /// server round trip either.
+  Future<void> logout() async {
+    final response = await _client.post(_uri('/logout'), headers: _headers());
+    _captureCookies(response);
+    _decodeOrThrow(response);
+  }
+
   Future<Map<String, dynamic>> bundle() async {
     final response = await _client.get(_uri('/bundle'), headers: _headers());
     _captureCookies(response);

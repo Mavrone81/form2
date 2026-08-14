@@ -20,10 +20,15 @@ import 'review_record.dart';
 /// empty state -- worded for whichever is actually true, offline or a
 /// server-side failure while online, never guessed.
 class ReviewQueueScreen extends StatefulWidget {
-  const ReviewQueueScreen({super.key, required this.api, required this.connectivity});
+  const ReviewQueueScreen({super.key, required this.api, required this.connectivity, this.onSignOut});
 
   final ApiClient api;
   final ConnectivitySource connectivity;
+
+  /// Optional sign-out affordance for the app shell to wire in as an AppBar
+  /// action. `null` (the default, and what every existing caller/test still
+  /// passes) renders exactly as before -- no action, no behaviour change.
+  final VoidCallback? onSignOut;
 
   @override
   State<ReviewQueueScreen> createState() => ReviewQueueScreenState();
@@ -112,6 +117,12 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
             const Padding(
               padding: EdgeInsets.only(right: 16),
               child: Center(child: Text('Offline', style: TextStyle(color: AppColors.paper, fontSize: 12.5))),
+            ),
+          if (widget.onSignOut != null)
+            IconButton(
+              icon: const Icon(Icons.logout),
+              tooltip: 'Sign out',
+              onPressed: widget.onSignOut,
             ),
         ],
       ),

@@ -101,6 +101,17 @@ class PinLock {
   static const _hashKey = 'pin_hash';
   static const _saltKey = 'pin_salt';
 
+  /// Which signed-in username this device's current PIN belongs to --
+  /// bookkeeping only, no bearing on [verify] itself (the hash/salt above
+  /// are the entire gate). Exists so the app shell can tell "the PIN
+  /// already set on this device is still this technician's own" apart from
+  /// "a PREVIOUS technician's PIN is still sitting here, and this newly
+  /// logged-in technician has never set one of their own" -- the latter
+  /// must force a fresh [setPin], never silently reuse the old hash a
+  /// different person's password can't possibly reproduce. See
+  /// `main.dart`'s `AppShellState._onLoginSuccess`.
+  static const _ownerKey = 'pin_owner_username';
+
   /// Single key for the whole attempt/lockout unit -- see [_AttemptState].
   /// Deliberately new (nothing has shipped yet), so there is no legacy
   /// split-key state to migrate; any old `pin_fail_count` /
@@ -154,7 +165,12 @@ class PinLock {
   /// PIN exists yet) is the only case that is safe to call directly; a
   /// "change PIN" flow MUST call [verify] with the current PIN and check
   /// `.isOk` before ever calling this. See the class doc for why.
-  Future<void> setPin(String pin) async {
+  ///
+  /// [owner], when given, is stamped as this PIN's owning username -- see
+  /// [_ownerKey] -- purely so a later caller can tell whose PIN this is;
+  /// omitted, any previously stored owner is left untouched (existing
+  /// callers that never pass it see no behaviour change at all).
+  Future<void> setPin(String pin, {String? owner}) async {
     if (!_pinShape.hasMatch(pin)) {
       throw ArgumentError('PIN must be 4 to 6 digits.');
     }
@@ -162,8 +178,16 @@ class PinLock {
     final hash = hashPin(pin, salt);
     await _storage.write(_saltKey, salt);
     await _storage.write(_hashKey, hash);
+    if (owner != null) {
+      await _storage.write(_ownerKey, owner);
+    }
     await _resetAttempts();
   }
+
+  /// The username [setPin] was last called with an explicit `owner` for, or
+  /// `null` if none was ever recorded (never set, or set by an older/other
+  /// caller that didn't pass one).
+  Future<String?> owner() => _storage.read(_ownerKey);
 
   Future<bool> hasPin() async => (await _storage.read(_hashKey)) != null;
 

@@ -59,8 +59,16 @@ class SyncQueue {
   /// `records.error` column without bound.
   static const _maxStoredErrorLength = 500;
 
-  Future<SyncReplayResult> replay(ApiClient api) async {
-    final queued = await _db.getQueuedRecords();
+  /// [include], when given, narrows the batch to only the queued records it
+  /// accepts -- e.g. the app shell's "records owned by the currently
+  /// signed-in technician" filter (see `LocalDb.getQueuedRecordsOwnedBy`),
+  /// so a stale queued record left behind by a PREVIOUS technician is never
+  /// swept up and sent to the server under a different technician's device
+  /// token. Omitted (the default), every queued record is sent, unchanged
+  /// from this method's original behaviour.
+  Future<SyncReplayResult> replay(ApiClient api, {bool Function(LocalRecord record)? include}) async {
+    final allQueued = await _db.getQueuedRecords();
+    final queued = include == null ? allQueued : allQueued.where(include).toList();
     if (queued.isEmpty) return const SyncReplayResult.empty();
 
     final syncRecords = queued.map((r) => r.toSyncRecord()).toList();

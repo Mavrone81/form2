@@ -15,9 +15,17 @@ import 'record_editor.dart';
 /// brief. Nothing here talks to the network; a form only appears once it has
 /// been synced down at least once.
 class FormsListScreen extends StatefulWidget {
-  const FormsListScreen({super.key, required this.db});
+  const FormsListScreen({super.key, required this.db, required this.username});
 
   final LocalDb db;
+
+  /// The signed-in technician's username, stamped as this device's own
+  /// `record_owners` entry for every draft this screen creates -- see
+  /// `LocalDb`'s `record_owners` doc for why: it is what lets a later
+  /// sign-out/sign-in of a DIFFERENT technician on the same device tell
+  /// "my drafts" apart from "the previous technician's drafts" instead of
+  /// silently mixing (and, worse, syncing) both under one identity.
+  final String username;
 
   @override
   State<FormsListScreen> createState() => _FormsListScreenState();
@@ -53,6 +61,7 @@ class _FormsListScreenState extends State<FormsListScreen> {
       status: RecordStatus.draft,
     );
     await widget.db.insertRecord(record);
+    await widget.db.setRecordOwner(record.clientUuid, widget.username);
     if (!mounted) return;
     await Navigator.of(context).push<void>(
       MaterialPageRoute(builder: (_) => RecordEditorScreen(db: widget.db, clientUuid: record.clientUuid)),
