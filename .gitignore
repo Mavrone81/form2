@@ -41,3 +41,12 @@ compose.override.yaml
 # commit a second, silently forkable copy of the renderer; CI and the app
 # build it, and test/pdf-engine-golden.test.js skips when it is absent.
 mobile/pdf-engine/dist/
+
+# Android release signing material. mobile/app/android/.gitignore and
+# mobile/app/.gitignore already ignore these within the app, but they're
+# repeated here (root-level, unanchored) so a keystore dropped anywhere in
+# the repo -- not just under mobile/ -- is still caught before `git add`.
+# The keystore itself lives only as the ANDROID_KEYSTORE_B64 GitHub secret;
+# see .github/workflows/android.yml and scripts/check-no-sensitive-files.sh.
+*.keystore
+*.jks

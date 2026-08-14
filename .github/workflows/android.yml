@@ -1,0 +1,123 @@
+name: Android
+
+# Builds a signed release APK for the PM Records Flutter app.
+#
+# Triggers: pushing a tag matching `apk-*` (e.g. `apk-1.0.0`) builds, tests,
+# and attaches the APK to a GitHub release for that tag; workflow_dispatch
+# lets someone build on demand (e.g. to sanity-check signing) without
+# needing a tag. Unlike ci.yml this does not run on every push/PR: a Gradle
+# + Flutter release build is slow and the signing secrets should only be
+# exercised deliberately.
+on:
+  push:
+    tags:
+      - 'apk-*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      # Only needed so the final step can attach the APK to a GitHub
+      # release; everything else in this job is read-only.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build the Android app's PDF engine
+        # The bundle is a build artefact and is gitignored (see
+        # mobile/pdf-engine/dist/ in .gitignore), so it has to be built here
+        # or test/pdf-engine-golden.test.js skips -- and that test is the
+        # only thing holding the app's offline preview to being the same
+        # bytes as the archived record. Its own npm project, same as ci.yml.
+        run: |
+          npm ci --prefix mobile/pdf-engine
+          node mobile/pdf-engine/build.mjs
+
+      - name: Stage the PDF engine into the app's assets
+        # pubspec.yaml's flutter.assets lists these three paths, but none of
+        # them is committed (mobile/app/.gitignore ignores
+        # /assets/pdf-engine/) -- they're staged here from mobile/pdf-engine/
+        # before flutter test/build ever run, exactly the way the pubspec.yaml
+        # comment above that assets block says this step must happen.
+        run: |
+          mkdir -p mobile/app/assets/pdf-engine/dist
+          cp mobile/pdf-engine/harness.html mobile/app/assets/pdf-engine/harness.html
+          cp mobile/pdf-engine/harness.js mobile/app/assets/pdf-engine/harness.js
+          cp mobile/pdf-engine/dist/pdf-engine.js mobile/app/assets/pdf-engine/dist/pdf-engine.js
+
+      - name: Run server tests
+        # GitHub's default shell is `bash -e`, NOT `-o pipefail`: without
+        # this, the step exits with `tail`'s status (always 0) and a
+        # failing suite goes green. Same discipline as ci.yml's "Run tests"
+        # step, verified there against a deliberately failing test.
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test 2>&1 | tail -20
+
+      - name: Guard against committed form content and signing material
+        run: npm run check:sensitive
+
+      - run: flutter pub get
+        working-directory: mobile/app
+
+      - run: flutter test
+        working-directory: mobile/app
+
+      - run: flutter analyze
+        working-directory: mobile/app
+
+      - name: Decode release keystore
+        # ANDROID_KEYSTORE_B64 is the release keystore, base64-encoded, held
+        # as a GitHub secret -- it never enters the repo (see
+        # scripts/check-no-sensitive-files.sh and android/.gitignore).
+        # Decoded to $RUNNER_TEMP, which GitHub Actions wipes at the end of
+        # the job.
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/pmrecords-release.keystore"
+
+      - name: Build signed release APK
+        working-directory: mobile/app
+        env:
+          # Read by android/app/build.gradle.kts's release signingConfig.
+          # When these are unset (local dev), that config falls back to
+          # debug signing instead -- see the comment there.
+          KEYSTORE_PATH: ${{ runner.temp }}/pmrecords-release.keystore
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+        run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pmrecords-release-apk
+          path: mobile/app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+      - name: Attach APK to the tag's GitHub release
+        # Only on the tag trigger, not on workflow_dispatch runs (those have
+        # no tag to attach to). softprops/action-gh-release creates the
+        # release for the pushed tag if it doesn't already exist, and
+        # uploads the APK as its asset.
+        if: startsWith(github.ref, 'refs/tags/apk-')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mobile/app/build/app/outputs/flutter-apk/app-release.apk
