@@ -160,7 +160,16 @@ const MIGRATIONS = [
       expires_at text not null,
       last_used_at text
     )
-  ` }
+  ` },
+  // The Android app's offline id for a record it created before it ever had
+  // a server-assigned one. POST /api/sync (server/routes.js) uses this to
+  // recognise a replayed record — a device retrying a batch after a dropped
+  // response, or genuinely syncing the same record twice — as the SAME
+  // submission rather than creating a duplicate. `null` for every record
+  // created through the browser, which has no offline id at all, hence the
+  // partial index: a plain unique index over the column would let at most one
+  // browser-created (null) row exist across the whole table.
+  { table: 'submissions', column: 'client_uuid', ddl: 'alter table submissions add column client_uuid text' }
 ];
 
 // The allowed answers for a field, as a list. '' (the default for every
@@ -190,5 +199,13 @@ export function openDb(path = 'data/pm.sqlite') {
   db.pragma('journal_mode = WAL');
   db.exec(SCHEMA);
   applyMigrations(db);
+  // `create unique index if not exists` cannot run inside SCHEMA above: on a
+  // pre-existing database SCHEMA's own `create table if not exists` is a
+  // no-op, so the column this index is over does not exist until the
+  // MIGRATIONS loop just above has run. `where client_uuid is not null` is a
+  // PARTIAL index — it enforces uniqueness only among rows that have an
+  // offline id at all, so the many existing (and future browser-created)
+  // rows with a null client_uuid never collide with each other.
+  db.exec('create unique index if not exists idx_sub_uuid on submissions(client_uuid) where client_uuid is not null');
   return db;
 }

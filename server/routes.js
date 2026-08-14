@@ -7,7 +7,7 @@ import { buildGrid } from './grid-model.js';
 import { parseWorkbook } from './excel-parser.js';
 import { tasksInScope, scopeSummary } from './intervals.js';
 import { cellMapFor } from './cell-map.js';
-import { createSubmission, saveFields, signAndAdvance, rejectSubmission, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
+import { createSubmission, findByClientUuid, saveFields, signAndAdvance, rejectSubmission, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
 import { renderRecordPdf } from './pdf-record.js';
 import { createLoginThrottle } from './login-throttle.js';
 
@@ -61,6 +61,117 @@ function tokenOrSession(db) {
 // session user -- so a route reads one thing instead of branching on
 // req.authVia itself just to find out who is acting.
 const actingUser = (req) => req.deviceUser ?? req.session?.user ?? null;
+
+// POST /api/sync's own guard -- deliberately NOT tokenOrSession. Sync exists
+// for the Android app replaying its offline queue, and only for that: a
+// browser tab's session cookie must never be accepted here, even a valid
+// one, because a shared shop-floor browser silently syncing "whoever is
+// signed in"'s offline queue is not a thing that can happen -- there is no
+// offline queue in the browser. Presenting no Authorization header, or a
+// session with no token, is refused with the same 401 an invalid token gets;
+// there is no session fallback to have a precedence rule about.
+function deviceTokenOnly(db) {
+  return (req, res, next) => {
+    const [scheme, token] = String(req.get('authorization') ?? '').split(' ');
+    if (scheme?.toLowerCase() !== 'bearer' || !token) {
+      return res.status(401).json({ error: 'A device token is required.' });
+    }
+    const user = validateDeviceToken(db, token);
+    if (!user) return res.status(401).json({ error: 'Invalid or expired device token.' });
+    req.deviceUser = user;
+    req.authVia = 'token';
+    next();
+  };
+}
+
+// client_uuid is the Android app's own offline id for a record, minted
+// before the record ever reaches the server -- see the column comment in
+// server/db.js. Validated as UUID-shaped (36 chars: 8-4-4-4-12 hex, RFC 4122
+// layout) before it is ever used as a lookup key or stored: an unvalidated
+// string reaching a WHERE client_uuid=? clause is harmless in itself, but a
+// malformed or empty value from a buggy client must be refused loudly rather
+// than silently colliding with another record's id one day.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function syncError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+// One record of a sync batch. Every failure -- a bad uuid, someone else's
+// uuid, an unknown form, an invalid answer, a bad signature -- is caught
+// HERE and turned into this record's own `error`, never allowed to escape
+// and abort the records after it: a phone replaying twenty offline records
+// must not lose the other nineteen because one had a stale formId.
+function syncOneRecord(db, user, record) {
+  const clientUuid = record?.client_uuid;
+  const out = { client_uuid: clientUuid, submissionId: null, state: null };
+  // Tracked outside the try so a failure partway through (e.g. an invalid
+  // field value AFTER the submission was created-or-found) can still report
+  // the id and state it reached, rather than the caller losing track of a
+  // draft that genuinely exists and just needs a corrected retry.
+  let sub = null;
+  try {
+    if (typeof clientUuid !== 'string' || !UUID_RE.test(clientUuid)) {
+      throw syncError('INVALID', 'client_uuid must be a UUID.');
+    }
+
+    sub = findByClientUuid(db, clientUuid);
+    // A uuid that exists but was created by someone else must not leak
+    // anything about that record -- not its id, not its state, not even
+    // that saveFields or signAndAdvance would have refused it for some
+    // OTHER reason too. FORBIDDEN and nothing else, exactly as a stranger
+    // guessing a uuid at random would get -- hence clearing `sub` back to
+    // null rather than leaving it set for the assignment below.
+    if (sub && sub.created_by !== user.id) {
+      sub = null;
+      throw syncError('FORBIDDEN', 'This record belongs to another user.');
+    }
+
+    if (!sub) {
+      const form = db.prepare('select id from form_catalog where id=?').get(record?.formId);
+      if (!form) throw syncError('NOT_FOUND', 'Form not found.');
+      sub = createSubmission(db, {
+        formId: record.formId,
+        userId: user.id,
+        machineId: record?.machineId ?? '',
+        frequency: record?.frequency ?? '',
+        clientUuid
+      });
+    }
+
+    // Idempotent replay: a record already advanced past `draft` carries the
+    // first sync's saveFields + signature already, so applying either again
+    // would be wrong (saveFields would throw -- assertCanEdit's stage
+    // ownership no longer names this technician as the owner of e.g.
+    // pending_lead -- and re-signing would mean two sign-offs for one
+    // submit). Only `draft` -- a fresh create above, or a previous sync that
+    // inserted the row but was cut off before signing -- gets the remaining
+    // steps applied. `rejected` is deliberately excluded even though a
+    // technician owns it too: a record sent back for correction needs a
+    // person to look at it and resubmit deliberately, not to be silently
+    // re-applied by a device replaying its old queue.
+    //
+    // signedAtDevice is accepted in the request shape and never read here:
+    // signAndAdvance stamps signed_at from the SERVER clock, exactly as it
+    // does for a browser sign-off, because a device's clock is not trusted
+    // on a records system any more than its camera is trusted for the
+    // signature ink itself.
+    if (sub.state === 'draft') {
+      saveFields(db, sub.id, record?.values ?? {}, user);
+      sub = signAndAdvance(db, {
+        submissionId: sub.id,
+        user,
+        signaturePng: record?.signaturePng ?? ''
+      });
+    }
+  } catch (err) {
+    out.error = { code: err.code ?? 'ERROR', message: err.message };
+  }
+  if (sub) { out.submissionId = sub.id; out.state = sub.state; }
+  return out;
+}
 
 // Signatures must be read back in the workflow's own order — technician,
 // then team leader, then engineer — because drawSignatures lays block i at
@@ -322,6 +433,32 @@ export function makeRoutes(db) {
     }
     res.json({ generated_at: new Date().toISOString(), forms, skipped });
   }));
+
+  // Replays a device's offline queue: one or more records the Android app
+  // recorded while disconnected, each carrying its own client-minted
+  // client_uuid. deviceTokenOnly, not tokenOrSession: this route exists
+  // exclusively for a paired device's own bearer token (see the guard's own
+  // comment above) -- a browser session, however valid, gets 401 here, and a
+  // non-technician device token gets 403, because every record in a batch is
+  // necessarily a technician's own draft-and-sign.
+  //
+  // Deliberately synchronous (no asyncRoute wrapper): syncOneRecord and
+  // everything it calls (findByClientUuid, createSubmission, saveFields,
+  // signAndAdvance) are all synchronous better-sqlite3 calls, so there is no
+  // promise here that could reject unhandled.
+  r.post('/sync', deviceTokenOnly(db), (req, res) => {
+    const user = req.deviceUser;
+    if (user.role !== 'technician') {
+      return res.status(403).json({ error: 'Your role cannot sync records.' });
+    }
+    const records = Array.isArray(req.body?.records) ? req.body.records : [];
+    // Every record is independent: syncOneRecord catches its own failures,
+    // so one bad record in a batch of twenty can never abort the other
+    // nineteen, and the batch itself always answers 200 -- per-record
+    // success or failure is carried in each result's own `error`, never in
+    // the HTTP status of the call as a whole.
+    res.json({ results: records.map((record) => syncOneRecord(db, user, record)) });
+  });
 
   r.post('/submissions', requireRole('technician'), (req, res) => {
     const { formId, machineId, frequency } = req.body ?? {};

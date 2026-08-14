@@ -65,7 +65,7 @@ function assertStageOwnership(sub, user, messages) {
   return stage;
 }
 
-export function createSubmission(db, { formId, userId, machineId = '', frequency = '', snapshot = null }) {
+export function createSubmission(db, { formId, userId, machineId = '', frequency = '', snapshot = null, clientUuid = null }) {
   const now = new Date().toISOString();
   const fields = snapshot ??
     db.prepare('select field_key, label, section, kind, options, sort_order from form_fields where form_id=? order by sort_order').all(formId);
@@ -75,13 +75,27 @@ export function createSubmission(db, { formId, userId, machineId = '', frequency
   // must keep saying Rev E forever, so the archival PDF reads these columns
   // and never the catalog (server/routes.js, the /pdf route).
   const form = db.prepare('select doc_number, revision, content_hash from form_catalog where id=?').get(formId);
+  // `clientUuid` is the Android app's offline id for a record created before
+  // it ever reached the server — see the client_uuid comment in
+  // server/db.js. Null for every browser-created submission, which has no
+  // such id at all.
   const info = db.prepare(`insert into submissions
     (form_id, form_snapshot, machine_id, frequency, state, created_by, created_at, updated_at,
-     doc_number, revision, content_hash)
-    values (?,?,?,?, 'draft', ?,?,?, ?,?,?)`)
+     doc_number, revision, content_hash, client_uuid)
+    values (?,?,?,?, 'draft', ?,?,?, ?,?,?, ?)`)
     .run(formId, JSON.stringify(fields), machineId, frequency, userId, now, now,
-      form?.doc_number ?? '', form?.revision ?? '', form?.content_hash ?? '');
+      form?.doc_number ?? '', form?.revision ?? '', form?.content_hash ?? '', clientUuid);
   return db.prepare('select * from submissions where id=?').get(info.lastInsertRowid);
+}
+
+// The other half of create-or-find-by-client_uuid: POST /api/sync
+// (server/routes.js) calls this first for every record in a batch, so a
+// replayed record — the device retrying after a dropped response, or
+// genuinely syncing twice — resolves to the SAME submission instead of a
+// duplicate. Returns undefined for an id this device has not synced before,
+// exactly like better-sqlite3's own `.get()`.
+export function findByClientUuid(db, clientUuid) {
+  return db.prepare('select * from submissions where client_uuid=?').get(clientUuid);
 }
 
 // The whole point of this module is that no future HTTP route can bypass the
