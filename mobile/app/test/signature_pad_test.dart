@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -46,7 +47,10 @@ void main() {
     expect(controller.paintedSize!.width, closeTo(320, 4));
   });
 
-  testWidgets('exporting after a stroke near the right edge of a wide (800px) pad produces valid PNG bytes', (tester) async {
+  testWidgets(
+      'exporting after a stroke near the right edge of a wide (800px) pad '
+      'renders at the real painted size, with the stroke surviving into the pixels',
+      (tester) async {
     final controller = SignaturePadController();
     await tester.pumpWidget(_harness(800, controller));
     await tester.pumpAndSettle();
@@ -57,6 +61,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(controller.isEmpty, isFalse);
+    final paintedSize = controller.paintedSize!;
 
     // `Picture.toImage()`/`Image.toByteData()` are genuine engine-level
     // async work that plain `pumpAndSettle()` never waits for -- `runAsync`
@@ -68,6 +73,49 @@ void main() {
       final bytes = await controller.exportPng();
       expect(bytes.length, greaterThan(8));
       expect(bytes.sublist(0, 8), _pngMagic);
+
+      // Pin the export GEOMETRY. A PNG-validity check alone is not enough
+      // to catch a regression back to a fixed 600x200 canvas -- a clipped
+      // or rescaled stroke still decodes to a perfectly valid (just wrong)
+      // PNG. Decoding the real dimensions back out and comparing against
+      // the pad's actual painted size is what makes a size regression fail
+      // this test.
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      final image = frame.image;
+      expect(image.width.toDouble(), closeTo(paintedSize.width, 1));
+      expect(image.height.toDouble(), closeTo(paintedSize.height, 1));
+
+      // Pin the CONTENT too. The stroke was drawn at local x in [740, 780]
+      // on a ~798-wide canvas -- squarely in the rightmost ~10%. A canvas
+      // silently clipped or rescaled back to a fixed 600px width would
+      // either drop that stroke entirely or paint it at the wrong
+      // coordinates; scanning that exact band for a non-background pixel
+      // catches both failure modes, not just "some PNG came out".
+      final raw = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      expect(raw, isNotNull);
+      final pixels = raw!.buffer.asUint8List();
+      final bandStartX = (image.width * 0.9).floor();
+      var foundInk = false;
+      outer:
+      for (var y = 0; y < image.height; y++) {
+        for (var x = bandStartX; x < image.width; x++) {
+          final i = (y * image.width + x) * 4;
+          final r = pixels[i], g = pixels[i + 1], b = pixels[i + 2], a = pixels[i + 3];
+          // The background is opaque white (AppColors.paper); the stroke is
+          // drawn in AppColors.ink, so any visibly non-white opaque pixel in
+          // this band can only be the stroke.
+          if (a > 0 && (r < 250 || g < 250 || b < 250)) {
+            foundInk = true;
+            break outer;
+          }
+        }
+      }
+      expect(
+        foundInk,
+        isTrue,
+        reason: 'expected the stroke drawn near the right edge of the pad to survive into the exported PNG',
+      );
     });
   });
 
