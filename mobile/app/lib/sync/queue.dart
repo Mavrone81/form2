@@ -54,6 +54,11 @@ class SyncQueue {
 
   final LocalDb _db;
 
+  /// Matches the server's own `parse_error` truncation convention (see
+  /// `server/`) so a pathological error message can't grow the local
+  /// `records.error` column without bound.
+  static const _maxStoredErrorLength = 500;
+
   Future<SyncReplayResult> replay(ApiClient api) async {
     final queued = await _db.getQueuedRecords();
     if (queued.isEmpty) return const SyncReplayResult.empty();
@@ -70,7 +75,9 @@ class SyncQueue {
     for (final result in results) {
       final error = result.error;
       if (error != null) {
-        await _db.markError(result.clientUuid, '${error.code}: ${error.message}');
+        final message = '${error.code}: ${error.message}';
+        final capped = message.length > _maxStoredErrorLength ? message.substring(0, _maxStoredErrorLength) : message;
+        await _db.markError(result.clientUuid, capped);
         errored.add(result.clientUuid);
       } else {
         await _db.markSynced(result.clientUuid, serverId: result.submissionId, state: result.state);

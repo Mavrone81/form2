@@ -206,7 +206,11 @@ void main() {
 
       await db.requeue(record.clientUuid);
 
-      expect((await db.getRecord(record.clientUuid))!.status, RecordStatus.queued);
+      final requeued = await db.getRecord(record.clientUuid);
+      expect(requeued!.status, RecordStatus.queued);
+      // The stale error from the failed attempt must not linger once the
+      // record is back in the queue for a fresh try.
+      expect(requeued.error, isNull);
     });
 
     test('synced -> queued is rejected', () async {

@@ -76,6 +76,34 @@ class _CrashMidBatchApiClient extends ApiClient {
   }
 }
 
+/// Simulates the "lost mark" case named in the brief: the server genuinely
+/// held the record (it is not lost server-side), but *this device* never
+/// found out -- the response never arrived (connection dropped, app killed
+/// before the `Future` resolved, whatever). From the device's point of
+/// view that is indistinguishable from "the whole batch failed": nothing
+/// gets marked, the record stays `queued`, and it goes out again next
+/// replay. This fake's first call throws; its second call answers as the
+/// real server would on a retried `client_uuid` -- the *same* `submissionId`
+/// for the *same* uuid, proving convergence rather than a duplicate. The
+/// server side of that dedupe guarantee (same client_uuid -> same
+/// submissionId, no duplicate row) is exercised in the server's own suite,
+/// not here -- see `test/sync.test.js`, "replaying the same batch is
+/// idempotent: same submissionId, still exactly one signature, no error".
+class _LostMarkApiClient extends ApiClient {
+  int callCount = 0;
+  final List<List<String>> batches = [];
+
+  @override
+  Future<List<SyncResult>> sync(List<SyncRecord> records) async {
+    callCount++;
+    batches.add(records.map((r) => r.clientUuid).toList());
+    if (callCount == 1) {
+      throw ApiException(500, 'connection reset before response');
+    }
+    return records.map((r) => SyncResult(clientUuid: r.clientUuid, submissionId: 777, state: 'pending_lead')).toList();
+  }
+}
+
 void main() {
   setUpAll(() {
     sqfliteFfiInit();
@@ -158,6 +186,25 @@ void main() {
 
       expect((await db.getRecord(_uuidA))!.status, RecordStatus.synced);
       expect((await db.getRecord(_uuidC))!.status, RecordStatus.synced);
+    });
+
+    test('a stored error message is capped at 500 chars, matching the server\'s parse_error convention', () async {
+      final db = _newDb();
+      addTearDown(db.close);
+      await db.insertRecord(_queuedRecord(_uuidA));
+
+      final longMessage = 'x' * 600;
+      final api = _ScriptedApiClient({
+        _uuidA: SyncResult(clientUuid: _uuidA, error: SyncRecordError('ERROR', longMessage)),
+      });
+
+      await SyncQueue(db).replay(api);
+
+      final a = await db.getRecord(_uuidA);
+      expect(a!.status, RecordStatus.error);
+      // "ERROR: " prefix (7 chars) + the 500-char cap.
+      expect(a.error!.length, 500);
+      expect(a.error, startsWith('ERROR: '));
     });
   });
 
@@ -266,6 +313,39 @@ void main() {
       expect(result.synced.toSet(), {_uuidB, _uuidC});
       expect(followUpApi.batchSizes, [2]);
       expect((await db.getRecord(_uuidA))!.serverId, 900); // untouched, not resent
+    });
+  });
+
+  group('SyncQueue.replay lost mark (server held it, response never arrived)', () {
+    test('the record stays queued after the lost response and converges to the server\'s id on retry', () async {
+      final db = _newDb();
+      addTearDown(db.close);
+      await db.insertRecord(_queuedRecord(_uuidA));
+
+      final api = _LostMarkApiClient();
+
+      // First attempt: the batch call itself throws, exactly like any other
+      // whole-batch transport failure -- from this device's perspective
+      // nothing was ever marked, so the record is untouched: still queued.
+      await expectLater(() => SyncQueue(db).replay(api), throwsA(isA<ApiException>()));
+      expect((await db.getRecord(_uuidA))!.status, RecordStatus.queued);
+      expect(api.callCount, 1);
+
+      // Second attempt: proves this isn't the "already synced, filtered out
+      // by the queued-rows query" shape from the mid-batch-crash test above
+      // -- the record genuinely gets resent (the fake's own recorded batch
+      // contents prove it), and the server's dedupe-by-client_uuid contract
+      // (tested server-side) hands back the *same* submissionId it would
+      // have on the very first successful attempt.
+      final result = await SyncQueue(db).replay(api);
+
+      expect(api.callCount, 2);
+      expect(api.batches[1], [_uuidA]); // resent, not skipped
+      expect(result.synced, [_uuidA]);
+
+      final a = await db.getRecord(_uuidA);
+      expect(a!.status, RecordStatus.synced);
+      expect(a.serverId, 777);
     });
   });
 }

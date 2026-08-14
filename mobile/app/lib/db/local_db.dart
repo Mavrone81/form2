@@ -189,14 +189,19 @@ class LocalDb {
   }
 
   /// Retries an `error` record by moving it back to `queued` so the next
-  /// [SyncQueue.replay] picks it up again.
+  /// [SyncQueue.replay] picks it up again, clearing the stale [error]
+  /// message that would otherwise linger and misdescribe a fresh attempt.
+  /// (The same guard also legally accepts `draft` -> `queued` -- the plain
+  /// first-submit case, identical to what [updateRecord] would do -- since
+  /// [isValidRecordTransition] doesn't distinguish "retry" from "submit";
+  /// both just mean "this record is ready to go out.")
   Future<void> requeue(String clientUuid) async {
     final current = await _requireRecord(clientUuid);
     _assertValidTransition(current.status, RecordStatus.queued, clientUuid);
     final db = await _database;
     await db.update(
       'records',
-      {'status': RecordStatus.queued.dbValue},
+      {'status': RecordStatus.queued.dbValue, 'error': null},
       where: 'client_uuid = ?',
       whereArgs: [clientUuid],
     );
