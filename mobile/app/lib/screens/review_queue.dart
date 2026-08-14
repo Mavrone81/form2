@@ -17,7 +17,8 @@ import 'review_record.dart';
 /// screen: a failed [refresh] leaves [_rows] exactly as it was and shows
 /// [_StaleBanner] instead, rather than clearing the list or dumping the
 /// failure. A device that has never once fetched successfully shows a plain
-/// offline empty state.
+/// empty state -- worded for whichever is actually true, offline or a
+/// server-side failure while online, never guessed.
 class ReviewQueueScreen extends StatefulWidget {
   const ReviewQueueScreen({super.key, required this.api, required this.connectivity});
 
@@ -126,18 +127,23 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
     }
 
     if (rows == null) {
-      // Never fetched successfully at all: nothing cached to fall back to,
-      // so this is a plain offline empty state, not the raw fetch failure.
+      // Never fetched successfully at all: nothing cached to fall back to.
+      // The copy branches on [_online] -- an ONLINE reviewer hit by, say, a
+      // server 500 must not be told they're offline (that sends them
+      // chasing the wrong problem); only a genuinely offline device gets
+      // the offline-specific copy.
       return ListView(
         children: [
           Padding(
             padding: const EdgeInsets.all(24),
             child: Column(
               children: [
-                const Text(
-                  "You're offline, and this queue has never loaded on this device.",
+                Text(
+                  _online
+                      ? 'The queue could not be loaded. Pull to refresh to try again.'
+                      : "You're offline, and this queue has never loaded on this device.",
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: AppColors.mute, fontSize: 13),
+                  style: const TextStyle(color: AppColors.mute, fontSize: 13),
                 ),
                 const SizedBox(height: 12),
                 TextButton(onPressed: refresh, child: const Text('Retry')),
@@ -151,7 +157,7 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
     if (rows.isEmpty) {
       return ListView(
         children: [
-          if (_stale) const _StaleBanner(),
+          if (_stale) _StaleBanner(online: _online),
           const Padding(
             padding: EdgeInsets.all(24),
             child: Text(
@@ -170,7 +176,7 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
       separatorBuilder: (context, index) => const SizedBox(height: 8),
       itemBuilder: (context, i) {
         if (_stale) {
-          if (i == 0) return const _StaleBanner();
+          if (i == 0) return _StaleBanner(online: _online);
           return _Row(row: Map<String, dynamic>.from(rows[i - 1] as Map), onTap: _open);
         }
         return _Row(row: Map<String, dynamic>.from(rows[i] as Map), onTap: _open);
@@ -180,7 +186,15 @@ class ReviewQueueScreenState extends State<ReviewQueueScreen> {
 }
 
 class _StaleBanner extends StatelessWidget {
-  const _StaleBanner();
+  const _StaleBanner({required this.online});
+
+  /// Whether the device is currently online. [_stale] alone (see
+  /// [ReviewQueueScreenState]) only says "the last refresh failed" -- it
+  /// doesn't say WHY, and offline is not the only reason a refresh fails.
+  /// An online reviewer whose refresh hit a server error must not be told
+  /// "Offline", which would send them looking for a connectivity problem
+  /// they don't have.
+  final bool online;
 
   @override
   Widget build(BuildContext context) {
@@ -188,9 +202,11 @@ class _StaleBanner extends StatelessWidget {
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(color: AppColors.tint, border: Border.all(color: AppColors.rule)),
-      child: const Text(
-        'Offline — showing this list as of last connection.',
-        style: TextStyle(color: AppColors.stamp, fontSize: 12.5, fontWeight: FontWeight.w600),
+      child: Text(
+        online
+            ? "Couldn't refresh — showing the last loaded list."
+            : 'Offline — showing this list as of last connection.',
+        style: const TextStyle(color: AppColors.stamp, fontSize: 12.5, fontWeight: FontWeight.w600),
       ),
     );
   }

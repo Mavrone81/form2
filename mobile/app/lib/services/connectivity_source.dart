@@ -27,17 +27,24 @@ abstract class ConnectivitySource {
 /// counts as online -- matching how the plugin itself flags "definitely
 /// offline" only with a single-element `[none]` list.
 class PlatformConnectivitySource implements ConnectivitySource {
-  PlatformConnectivitySource({Connectivity? connectivity}) : _connectivity = connectivity ?? Connectivity() {
-    _sub = _connectivity.onConnectivityChanged.listen((results) {
+  /// [initialCheck] and [changes] are both independently injectable --
+  /// separately from [connectivity] -- specifically so a test can drive the
+  /// exact race this class exists to close (see [_applyInitialCheck]'s doc)
+  /// without a fake `connectivity_plus` platform channel. `Connectivity`
+  /// itself cannot be faked directly: it's a private-constructor,
+  /// factory-returned singleton wired to a real platform channel, so
+  /// subclassing or constructing a second instance isn't an option. In the
+  /// running app both parameters default to that real singleton's own calls.
+  PlatformConnectivitySource({
+    Connectivity? connectivity,
+    Future<List<ConnectivityResult>>? initialCheck,
+    Stream<List<ConnectivityResult>>? changes,
+  }) : _connectivity = connectivity ?? Connectivity() {
+    _sub = (changes ?? _connectivity.onConnectivityChanged).listen((results) {
       _isOnline = _hasConnection(results);
-      _controller.add(_isOnline);
+      if (!_controller.isClosed) _controller.add(_isOnline);
     });
-    // checkConnectivity() answers the CURRENT state immediately, so a screen
-    // built before the first onConnectivityChanged event still reads the
-    // right value from isOnline rather than the optimistic default below.
-    unawaited(_connectivity.checkConnectivity().then((results) {
-      _isOnline = _hasConnection(results);
-    }));
+    unawaited((initialCheck ?? _connectivity.checkConnectivity()).then(_applyInitialCheck));
   }
 
   final Connectivity _connectivity;
@@ -46,11 +53,35 @@ class PlatformConnectivitySource implements ConnectivitySource {
 
   // Optimistic until the first real check resolves, so a screen never flashes
   // an offline state on a device that is, in fact, online -- the same
-  // "assume the best, correct fast" choice the rest of this app makes.
+  // "assume the best, correct fast" choice the rest of this app makes. Kept
+  // deliberately optimistic rather than pessimistic: [_applyInitialCheck]
+  // below is what closes the resulting hole, by actively correcting this the
+  // moment the real answer is known, rather than requiring a caller to
+  // reconcile [isOnline] against a value [onChange] never told them about.
   bool _isOnline = true;
 
   static bool _hasConnection(List<ConnectivityResult> results) =>
       results.any((r) => r != ConnectivityResult.none);
+
+  /// The constructor's one-shot `checkConnectivity()` result. Extracted to
+  /// its own method (rather than inlined in the constructor) so a test can
+  /// drive exactly this path via the injectable `initialCheck` future above.
+  ///
+  /// Critically, this EMITS on [onChange], not just updates [_isOnline]: a
+  /// device already offline before this app ever launched gets no
+  /// `onConnectivityChanged` event to correct it (nothing about its
+  /// connectivity changes again -- it was already off), so the optimistic
+  /// `true` default would otherwise stand, uncorrected, for the rest of the
+  /// session -- every submitting control rendering enabled, with no caption,
+  /// while a real tap genuinely reaches (and fails against) the network.
+  /// Without this emission, only a LATER change would ever notify a
+  /// listener; this call is what notifies one of the FIRST, already-known
+  /// answer too.
+  void _applyInitialCheck(List<ConnectivityResult> results) {
+    final online = _hasConnection(results);
+    _isOnline = online;
+    if (!_controller.isClosed) _controller.add(online);
+  }
 
   @override
   bool get isOnline => _isOnline;

@@ -155,7 +155,13 @@ void main() {
       await tester.pumpAndSettle();
       await _revealComposer(tester);
 
-      expect(find.text(offlineSubmitCaption), findsOneWidget);
+      // The caption text is pinned here as a hardcoded literal, independent
+      // of the `offlineSubmitCaption` constant the production widget and
+      // every other assertion in this file use -- so a future edit that
+      // silently changes the constant's value can never make this whole
+      // suite agree with itself by construction; this one test still checks
+      // against the brief's own exact wording.
+      expect(find.text('Connection required to submit'), findsOneWidget);
 
       final signButton = tester.widget<FilledButton>(find.widgetWithText(FilledButton, 'Sign'));
       expect(signButton.onPressed, isNull);
@@ -223,6 +229,45 @@ void main() {
 
       expect(api.rejectCalls, 0);
       expect(find.text('A reason is required to reject this record.'), findsOneWidget);
+
+      // Whitespace-only is not a reason either -- the same client-side
+      // check trims before deciding, mirroring rejectSubmission's own
+      // `String(reason ?? '').trim()` check server-side (server/workflow.js).
+      await tester.enterText(find.byType(TextField), '   \n  ');
+      await tester.tap(find.widgetWithText(OutlinedButton, 'Reject'));
+      await tester.pumpAndSettle();
+
+      expect(api.rejectCalls, 0);
+      expect(find.text('A reason is required to reject this record.'), findsOneWidget);
+    });
+
+    testWidgets('an ApiException from reject surfaces its message in a SnackBar and stays put', (tester) async {
+      final api = _FakeApi()
+        ..submissionData = _submissionData()
+        ..rejectError = ApiException(403, 'Your role cannot reject this record at its current stage.');
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(_recordHarness(api, connectivity));
+      await tester.pumpAndSettle();
+      await _revealComposer(tester);
+
+      await tester.enterText(find.byType(TextField), 'Torque values not recorded.');
+      await tester.scrollUntilVisible(
+        find.widgetWithText(OutlinedButton, 'Reject'),
+        300,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(OutlinedButton, 'Reject'));
+      await tester.pumpAndSettle();
+
+      expect(api.rejectCalls, 1);
+      expect(find.text('Your role cannot reject this record at its current stage.'), findsOneWidget);
+      // Still on the record screen: the Reject button is present and
+      // re-enabled, not left stuck by the failed attempt.
+      final rejectButton = tester.widget<OutlinedButton>(find.widgetWithText(OutlinedButton, 'Reject'));
+      expect(rejectButton.onPressed, isNotNull);
     });
 
     testWidgets('a non-empty reason calls api.reject and pops back to the caller', (tester) async {
@@ -365,7 +410,7 @@ void main() {
       expect(find.textContaining('DOC-002'), findsOneWidget);
     });
 
-    testWidgets('a fetch failure with no cache shows an offline empty state, not an error dump', (tester) async {
+    testWidgets('a fetch failure with no cache while offline shows the offline empty state, not an error dump', (tester) async {
       final api = _FakeApi()..queueError = ApiException(0, 'Failed host lookup');
       final connectivity = _FakeConnectivity(false);
       addTearDown(connectivity.dispose);
@@ -377,29 +422,81 @@ void main() {
       expect(find.textContaining("You're offline"), findsOneWidget);
     });
 
-    testWidgets('a later fetch failure keeps showing the cached rows, marked as of last connection', (tester) async {
-      final api = _FakeApi()
-        ..queueRows = [
-          {'id': 1, 'doc_number': 'DOC-001', 'revision': 'A', 'machine_id': 'GEN-1', 'frequency': 'Y', 'state': 'pending_lead'},
-        ];
-      final connectivity = _FakeConnectivity(true);
-      addTearDown(connectivity.dispose);
+    testWidgets(
+      'a fetch failure with no cache while ONLINE shows a server-failure empty state, never the offline copy',
+      (tester) async {
+        // A genuinely online reviewer hit by, say, a server 500 must not be
+        // told "you're offline" -- that misdirects them into chasing a
+        // connectivity problem they don't have (Important #2 from review).
+        final api = _FakeApi()..queueError = ApiException(500, 'Internal error');
+        final connectivity = _FakeConnectivity(true);
+        addTearDown(connectivity.dispose);
 
-      await tester.pumpWidget(MaterialApp(home: ReviewQueueScreen(api: api, connectivity: connectivity)));
-      await tester.pumpAndSettle();
-      expect(find.textContaining('DOC-001'), findsOneWidget);
-      expect(find.textContaining('as of last connection'), findsNothing);
+        await tester.pumpWidget(MaterialApp(home: ReviewQueueScreen(api: api, connectivity: connectivity)));
+        await tester.pumpAndSettle();
 
-      connectivity.setOnline(false);
-      api.queueError = ApiException(0, 'Network is unreachable');
-      final state = tester.state<ReviewQueueScreenState>(find.byType(ReviewQueueScreen));
-      await state.refresh();
-      await tester.pumpAndSettle();
+        expect(find.textContaining('Internal error'), findsNothing);
+        expect(find.textContaining("You're offline"), findsNothing);
+        expect(find.textContaining('The queue could not be loaded'), findsOneWidget);
+      },
+    );
 
-      // The cached row is still shown -- not cleared by the failed refresh.
-      expect(find.textContaining('DOC-001'), findsOneWidget);
-      expect(find.textContaining('Network is unreachable'), findsNothing);
-      expect(find.textContaining('as of last connection'), findsOneWidget);
-    });
+    testWidgets(
+      'a later fetch failure WHILE OFFLINE keeps showing the cached rows, marked as of last connection',
+      (tester) async {
+        final api = _FakeApi()
+          ..queueRows = [
+            {'id': 1, 'doc_number': 'DOC-001', 'revision': 'A', 'machine_id': 'GEN-1', 'frequency': 'Y', 'state': 'pending_lead'},
+          ];
+        final connectivity = _FakeConnectivity(true);
+        addTearDown(connectivity.dispose);
+
+        await tester.pumpWidget(MaterialApp(home: ReviewQueueScreen(api: api, connectivity: connectivity)));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('DOC-001'), findsOneWidget);
+        expect(find.textContaining('as of last connection'), findsNothing);
+
+        connectivity.setOnline(false);
+        api.queueError = ApiException(0, 'Network is unreachable');
+        final state = tester.state<ReviewQueueScreenState>(find.byType(ReviewQueueScreen));
+        await state.refresh();
+        await tester.pumpAndSettle();
+
+        // The cached row is still shown -- not cleared by the failed refresh.
+        expect(find.textContaining('DOC-001'), findsOneWidget);
+        expect(find.textContaining('Network is unreachable'), findsNothing);
+        expect(find.textContaining('as of last connection'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'a later fetch failure WHILE ONLINE keeps showing the cached rows, marked as a refresh failure, never "Offline"',
+      (tester) async {
+        // Important #3 from review: any failed refresh used to render the
+        // SAME "Offline —" banner even when the device is plainly online
+        // (e.g. a server 500) -- misleading the reviewer about the cause.
+        final api = _FakeApi()
+          ..queueRows = [
+            {'id': 1, 'doc_number': 'DOC-001', 'revision': 'A', 'machine_id': 'GEN-1', 'frequency': 'Y', 'state': 'pending_lead'},
+          ];
+        final connectivity = _FakeConnectivity(true);
+        addTearDown(connectivity.dispose);
+
+        await tester.pumpWidget(MaterialApp(home: ReviewQueueScreen(api: api, connectivity: connectivity)));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('DOC-001'), findsOneWidget);
+
+        // Connectivity stays online; only the server call fails.
+        api.queueError = ApiException(500, 'Internal error');
+        final state = tester.state<ReviewQueueScreenState>(find.byType(ReviewQueueScreen));
+        await state.refresh();
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('DOC-001'), findsOneWidget); // still cached, not cleared
+        expect(find.textContaining('Internal error'), findsNothing);
+        expect(find.textContaining('Offline'), findsNothing);
+        expect(find.textContaining("Couldn't refresh"), findsOneWidget);
+      },
+    );
   });
 }
