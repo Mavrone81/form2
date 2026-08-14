@@ -131,6 +131,40 @@ function unreadableForm(res, formId, err) {
 const statusFor = (err, fallback) =>
   err.code === 'FORBIDDEN' ? 403 : err.code === 'NOT_FOUND' ? 404 : err.code === 'INVALID' ? 400 : fallback;
 
+// The request-independent half of a form's definition: everything
+// /forms/:id/fields and GET /bundle both need, and nothing either of them
+// derives from its own query string. (inScope/summary/completeness are NOT
+// here — they are computed against a `frequency`/`submissionId` a caller
+// supplies, which the bundle route has no such thing to supply on any one
+// form's behalf, so they stay in that route alone.)
+//
+// Throws (never catches) when the file cannot be parsed — parseWorkbook's
+// own rejection propagates straight out — so each caller decides for itself
+// what a parse failure means for ITS response: one form's fields route turns
+// it into a 500, while the bundle route sets that one form aside in
+// `skipped` and keeps going for every other form.
+async function formSpec(db, form) {
+  const fields = db.prepare('select * from form_fields where form_id=? order by sort_order').all(form.id);
+  let tasks = [], frequencies = [];
+  // Where each entered value belongs on the reproduced sheet, so the left
+  // pane can show the record as it will look on paper instead of a blank
+  // form. Derived from the parsed definition, never guessed: a field with
+  // no determinate cell (e.g. every task status on the two forms that have
+  // no Status column) is simply absent, and the client renders only what it
+  // is told. Both default to an empty/absent map so a pdf form, or one that
+  // is not `ready`, still returns a valid payload.
+  // ...and which printed option of the frequency band each interval is, so
+  // the preview can ring the selected one the way a technician rings it on
+  // paper. Absent for an interval the form does not offer.
+  let cellFor = {}, titleCell = null, intervalCells = {}, calibrationCells = {};
+  if (form.file_type === 'xlsx' && form.state === 'ready') {
+    const def = await parseWorkbook(form.file_path);
+    tasks = def.tasks; frequencies = def.frequencies;
+    ({ cellFor, titleCell, intervalCells, calibrationCells } = cellMapFor(def));
+  }
+  return { form, fields, frequencies, tasks, cellFor, titleCell, intervalCells, calibrationCells };
+}
+
 export { tokenOrSession, actingUser };
 
 export function makeRoutes(db) {
@@ -204,32 +238,16 @@ export function makeRoutes(db) {
   r.get('/forms/:id/fields', signedIn, asyncRoute(async (req, res) => {
     const form = db.prepare('select * from form_catalog where id=?').get(req.params.id);
     if (!form) return res.status(404).json({ error: 'Form not found.' });
-    const fields = db.prepare('select * from form_fields where form_id=? order by sort_order').all(form.id);
-    let tasks = [], frequencies = [];
-    // Where each entered value belongs on the reproduced sheet, so the left
-    // pane can show the record as it will look on paper instead of a blank
-    // form. Derived from the parsed definition, never guessed: a field with
-    // no determinate cell (e.g. every task status on the two forms that have
-    // no Status column) is simply absent, and the client renders only what it
-    // is told. Both default to an empty/absent map so a pdf form, or one that
-    // is not `ready`, still returns a valid payload.
-    // ...and which printed option of the frequency band each interval is, so
-    // the preview can ring the selected one the way a technician rings it on
-    // paper. Absent for an interval the form does not offer.
-    let cellFor = {}, titleCell = null, intervalCells = {}, calibrationCells = {};
-    if (form.file_type === 'xlsx' && form.state === 'ready') {
-      let def;
-      try {
-        def = await parseWorkbook(form.file_path);
-      } catch (err) {
-        return unreadableForm(res, form.id, err);
-      }
-      tasks = def.tasks; frequencies = def.frequencies;
-      ({ cellFor, titleCell, intervalCells, calibrationCells } = cellMapFor(def));
+    let spec;
+    try {
+      spec = await formSpec(db, form);
+    } catch (err) {
+      return unreadableForm(res, form.id, err);
     }
+    const { tasks } = spec;
     const selected = String(req.query.frequency ?? '');
     const response = {
-      form, fields, frequencies, tasks, cellFor, titleCell, intervalCells, calibrationCells,
+      ...spec,
       inScope: (selected ? tasksInScope(tasks, selected) : tasks).map((t) => t.row),
       summary: selected ? scopeSummary(tasks, selected) : null
     };
@@ -245,6 +263,38 @@ export function makeRoutes(db) {
     }
 
     res.json(response);
+  }));
+
+  // Every ready xlsx form's full definition in one payload, for the Android
+  // app's offline cache — one request at sync time instead of a fields call
+  // per form. Per-form: exactly what /forms/:id/fields returns (minus the
+  // request-scoped inScope/summary/completeness, which only mean something
+  // against a frequency or submission the app does not have yet) plus the
+  // grid /forms/:id/grid returns, so the device can render the sheet without
+  // a second round trip. tokenOrSession, not signedIn: this is the one route
+  // the paired device calls with its own bearer token instead of a browser
+  // session.
+  //
+  // A form whose file cannot be read (moved, corrupted, deleted since the
+  // last scan) must never fail the WHOLE bundle for every other form and
+  // every other device — it is set aside in `skipped` instead, exactly the
+  // per-form failure the single-form routes turn into a 500 for.
+  r.get('/bundle', tokenOrSession(db), asyncRoute(async (_req, res) => {
+    const readyForms = db.prepare("select * from form_catalog where state='ready' and file_type='xlsx'").all();
+    const forms = [];
+    const skipped = [];
+    for (const form of readyForms) {
+      try {
+        const spec = await formSpec(db, form);
+        const def = await parseWorkbook(form.file_path);
+        const grid = await buildGrid(form.file_path, def);
+        forms.push({ ...spec, grid });
+      } catch (err) {
+        console.error(`Bundle: form ${form.id} could not be read; skipping:`, err);
+        skipped.push({ id: form.id, error: 'This form could not be read.' });
+      }
+    }
+    res.json({ generated_at: new Date().toISOString(), forms, skipped });
   }));
 
   r.post('/submissions', requireRole('technician'), (req, res) => {
