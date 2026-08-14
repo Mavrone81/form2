@@ -69,6 +69,11 @@ class PreviewRenderException extends PreviewEngineException {
 /// was signed" notice needs a live re-read of the form file to detect,
 /// which only the server can do -- an offline preview has nothing to compare
 /// the cached bundle against, so it never claims staleness it cannot check).
+/// `identity` has the same blind spot for the same reason: it reflects
+/// whatever this device's cached bundle holds, not a live read of the form,
+/// so a revision made server-side after this device's last `GET /bundle`
+/// previews under the OLD title/doc number/revision until the device
+/// re-syncs -- see the comment where `identity` is built, below.
 Map<String, dynamic> buildEngineInput(
   Map<String, dynamic> bundleForm,
   LocalRecord record,
@@ -79,6 +84,16 @@ Map<String, dynamic> buildEngineInput(
       ? Map<String, dynamic>.from(bundleForm['form'] as Map)
       : <String, dynamic>{};
 
+  // The bundle's `fields` (server: `select * from form_fields`, 9 columns
+  // including `id`/`form_id`/`source`) is a compatible SUPERSET of what a
+  // real submission's `form_snapshot` stores (server: `select field_key,
+  // label, section, kind, options, sort_order from form_fields`, 6 columns
+  // -- see `createSubmission` in `server/workflow.js`). Passed straight
+  // through rather than narrowed to those 6: `renderRecordPdf` only ever
+  // reads `field_key`, `kind`, `label` and `section` off a snapshot entry
+  // (`unmappedFields`/`planValues` in `server/pdf-record.js`), and the extra
+  // columns here are simply ignored, the same way an unrecognised object key
+  // always is in JS.
   final snapshot = ((bundleForm['fields'] as List?) ?? [])
       .map((e) => Map<String, dynamic>.from(e as Map))
       .toList();
@@ -99,6 +114,14 @@ Map<String, dynamic> buildEngineInput(
         ]
       : <Map<String, dynamic>>[];
 
+  // Same staleness caveat as `notice` below applies here too, for the same
+  // root cause: this reads whatever `title`/`doc_number`/`revision` happen
+  // to be on the CACHED bundle, not a live read of the form. If an admin
+  // revises the document on the server after this device's last `GET
+  // /bundle`, the offline preview keeps showing the old identity until the
+  // device re-syncs its bundle -- there is nothing here to detect that,
+  // the same way there is nothing here to detect the source file changing
+  // underneath a signed record (the case `notice` exists for on the server).
   final identity = {
     'title': (form['title'] ?? '').toString(),
     'doc_number': (form['doc_number'] ?? '').toString(),
@@ -142,6 +165,24 @@ Map<String, dynamic> buildEngineInput(
 /// `mobile/pdf-engine/harness.html`'s protocol doc).
 abstract class EngineTransport {
   Future<Map<String, dynamic>> render(Map<String, dynamic> input);
+}
+
+/// Interprets the return value of the readiness probe
+/// `WebViewEngineTransport` runs on `onPageFinished`
+/// (`typeof window.renderRecordPdf === 'function'`) -- `true` means the
+/// engine script loaded and defined the function; anything else means it
+/// didn't. Extracted as its own pure function because
+/// `runJavaScriptReturningResult`'s return shape is not uniform across
+/// webview_flutter's platform implementations: some hand back a real Dart
+/// `bool`, others a JSON-encoded string (`'true'`, or quoted as `'"true"'`).
+/// That parsing ambiguity is exactly the kind of decision worth pinning with
+/// a plain Dart-VM test (`test/engine_input_test.dart`) independent of the
+/// WebView itself, which is the one part of this file that stays
+/// device-tested only (see [WebViewEngineTransport]'s own doc comment).
+bool readinessProbeIndicatesEngine(Object? probeResult) {
+  if (probeResult is bool) return probeResult;
+  final text = probeResult?.toString().trim().toLowerCase();
+  return text == 'true' || text == '"true"';
 }
 
 /// Bridges to the hidden WebView loading `assets/pdf-engine/harness.html`
@@ -195,6 +236,54 @@ class WebViewEngineTransport implements EngineTransport {
                 ),
               );
             }
+          },
+          // The harness page (`mobile/pdf-engine/harness.html`) loads
+          // `dist/pdf-engine.js` and `harness.js` as plain, synchronous
+          // `<script src>` tags -- neither `async` nor `defer` -- so by the
+          // time the page's `load` event fires (this callback), both have
+          // already finished executing: `window.renderRecordPdf` is
+          // DEFINITIVELY present or absent, and harness.js has already
+          // either posted `ready` or, on a missing engine script, posted
+          // nothing at all (see harness.js's own `loaded` check -- that
+          // silent-failure case is exactly why this probe exists). Probing
+          // directly here, instead of only ever waiting on a `ready`
+          // message that a missing asset means will never arrive, turns
+          // that failure from a 35s timeout on EVERY attempt (the cached
+          // `_ready` completer is re-awaited on every retry) into an
+          // immediate, clearly-worded error on the first one -- and every
+          // retry after, since a completed Future rejects instantly for any
+          // later `await`.
+          onPageFinished: (_) async {
+            if (ready.isCompleted) return;
+            bool present;
+            try {
+              // `_controller` rather than the local `controller` being built
+              // by this very cascade: this callback only ever fires once the
+              // page has loaded, well after `_controller = controller;`
+              // below has run, but referencing the local here would be a
+              // forward reference within its own declaration statement,
+              // which Dart rejects at compile time.
+              final result = await _controller!.runJavaScriptReturningResult(
+                "typeof window.renderRecordPdf === 'function'",
+              );
+              present = readinessProbeIndicatesEngine(result);
+            } catch (e) {
+              // Could not even run the probe -- treat exactly like "engine
+              // absent" rather than falling through to silently wait on a
+              // `ready` that may now never come either.
+              present = false;
+            }
+            if (!present && !ready.isCompleted) {
+              ready.completeError(
+                StateError(
+                  'PDF engine asset missing from this build — reinstall the app / report this build.',
+                ),
+              );
+            }
+            // When present, `ready` is left for `_onMessage`'s own
+            // `{type: 'ready'}` handling to complete -- harness.js has
+            // already sent it (or is about to, via the JS channel) by this
+            // point, so there is nothing more to do here.
           },
         ),
       );

@@ -350,6 +350,43 @@ void main() {
       );
     });
   });
+
+  // WebViewEngineTransport itself stays device-tested only (see its doc
+  // comment) -- but the DECISION it makes from a readiness probe result is
+  // plain Dart, and worth pinning here: webview_flutter's
+  // `runJavaScriptReturningResult` does not return a uniform shape across
+  // platform implementations for a JS boolean expression, so this is the
+  // one place that ambiguity is actually resolved.
+  group('readinessProbeIndicatesEngine', () {
+    test('a real Dart bool true means the engine is present', () {
+      expect(readinessProbeIndicatesEngine(true), isTrue);
+    });
+
+    test('a real Dart bool false means the engine is absent', () {
+      expect(readinessProbeIndicatesEngine(false), isFalse);
+    });
+
+    test('an unquoted "true" string (some platforms) means present', () {
+      expect(readinessProbeIndicatesEngine('true'), isTrue);
+    });
+
+    test('a JSON-quoted \'"true"\' string (other platforms) means present', () {
+      expect(readinessProbeIndicatesEngine('"true"'), isTrue);
+    });
+
+    test('"false" means absent', () {
+      expect(readinessProbeIndicatesEngine('false'), isFalse);
+    });
+
+    test('null (the probe itself failing) means absent', () {
+      expect(readinessProbeIndicatesEngine(null), isFalse);
+    });
+
+    test('any other, unrecognised value means absent -- fails closed', () {
+      expect(readinessProbeIndicatesEngine('undefined'), isFalse);
+      expect(readinessProbeIndicatesEngine(0), isFalse);
+    });
+  });
 }
 
 /// A transport whose Future never completes -- the exact shape of a hidden
