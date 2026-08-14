@@ -24,6 +24,7 @@ class FormsListScreen extends StatefulWidget {
     required this.userFullName,
     this.api,
     this.connectivity,
+    this.onAuthExpired,
   });
 
   final LocalDb db;
@@ -41,11 +42,13 @@ class FormsListScreen extends StatefulWidget {
   /// block. Nothing here uses it itself.
   final String userFullName;
 
-  /// Likewise pass-through, and likewise only for the editor's preview: the
-  /// "view the server's copy" fallback, which only ever applies to a record
-  /// that has already synced (never to the brand-new draft this screen makes).
+  /// Likewise pass-throughs, and likewise only for the editor's preview: the
+  /// "view the server's copy" fallback (which only ever applies to a record
+  /// that has already synced, never to the brand-new draft this screen
+  /// makes) and the 401 seam that fallback routes through.
   final ApiClient? api;
   final ConnectivitySource? connectivity;
+  final VoidCallback? onAuthExpired;
 
   @override
   State<FormsListScreen> createState() => _FormsListScreenState();
@@ -91,6 +94,7 @@ class _FormsListScreenState extends State<FormsListScreen> {
           userFullName: widget.userFullName,
           api: widget.api,
           connectivity: widget.connectivity,
+          onAuthExpired: widget.onAuthExpired,
         ),
       ),
     );

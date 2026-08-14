@@ -135,6 +135,7 @@ class TechnicianHomeScreenState extends State<TechnicianHomeScreen> {
           userFullName: widget.userFullName,
           api: widget.api,
           connectivity: widget.connectivity,
+          onAuthExpired: widget.onAuthExpired,
         ),
       ),
     );
@@ -151,6 +152,7 @@ class TechnicianHomeScreenState extends State<TechnicianHomeScreen> {
           userFullName: widget.userFullName,
           api: widget.api,
           connectivity: widget.connectivity,
+          onAuthExpired: widget.onAuthExpired,
         ),
       ),
     );

@@ -273,11 +273,32 @@ const REJECTIONS_SQL =
 
 // Signature ink is replayable: an image lifted from one record could be
 // pasted onto another. Attribution (who signed, when) stays legible to every
-// signed-in reader, but the image itself is returned only to the stage that
-// drew it and to an admin — mirroring the PDF route's own rule rather than
-// leaving a second, laxer path to the same evidence.
-const visibleSignatures = (rows, user) => rows.map(({ image_png, ...rest }) =>
-  (user.role === 'admin' || rest.stage === user.role) ? { ...rest, image_png } : rest);
+// signed-in reader, but the image itself is returned only to an admin, and
+// otherwise only to the reader who actually drew it:
+//
+//   * an admin sees every stage's ink;
+//   * a team leader or engineer sees their OWN stage's ink on any record
+//     they can read (role equality is the whole rule for a reviewer — there
+//     is exactly one reviewer of each kind per record, so their stage row
+//     is by definition theirs);
+//   * a technician sees the technician-stage ink only on a record THEY
+//     created.
+//
+// That last clause is the one role equality alone got wrong. Every
+// technician's signature sits at stage 'technician', so `stage === role`
+// handed technician B the image of technician A's signature on A's record —
+// the exact replayable evidence this function exists to withhold, and a
+// laxer path to it than the PDF route, which refuses B outright
+// (assertCanViewPdf in server/workflow.js: for a technician the rule is
+// OWNERSHIP, not role). `sub` is threaded in for that comparison so the two
+// paths to the same ink now agree.
+const visibleSignatures = (rows, user, sub) => rows.map(({ image_png, ...rest }) => {
+  const ownStage = rest.stage === user.role;
+  // Only the technician stage needs the extra ownership test: it is the one
+  // stage whose actor is not unique per record.
+  const owned = rest.stage !== 'technician' || sub.created_by === user.id;
+  return (user.role === 'admin' || (ownStage && owned)) ? { ...rest, image_png } : rest;
+});
 
 // Express 4 does not catch a rejected promise thrown by an async handler —
 // it becomes an unhandled rejection, and Node 22's default
@@ -656,7 +677,7 @@ export function makeRoutes(db) {
       submission: sub,
       snapshot: JSON.parse(sub.form_snapshot),
       values: db.prepare('select field_key, value from submission_fields where submission_id=?').all(sub.id),
-      signatures: visibleSignatures(db.prepare(SIGNATURES_SQL).all(sub.id), req.session.user),
+      signatures: visibleSignatures(db.prepare(SIGNATURES_SQL).all(sub.id), req.session.user, sub),
       rejections: db.prepare(REJECTIONS_SQL).all(sub.id)
     });
   });

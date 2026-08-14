@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ExcelJS from 'exceljs';
 import { openDb } from '../server/db.js';
+import { createUser } from '../server/auth.js';
 import { createApp } from '../server/index.js';
 import { seedDemoUsers } from '../server/seed.js';
 import { scanFolder } from '../server/scanner.js';
@@ -399,6 +400,56 @@ test('signature ink is returned only for a stage the caller is entitled to see',
     const asAdmin = (await call('GET', `/api/submissions/${sub.id}`)).body.signatures;
     assert.equal(asAdmin.length, 2);
     for (const s of asAdmin) assert.equal(s.image_png, PNG, 'an admin sees every stage\'s ink');
+  } finally { server.close(); }
+});
+
+// Every technician signs at stage 'technician', so a role-equality rule
+// handed ANY technician the image of ANY other technician's signature — the
+// precise replayable evidence visibleSignatures exists to withhold, and a
+// laxer path to it than the PDF route, which refuses a non-owning technician
+// outright. The rule for the technician stage is ownership.
+test('a technician sees the technician-stage ink only on a record they created', async () => {
+  const { db, server, call } = await boot();
+  try {
+    db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+      values ('/f.xlsx','f.xlsx','xlsx','ready')`).run();
+    createUser(db, { username: 'tech2', password: 'tech2', fullName: 'Tech Two', role: 'technician' });
+
+    // Technician A creates and signs a record.
+    await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+    const sub = (await call('POST', '/api/submissions', { formId: 1, machineId: 'ED04', frequency: 'Y' })).body;
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+
+    // ...and reads their own ink back, unchanged by this rule.
+    const asOwner = (await call('GET', `/api/submissions/${sub.id}`)).body.signatures;
+    const ownerRow = asOwner.find((s) => s.stage === 'technician');
+    assert.equal(ownerRow.image_png, PNG, 'a technician must still get their OWN ink back');
+
+    // Technician B reads the same record: attribution yes, ink no.
+    await call('POST', '/api/login', { username: 'tech2', password: 'tech2' });
+    const asOther = (await call('GET', `/api/submissions/${sub.id}`)).body.signatures;
+    const otherRow = asOther.find((s) => s.stage === 'technician');
+    assert.equal('image_png' in otherRow, false,
+      'another technician\'s signature image must never be handed out on role equality alone');
+    assert.ok(otherRow.full_name, 'attribution stays legible even when the ink is withheld');
+    assert.ok(otherRow.signed_at);
+    // And the two paths to this evidence agree: the PDF route refuses B too.
+    assert.equal((await call('GET', `/api/submissions/${sub.id}/pdf`)).status, 403);
+
+    // The reviewer rule is untouched: a lead sees lead-stage ink on a record
+    // awaiting them, having signed it, exactly as before.
+    await call('POST', '/api/login', { username: 'lead', password: 'lead' });
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG });
+    const asLead = (await call('GET', `/api/submissions/${sub.id}`)).body.signatures;
+    assert.equal(asLead.find((s) => s.stage === 'team_leader').image_png, PNG,
+      'a reviewer\'s own-stage rule must be unchanged');
+    assert.equal('image_png' in asLead.find((s) => s.stage === 'technician'), false,
+      'a lead still sees no technician ink');
+
+    // ...and an admin still sees everything.
+    await call('POST', '/api/login', { username: 'admin', password: 'admin' });
+    const asAdmin = (await call('GET', `/api/submissions/${sub.id}`)).body.signatures;
+    for (const s of asAdmin) assert.equal(s.image_png, PNG);
   } finally { server.close(); }
 });
 

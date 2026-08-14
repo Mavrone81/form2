@@ -112,6 +112,7 @@ Future<void> _pumpPreview(
   LocalDb db, {
   ApiClient? api,
   ConnectivitySource? connectivity,
+  VoidCallback? onAuthExpired,
 }) async {
   await tester.pumpWidget(MaterialApp(
     home: PdfPreviewScreen(
@@ -120,6 +121,7 @@ Future<void> _pumpPreview(
       userFullName: 'Tech One',
       api: api,
       connectivity: connectivity,
+      onAuthExpired: onAuthExpired,
       engine: PreviewEngine(transport: _ErrorTransport()),
     ),
   ));
@@ -252,6 +254,58 @@ void main() {
       // Still recoverable: both ways out are still on offer.
       expect(find.widgetWithText(FilledButton, 'Retry'), findsOneWidget);
       expect(find.widgetWithText(TextButton, 'View server copy'), findsOneWidget);
+    });
+
+    testWidgets('a 401 routes through onAuthExpired and shows the shared copy, not the server string', (tester) async {
+      final db = await _seed(RecordStatus.synced, serverId: 42);
+      addTearDown(db.close);
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+      final api = _FakeApi()..pdfError = ApiException(401, 'Sign in to continue.');
+      var expiredCalls = 0;
+
+      await _pumpPreview(tester, db, api: api, connectivity: connectivity, onAuthExpired: () => expiredCalls++);
+      await tester.tap(find.widgetWithText(TextButton, 'View server copy'));
+      await tester.pumpAndSettle();
+
+      expect(expiredCalls, 1);
+      expect(find.textContaining('Session expired'), findsOneWidget);
+      expect(find.textContaining('Sign in to continue.'), findsNothing,
+          reason: 'the server\'s own 401 wording means nothing beside a preview');
+    });
+
+    testWidgets('a non-401 refusal never routes to the auth path', (tester) async {
+      final db = await _seed(RecordStatus.synced, serverId: 42);
+      addTearDown(db.close);
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+      final api = _FakeApi()..pdfError = ApiException(500, 'Internal error');
+      var expiredCalls = 0;
+
+      await _pumpPreview(tester, db, api: api, connectivity: connectivity, onAuthExpired: () => expiredCalls++);
+      await tester.tap(find.widgetWithText(TextButton, 'View server copy'));
+      await tester.pumpAndSettle();
+
+      expect(expiredCalls, 0);
+      expect(find.textContaining('Internal error'), findsOneWidget);
+    });
+  });
+
+  group('PdfPreviewScreen missing form copy', () {
+    testWidgets('does not promise that syncing will bring a pruned form back', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      // A record whose form is NOT cached -- the state a technician reaches
+      // after the form was withdrawn server-side and pruned locally.
+      await db.insertRecord(_record(RecordStatus.draft));
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await _pumpPreview(tester, db, api: _FakeApi(), connectivity: connectivity);
+
+      expect(find.textContaining('Sync to continue'), findsNothing);
+      expect(find.textContaining('no longer available on this device'), findsOneWidget);
+      expect(find.textContaining('still syncs normally'), findsOneWidget);
     });
   });
 }

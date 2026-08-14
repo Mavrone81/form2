@@ -47,6 +47,7 @@ class RecordEditorScreen extends StatefulWidget {
     required this.userFullName,
     this.api,
     this.connectivity,
+    this.onAuthExpired,
     this.previewEngine,
   });
 
@@ -60,13 +61,16 @@ class RecordEditorScreen extends StatefulWidget {
   /// signed in (see `buildEngineInput`'s own doc).
   final String userFullName;
 
-  /// Both optional and both only ever reach [PdfPreviewScreen], which uses
-  /// them for one thing: offering the server's archival copy of a record
-  /// that has already SYNCED, when the local render fails and the device is
-  /// online. Omitted, the preview is purely on-device and makes no network
-  /// call at all.
+  /// All three optional, and all three only ever reach [PdfPreviewScreen]:
+  /// the first two for its one network feature (offering the server's
+  /// archival copy of a record that has already SYNCED, when the local
+  /// render fails and the device is online), the third so a 401 from that
+  /// fetch routes to the login screen like every other 401 in the app.
+  /// Omitted, the preview is purely on-device and makes no network call at
+  /// all.
   final ApiClient? api;
   final ConnectivitySource? connectivity;
+  final VoidCallback? onAuthExpired;
 
   /// Injectable renderer for the preview screen this one opens. `null` (the
   /// default, and what the whole app passes) lets [PdfPreviewScreen] build
@@ -110,7 +114,14 @@ class RecordEditorScreenState extends State<RecordEditorScreen> {
     final bundleRow = await widget.db.getBundle(formId);
     if (bundleRow == null) {
       setState(() {
-        _error = 'This form has not been downloaded to this device. Sync to continue.';
+        // Not "sync to continue": a form reaches this state chiefly by being
+        // withdrawn or unmapped server-side, which the next bundle refresh
+        // PRUNES rather than restores (see LocalDb.replaceBundle) -- syncing
+        // will not bring it back, and saying it will sends a technician
+        // refreshing for ever. The reassurance that is actually true is that
+        // their record is not lost.
+        _error = 'This form is no longer available on this device, so this record '
+            'cannot be opened. The record itself is safe and still syncs normally.';
         _loading = false;
       });
       return;
@@ -237,6 +248,7 @@ class RecordEditorScreenState extends State<RecordEditorScreen> {
           userFullName: widget.userFullName,
           api: widget.api,
           connectivity: widget.connectivity,
+          onAuthExpired: widget.onAuthExpired,
           engine: widget.previewEngine,
         ),
       ),

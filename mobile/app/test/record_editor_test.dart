@@ -309,6 +309,31 @@ void main() {
     expect(stored.values['remarks'], 'Cleaned and greased');
   });
 
+  testWidgets('a record whose form is no longer cached does not promise that syncing will restore it', (tester) async {
+    final db = _newDb();
+    addTearDown(db.close);
+    // No bundle row at all: the state a technician reaches when the form was
+    // withdrawn server-side and pruned from this device on the next refresh.
+    const uuid = '33333333-3333-4333-8333-333333333333';
+    await db.insertRecord(LocalRecord(
+      clientUuid: uuid,
+      formId: 1,
+      frequency: 'Y',
+      machineId: 'GEN-1',
+      values: const {},
+      signaturePng: '',
+      signedAt: '',
+      status: RecordStatus.draft,
+    ));
+
+    await tester.pumpWidget(_harness(db, uuid));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('Sync to continue'), findsNothing);
+    expect(find.textContaining('no longer available on this device'), findsOneWidget);
+    expect(find.textContaining('still syncs normally'), findsOneWidget);
+  });
+
   // The spec's first promise about this app is "The Preview button renders
   // the actual final document from the current values" -- so there has to be
   // a Preview button, on the screen where the values are.

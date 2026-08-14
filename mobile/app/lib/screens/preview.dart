@@ -45,6 +45,7 @@ class PdfPreviewScreen extends StatefulWidget {
     required this.userFullName,
     this.api,
     this.connectivity,
+    this.onAuthExpired,
     PreviewEngine? engine,
   }) : engine = engine ?? PreviewEngine();
 
@@ -59,6 +60,12 @@ class PdfPreviewScreen extends StatefulWidget {
   /// Optional, and read for the same one decision: there is no point
   /// offering to fetch the server's copy on a device that cannot reach it.
   final ConnectivitySource? connectivity;
+
+  /// Invoked when fetching the server copy is refused with 401 -- the same
+  /// seam the review queue and the sync banner use, so a dead session leads
+  /// to the login screen from wherever it is first noticed rather than
+  /// showing this screen's reader a server string they cannot act on.
+  final VoidCallback? onAuthExpired;
 
   /// The signed-in technician's display name -- stamped into the preview's
   /// signature block when this record has been signed. See
@@ -137,7 +144,15 @@ class _PdfPreviewScreenState extends State<PdfPreviewScreen> {
       final bundleRow = await widget.db.getBundle(formId);
       if (bundleRow == null) {
         setState(() {
-          _error = 'This form has not been downloaded to this device. Sync to continue.';
+          // Deliberately does NOT say "sync to continue": the commonest way
+          // to reach this state is the form having been withdrawn or
+          // unmapped server-side, which the next bundle refresh PRUNES
+          // rather than restores (see LocalDb.replaceBundle) -- so syncing
+          // would never fix it and promising otherwise sends a technician
+          // pulling to refresh for ever. What matters to them is the part
+          // that is still true: the record itself is safe.
+          _error = 'This form is no longer available on this device, so the '
+              'document cannot be drawn here. The record itself is safe and still syncs normally.';
           _loading = false;
         });
         return;
@@ -192,8 +207,21 @@ class _PdfPreviewScreenState extends State<PdfPreviewScreen> {
       });
     } on ApiException catch (e) {
       if (!mounted) return;
-      // The server's own message, verbatim -- same treatment the engine's
-      // errors get, and the retry/server-copy actions are still on offer.
+      // A 401 is not something to quote at the technician: the session is
+      // gone, no retry from this screen can bring it back, and the server's
+      // own wording ("Sign in to continue.") means nothing next to a preview.
+      // Same seam, same words as everywhere else a 401 surfaces.
+      if (e.statusCode == 401) {
+        setState(() {
+          _error = sessionExpiredMessage;
+          _loading = false;
+        });
+        widget.onAuthExpired?.call();
+        return;
+      }
+      // Anything else: the server's own message, verbatim -- same treatment
+      // the engine's errors get, and the retry/server-copy actions are still
+      // on offer.
       setState(() {
         _error = 'Could not fetch the server copy: ${e.message}';
         _loading = false;
