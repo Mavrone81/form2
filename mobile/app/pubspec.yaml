@@ -66,6 +66,23 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  # The on-device PDF preview engine: the harness page the hidden WebView
+  # loads, plus the bundled renderer it loads relative to itself
+  # (`harness.html`'s own `<script src="dist/pdf-engine.js">`, unmodified --
+  # see `mobile/pdf-engine/harness.html`). None of these three files is
+  # committed under this app: they are copied into place from
+  # `mobile/pdf-engine/` by the build pipeline (`node
+  # mobile/pdf-engine/build.mjs`, then a copy step -- see Task 12's CI
+  # workflow) before `flutter build`/`flutter test` ever run, exactly the
+  # way `mobile/pdf-engine/dist/` itself is a gitignored build artifact.
+  # `lib/preview/engine.dart`'s WebView transport treats a load failure here
+  # (missing/empty asset) as a typed, surfaced error -- see its
+  # `onWebResourceError` handler -- rather than a silent blank preview.
+  assets:
+    - assets/pdf-engine/harness.html
+    - assets/pdf-engine/harness.js
+    - assets/pdf-engine/dist/pdf-engine.js
+
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg

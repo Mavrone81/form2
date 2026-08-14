@@ -54,3 +54,10 @@ app.*.map.json
 *.jks
 key.properties
 android/key.properties
+
+# The on-device PDF preview engine (harness.html, harness.js,
+# dist/pdf-engine.js) is a build artefact staged here from
+# mobile/pdf-engine/ by the build pipeline -- never committed, exactly like
+# mobile/pdf-engine/dist/ itself. See pubspec.yaml's `flutter.assets` entry
+# and lib/preview/engine.dart for what happens when it is missing.
+/assets/pdf-engine/
