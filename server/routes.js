@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { readFileSync } from 'node:fs';
 import { authenticate, requireRole, createUser, ROLES } from './auth.js';
+import { issueDeviceToken, revokeUserTokens } from './device-tokens.js';
 import { listForms, scanFolder } from './scanner.js';
 import { buildGrid } from './grid-model.js';
 import { parseWorkbook } from './excel-parser.js';
@@ -107,6 +108,14 @@ export function makeRoutes(db) {
     }
     loginThrottle.clear(throttleKey);
     req.session.user = user;
+    // The Android app has no browser cookie jar to hold a session, so it
+    // opts in to a long-lived bearer token on the same login call instead of
+    // a second round trip. The web client never sends this flag, so its
+    // response shape is unchanged.
+    if (req.body?.wantDeviceToken === true) {
+      const { token, expires_at } = issueDeviceToken(db, user.id);
+      return res.json({ ...user, device_token: token, device_token_expires_at: expires_at });
+    }
     res.json(user);
   });
   r.post('/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
@@ -408,6 +417,9 @@ export function makeRoutes(db) {
     const { fullName, role, active } = req.body ?? {};
     db.prepare('update users set full_name=coalesce(?,full_name), role=coalesce(?,role), active=coalesce(?,active) where id=?')
       .run(fullName ?? null, role ?? null, active ?? null, req.params.id);
+    // A deactivated account must not keep working from an already-paired
+    // phone just because that token has not hit its 30-day expiry yet.
+    if (active === 0 || active === false) revokeUserTokens(db, req.params.id);
     res.json({ ok: true });
   });
 

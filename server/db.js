@@ -144,7 +144,23 @@ const MIGRATIONS = [
   // it is stored as text, rendered as text on the sheet, and compared as text.
   // What changes is only which values are allowed, which is exactly what this
   // column states.
-  { table: 'form_fields', column: 'options', ddl: "alter table form_fields add column options text not null default ''" }
+  { table: 'form_fields', column: 'options', ddl: "alter table form_fields add column options text not null default ''" },
+  // A new table, not a new column, so it cannot be keyed on a column-presence
+  // check like the entries above. `create: true` instead runs the DDL when
+  // `pragma table_info` comes back empty, i.e. the table does not exist yet —
+  // the same "run once, then never again" guarantee, for the table-creation
+  // case. Bearer tokens for the Android app: a phone stays signed in across
+  // app restarts without holding the session cookie a browser would use.
+  { table: 'device_tokens', create: true, ddl: `
+    create table if not exists device_tokens (
+      id integer primary key,
+      token_hash text not null unique,
+      user_id integer not null references users(id),
+      issued_at text not null,
+      expires_at text not null,
+      last_used_at text
+    )
+  ` }
 ];
 
 // The allowed answers for a field, as a list. '' (the default for every
@@ -157,9 +173,13 @@ export function optionsOf(field) {
 }
 
 function applyMigrations(db) {
-  for (const { table, column, ddl } of MIGRATIONS) {
-    const columns = db.prepare(`pragma table_info(${table})`).all().map((c) => c.name);
-    if (!columns.includes(column)) db.exec(ddl);
+  for (const { table, column, create, ddl } of MIGRATIONS) {
+    const info = db.prepare(`pragma table_info(${table})`).all();
+    if (create) {
+      if (info.length === 0) db.exec(ddl);
+      continue;
+    }
+    if (!info.map((c) => c.name).includes(column)) db.exec(ddl);
   }
 }
 
