@@ -6,6 +6,7 @@ import { createUser } from '../server/auth.js';
 import { createApp } from '../server/index.js';
 import { seedDemoUsers } from '../server/seed.js';
 import { issueDeviceToken, validateDeviceToken, revokeUserTokens } from '../server/device-tokens.js';
+import { tokenOrSession, actingUser } from '../server/routes.js';
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -105,14 +106,22 @@ async function boot() {
   const db = openDb(':memory:');
   seedDemoUsers(db, { silent: true });
   const app = createApp({ db });
+  // No production route uses tokenOrSession yet (that lands with the form
+  // bundle route in the next task) -- this is the same app/session instance
+  // as every other route in this file's HTTP tests, just with one extra,
+  // test-only route on it, so a session cookie minted by the real /login
+  // route above is recognized here too.
+  app.get('/__test/whoami', tokenOrSession(db), (req, res) => {
+    res.json({ authVia: req.authVia, user: actingUser(req) });
+  });
   const server = app.listen(0);
   const port = server.address().port;
   const base = `http://127.0.0.1:${port}`;
   let cookie = '';
-  const call = async (method, path, body) => {
+  const call = async (method, path, body, headers) => {
     const res = await fetch(base + path, {
       method,
-      headers: { 'content-type': 'application/json', ...(cookie ? { cookie } : {}) },
+      headers: { 'content-type': 'application/json', ...(cookie ? { cookie } : {}), ...(headers ?? {}) },
       body: body ? JSON.stringify(body) : undefined
     });
     const set = res.headers.get('set-cookie');
@@ -155,8 +164,8 @@ test('deactivating a user via the admin route revokes a device token issued to t
   const patch = await call('PATCH', '/api/admin/users/1', { active: 0 });
   assert.equal(patch.status, 200);
 
-  // No token-authed route exists yet (that's a later task), so the
-  // end-to-end assertion stops at the function the route calls.
+  // No production token-authed route exists yet (that's a later task), so
+  // the end-to-end assertion stops at the function the route calls.
   assert.equal(validateDeviceToken(db, token), null, 'a deactivated user\'s token must stop validating');
 
   // The assertion above passes even if the route's call to
@@ -174,4 +183,101 @@ test('deactivating a user via the admin route revokes a device token issued to t
   // The control token was never touched by any of this.
   assert.ok(validateDeviceToken(db, leadToken), "another user's token must survive an unrelated deactivation");
   server.close();
+});
+
+// --- tokenOrSession middleware ---
+// /__test/whoami (mounted in boot() above) is the only route guarded by
+// tokenOrSession anywhere in this suite -- exercising the actual middleware
+// over HTTP, on the same app/session instance the login route above uses,
+// rather than calling it as a bare function.
+
+test('a request with a valid Bearer token reaches a tokenOrSession route without a cookie', async () => {
+  const { db, server, call } = await boot();
+  const user = makeUser(db, { username: 'whoami-tech' });
+  const { token } = issueDeviceToken(db, user.id);
+  try {
+    // No prior login on this call()'s cookie jar -- it is empty for the
+    // whole test, so this proves the route works from the header alone.
+    const res = await call('GET', '/__test/whoami', undefined, { authorization: `Bearer ${token}` });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.authVia, 'token');
+    assert.equal(res.body.user.id, user.id);
+    assert.equal(res.body.user.username, 'whoami-tech');
+  } finally {
+    server.close();
+  }
+});
+
+test('a garbage Bearer token gets 401', async () => {
+  const { server, call } = await boot();
+  try {
+    const res = await call('GET', '/__test/whoami', undefined, { authorization: 'Bearer not-a-real-token' });
+    assert.equal(res.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test('an expired Bearer token gets 401', async () => {
+  const { db, server, call } = await boot();
+  const user = makeUser(db, { username: 'expired-tech' });
+  // Insert directly with a past expires_at, same technique as the
+  // expiry test on validateDeviceToken itself above.
+  const token = 'c'.repeat(64);
+  const hash = createHash('sha256').update(token).digest('hex');
+  const past = new Date(Date.now() - 1000).toISOString();
+  db.prepare(
+    'insert into device_tokens (token_hash, user_id, issued_at, expires_at) values (?,?,?,?)'
+  ).run(hash, user.id, past, past);
+  try {
+    const res = await call('GET', '/__test/whoami', undefined, { authorization: `Bearer ${token}` });
+    assert.equal(res.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test('a valid token for a deactivated user gets 401', async () => {
+  const { db, server, call } = await boot();
+  const user = makeUser(db, { username: 'deactivated-tech' });
+  const { token } = issueDeviceToken(db, user.id);
+  db.prepare('update users set active = 0 where id = ?').run(user.id);
+  try {
+    const res = await call('GET', '/__test/whoami', undefined, { authorization: `Bearer ${token}` });
+    assert.equal(res.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test('no session and no Bearer token gets 401 from a tokenOrSession route', async () => {
+  const { server, call } = await boot();
+  try {
+    const res = await call('GET', '/__test/whoami');
+    assert.equal(res.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test('a successful token auth does not create a session', async () => {
+  const { db, server } = await boot();
+  const user = makeUser(db, { username: 'no-session-tech' });
+  const { token } = issueDeviceToken(db, user.id);
+  const port = server.address().port;
+  try {
+    // Raw fetch here (not the call() helper, which discards headers) so the
+    // response's own Set-Cookie header can be inspected directly.
+    const res = await fetch(`http://127.0.0.1:${port}/__test/whoami`, {
+      headers: { authorization: `Bearer ${token}` }
+    });
+    assert.equal(res.status, 200);
+    // Express-session only sends Set-Cookie once a session has actually been
+    // touched (saveUninitialized: false in server/index.js) -- a token-authed
+    // request that never reads/writes req.session gets no session cookie at
+    // all, proving the middleware did not mutate req.session on this path.
+    assert.equal(res.headers.get('set-cookie'), null);
+  } finally {
+    server.close();
+  }
 });

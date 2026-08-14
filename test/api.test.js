@@ -8,6 +8,7 @@ import { openDb } from '../server/db.js';
 import { createApp } from '../server/index.js';
 import { seedDemoUsers } from '../server/seed.js';
 import { scanFolder } from '../server/scanner.js';
+import { tokenOrSession, actingUser } from '../server/routes.js';
 
 const PNG = 'data:image/png;base64,iVBORw0KGgo=';
 
@@ -51,7 +52,7 @@ async function boot() {
     if (set) { setCookie = set; cookie = set.split(';')[0]; }
     return { status: res.status, body: await res.json().catch(() => null) };
   };
-  return { db, server, call, lastSetCookie: () => setCookie };
+  return { db, server, call, app, lastSetCookie: () => setCookie };
 }
 
 test('login locks after 5 failures for that username, and only that username', async () => {
@@ -105,6 +106,27 @@ test('a technician cannot reach admin settings', async () => {
   await call('POST', '/api/login', { username: 'tech', password: 'tech' });
   assert.equal((await call('GET', '/api/admin/settings')).status, 403);
   server.close();
+});
+
+test('tokenOrSession accepts an existing browser session with no Bearer token', async () => {
+  // No production route uses tokenOrSession yet (that lands with the form
+  // bundle route in a later task), so this attaches a private test-only
+  // route to the same app/session instance /api/login already uses here —
+  // proving the session branch of the middleware, alongside the token
+  // branch covered end-to-end in test/device-tokens.test.js.
+  const { db, server, call, app } = await boot();
+  app.get('/__test/whoami', tokenOrSession(db), (req, res) => {
+    res.json({ authVia: req.authVia, user: actingUser(req) });
+  });
+  try {
+    await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+    const res = await call('GET', '/__test/whoami');
+    assert.equal(res.status, 200);
+    assert.equal(res.body.authVia, 'session');
+    assert.equal(res.body.user.role, 'technician');
+  } finally {
+    server.close();
+  }
 });
 
 test('a bad password is refused', async () => {

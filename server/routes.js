@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { readFileSync } from 'node:fs';
 import { authenticate, requireRole, createUser, ROLES } from './auth.js';
-import { issueDeviceToken, revokeUserTokens } from './device-tokens.js';
+import { issueDeviceToken, revokeUserTokens, validateDeviceToken } from './device-tokens.js';
 import { listForms, scanFolder } from './scanner.js';
 import { buildGrid } from './grid-model.js';
 import { parseWorkbook } from './excel-parser.js';
@@ -12,6 +12,42 @@ import { renderRecordPdf } from './pdf-record.js';
 import { createLoginThrottle } from './login-throttle.js';
 
 const signedIn = requireRole(...ROLES);
+
+// Bearer-token counterpart to `signedIn`, for the Android app: accepts
+// either an existing signed-in session (same rule `signedIn` applies) or a
+// device's `Authorization: Bearer <token>` header. A factory rather than a
+// plain middleware -- like `requireRole`'s returned function needs no `db`,
+// this one does, to look the token up -- so a route wires it up as
+// `tokenOrSession(db)` inside makeRoutes, where `db` is in scope.
+//
+// The token branch never reads or touches `req.session`. A bearer-authed
+// request is not a login: a shared shop-floor browser must never come away
+// signed in as whoever's phone last called this route with a token, and a
+// device that only ever sends a token must never accumulate server-side
+// session state on its behalf. `validateDeviceToken` itself stamps
+// `last_used_at` on every successful lookup, so this middleware does not
+// repeat that write.
+function tokenOrSession(db) {
+  return (req, res, next) => {
+    const [scheme, token] = String(req.get('authorization') ?? '').split(' ');
+    if (scheme === 'Bearer' && token) {
+      const user = validateDeviceToken(db, token);
+      if (!user) return res.status(401).json({ error: 'Invalid or expired device token.' });
+      req.deviceUser = user;
+      req.authVia = 'token';
+      return next();
+    }
+    if (!req.session?.user) return res.status(401).json({ error: 'Sign in to continue.' });
+    req.authVia = 'session';
+    next();
+  };
+}
+
+// The identity behind a tokenOrSession-guarded request, however it
+// authenticated -- the device user a bearer token resolved to, or the
+// session user -- so a route reads one thing instead of branching on
+// req.authVia itself just to find out who is acting.
+const actingUser = (req) => req.deviceUser ?? req.session?.user ?? null;
 
 // Signatures must be read back in the workflow's own order — technician,
 // then team leader, then engineer — because drawSignatures lays block i at
@@ -81,6 +117,8 @@ function unreadableForm(res, formId, err) {
 // this record" and sends them looking for the wrong problem.
 const statusFor = (err, fallback) =>
   err.code === 'FORBIDDEN' ? 403 : err.code === 'NOT_FOUND' ? 404 : err.code === 'INVALID' ? 400 : fallback;
+
+export { tokenOrSession, actingUser };
 
 export function makeRoutes(db) {
   const r = Router();
