@@ -33,27 +33,31 @@ void main() {
 
     test('no PIN set yet: verify fails and hasPin is false', () async {
       expect(await pin.hasPin(), isFalse);
-      expect(await pin.verify('1234'), isFalse);
+      expect(await pin.verifyBool('1234'), isFalse);
     });
 
     test('setPin then verify with the same PIN succeeds', () async {
       await pin.setPin('1234');
       expect(await pin.hasPin(), isTrue);
-      expect(await pin.verify('1234'), isTrue);
+      final result = await pin.verify('1234');
+      expect(result.status, PinVerifyStatus.ok);
+      expect(result.isOk, isTrue);
     });
 
     test('wrong PIN fails verification', () async {
       await pin.setPin('1234');
-      expect(await pin.verify('4321'), isFalse);
+      final result = await pin.verify('4321');
+      expect(result.isOk, isFalse);
+      expect(result.status, PinVerifyStatus.wrongPin);
     });
 
     test('accepts 4, 5 and 6 digit PINs', () async {
       await pin.setPin('1234');
-      expect(await pin.verify('1234'), isTrue);
+      expect(await pin.verifyBool('1234'), isTrue);
       await pin.setPin('12345');
-      expect(await pin.verify('12345'), isTrue);
+      expect(await pin.verifyBool('12345'), isTrue);
       await pin.setPin('123456');
-      expect(await pin.verify('123456'), isTrue);
+      expect(await pin.verifyBool('123456'), isTrue);
     });
 
     test('rejects a PIN shorter than 4 or longer than 6 digits, or non-digits', () async {
@@ -78,14 +82,151 @@ void main() {
       expect(saltA, isNot(equals(saltB)));
       expect(hashA, isNot(equals(hashB)));
       // Both remain valid for the same PIN against their own generation.
-      expect(await lock.verify('123456'), isTrue);
+      expect(await lock.verifyBool('123456'), isTrue);
     });
 
     test('clear removes the stored PIN', () async {
       await pin.setPin('1234');
       await pin.clear();
       expect(await pin.hasPin(), isFalse);
-      expect(await pin.verify('1234'), isFalse);
+      expect(await pin.verifyBool('1234'), isFalse);
+    });
+  });
+
+  group('PinLock attempt limiting / lockout', () {
+    late InMemorySecureStorage storage;
+    late DateTime clock;
+    late PinLock pin;
+
+    PinLock makeLock() => PinLock(storage, now: () => clock);
+
+    setUp(() async {
+      storage = InMemorySecureStorage();
+      clock = DateTime.utc(2026, 1, 1, 12, 0, 0);
+      pin = makeLock();
+      await pin.setPin('1234');
+    });
+
+    test('reports remaining attempts before the initial lock', () async {
+      final r1 = await pin.verify('0000');
+      expect(r1.status, PinVerifyStatus.wrongPin);
+      expect(r1.remainingBeforeLock, 4);
+
+      final r2 = await pin.verify('0000');
+      expect(r2.remainingBeforeLock, 3);
+
+      final r3 = await pin.verify('0000');
+      expect(r3.remainingBeforeLock, 2);
+
+      final r4 = await pin.verify('0000');
+      expect(r4.remainingBeforeLock, 1);
+    });
+
+    test('5 consecutive wrong PINs locks the gate for 30 seconds', () async {
+      for (var i = 0; i < 4; i++) {
+        expect((await pin.verify('0000')).status, PinVerifyStatus.wrongPin);
+      }
+      final fifth = await pin.verify('0000');
+      expect(fifth.status, PinVerifyStatus.lockedOut);
+      expect(fifth.lockedUntil, clock.add(const Duration(seconds: 30)));
+    });
+
+    test('the correct PIN during lockout is still refused until expiry', () async {
+      for (var i = 0; i < 5; i++) {
+        await pin.verify('0000');
+      }
+      // Still locked, 10s into a 30s lockout.
+      clock = clock.add(const Duration(seconds: 10));
+      final duringLock = await pin.verify('1234');
+      expect(duringLock.status, PinVerifyStatus.lockedOut);
+
+      // Now past the 30s cooldown: the correct PIN succeeds.
+      clock = clock.add(const Duration(seconds: 21)); // total 31s since lock
+      final afterLock = await pin.verify('1234');
+      expect(afterLock.isOk, isTrue);
+    });
+
+    test('one more wrong attempt right after the first cooldown re-locks at double the delay (60s)', () async {
+      for (var i = 0; i < 5; i++) {
+        await pin.verify('0000'); // 5th locks for 30s
+      }
+      clock = clock.add(const Duration(seconds: 31)); // cooldown over
+      final sixth = await pin.verify('0000');
+      expect(sixth.status, PinVerifyStatus.lockedOut);
+      expect(sixth.lockedUntil, clock.add(const Duration(seconds: 60)));
+    });
+
+    test('lockout delay keeps doubling and is capped at 30 minutes', () async {
+      // Lockout 1: 30s.
+      for (var i = 0; i < 5; i++) {
+        await pin.verify('0000');
+      }
+      // Lockout 2: 60s.
+      clock = clock.add(const Duration(seconds: 31));
+      var r = await pin.verify('0000');
+      expect(r.lockedUntil, clock.add(const Duration(seconds: 60)));
+
+      // Lockout 3: 120s.
+      clock = clock.add(const Duration(seconds: 61));
+      r = await pin.verify('0000');
+      expect(r.lockedUntil, clock.add(const Duration(seconds: 120)));
+
+      // Lockout 4: 240s.
+      clock = clock.add(const Duration(seconds: 121));
+      r = await pin.verify('0000');
+      expect(r.lockedUntil, clock.add(const Duration(seconds: 240)));
+
+      // Fast-forward through several more lockout cycles to prove the cap:
+      // stage 4 -> 240s, 5 -> 480s, 6 -> 960s, 7 -> 1920s which must clamp
+      // to the 30 minute (1800s) ceiling.
+      clock = clock.add(const Duration(seconds: 241));
+      r = await pin.verify('0000'); // stage 5: 480s
+      expect(r.lockedUntil, clock.add(const Duration(seconds: 480)));
+
+      clock = clock.add(const Duration(seconds: 481));
+      r = await pin.verify('0000'); // stage 6: 960s
+      expect(r.lockedUntil, clock.add(const Duration(seconds: 960)));
+
+      clock = clock.add(const Duration(seconds: 961));
+      r = await pin.verify('0000'); // stage 7 would be 1920s, capped to 1800s
+      expect(r.lockedUntil, clock.add(const Duration(seconds: 1800)));
+    });
+
+    test('a successful verify resets the counter and the lockout entirely', () async {
+      for (var i = 0; i < 5; i++) {
+        await pin.verify('0000'); // locks for 30s
+      }
+      clock = clock.add(const Duration(seconds: 31));
+      expect((await pin.verify('1234')).isOk, isTrue);
+
+      // Fresh budget: a single wrong attempt now reports 4 remaining, not
+      // an immediate re-lock.
+      final next = await pin.verify('0000');
+      expect(next.status, PinVerifyStatus.wrongPin);
+      expect(next.remainingBeforeLock, 4);
+    });
+
+    test('the failure counter persists across a new PinLock instance over the same storage', () async {
+      await pin.verify('0000');
+      await pin.verify('0000');
+      await pin.verify('0000'); // 3 failures, 2 remaining
+
+      final reopened = makeLock(); // simulates a cold start reading the same storage
+      final result = await reopened.verify('0000'); // 4th failure
+      expect(result.status, PinVerifyStatus.wrongPin);
+      expect(result.remainingBeforeLock, 1);
+
+      final locking = await reopened.verify('0000'); // 5th failure locks
+      expect(locking.status, PinVerifyStatus.lockedOut);
+    });
+
+    test('setPin clears any prior attempt count / lockout', () async {
+      for (var i = 0; i < 5; i++) {
+        await pin.verify('0000'); // now locked
+      }
+      await pin.setPin('9999');
+      final result = await pin.verify('9999');
+      expect(result.isOk, isTrue);
     });
   });
 }
