@@ -96,6 +96,126 @@ test('expiry is 30 days from issue', () => {
   assert.ok(delta <= THIRTY_DAYS_MS + (after - before) + 1000, `expected close to 30 days out, got ${delta}ms`);
 });
 
+// --- sliding expiry (I4) ---
+// The spec's rule is "signed out after 30 days without an online sign-in", so
+// the 30 days must run from the device's LAST contact, not from the day it
+// was paired. A token validated while it is close to expiry is renewed for a
+// full 30 days by the same write that stamps last_used_at.
+
+const FIFTEEN_DAYS_MS = 15 * 24 * 60 * 60 * 1000;
+
+// Plants a token row with an arbitrary expires_at, so a test can sit at any
+// point in a token's life without waiting or mocking the clock. Same
+// insert-directly technique the expiry tests above already use.
+function plantToken(db, userId, { token, expiresAt, issuedAt }) {
+  const hash = createHash('sha256').update(token).digest('hex');
+  db.prepare('insert into device_tokens (token_hash, user_id, issued_at, expires_at) values (?,?,?,?)')
+    .run(hash, userId, issuedAt ?? new Date().toISOString(), expiresAt);
+  return hash;
+}
+
+const expiryOf = (db, hash) =>
+  db.prepare('select expires_at from device_tokens where token_hash=?').get(hash).expires_at;
+
+test('validating a token that is close to expiry slides it out to a full 30 days', () => {
+  const db = openDb(':memory:');
+  const user = makeUser(db);
+  const token = 'd'.repeat(64);
+  // 10 days left: inside the 15-day renewal window.
+  const nearExpiry = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString();
+  const hash = plantToken(db, user.id, { token, expiresAt: nearExpiry });
+
+  const before = Date.now();
+  assert.ok(validateDeviceToken(db, token), 'a live token must still validate');
+  const after = Date.now();
+
+  const renewed = new Date(expiryOf(db, hash)).getTime();
+  assert.ok(renewed > new Date(nearExpiry).getTime(), 'the expiry must have moved forward');
+  assert.ok(renewed >= before + THIRTY_DAYS_MS, `expected at least 30 days out, got ${renewed - before}ms`);
+  assert.ok(renewed <= after + THIRTY_DAYS_MS + 1000, `expected close to 30 days out, got ${renewed - before}ms`);
+});
+
+test('validating a token that is far from expiry leaves its expiry exactly where it was', () => {
+  const db = openDb(':memory:');
+  const user = makeUser(db);
+  const token = 'e'.repeat(64);
+  // 25 days left: outside the 15-day renewal window, so nothing to renew.
+  const farExpiry = new Date(Date.now() + 25 * 24 * 60 * 60 * 1000).toISOString();
+  const hash = plantToken(db, user.id, { token, expiresAt: farExpiry });
+
+  assert.ok(validateDeviceToken(db, token));
+  assert.equal(expiryOf(db, hash), farExpiry, 'a token nowhere near expiry must not be rewritten');
+
+  // ...and last_used_at still moved, so "no renewal" is not "no write at all".
+  const lastUsed = db.prepare('select last_used_at from device_tokens where token_hash=?').get(hash).last_used_at;
+  assert.ok(lastUsed, 'last_used_at must still be stamped on a non-renewing validation');
+
+  // A freshly issued token is 30 days out, i.e. also outside the window --
+  // proving the renewal threshold is genuinely below the full TTL and not
+  // "renew on every request".
+  const fresh = issueDeviceToken(db, user.id);
+  const freshHash = createHash('sha256').update(fresh.token).digest('hex');
+  assert.ok(validateDeviceToken(db, fresh.token));
+  assert.equal(expiryOf(db, freshHash), fresh.expires_at);
+});
+
+test('an already-expired token is never resurrected by validation', () => {
+  const db = openDb(':memory:');
+  const user = makeUser(db);
+  const token = 'f'.repeat(64);
+  const past = new Date(Date.now() - 1000).toISOString();
+  const hash = plantToken(db, user.id, { token, expiresAt: past, issuedAt: past });
+
+  assert.equal(validateDeviceToken(db, token), null);
+  assert.equal(expiryOf(db, hash), past, 'a dead token must stay dead -- the slide only applies to a LIVE one');
+  // And again, to be sure a second attempt cannot walk it back to life either.
+  assert.equal(validateDeviceToken(db, token), null);
+  assert.equal(expiryOf(db, hash), past);
+});
+
+test('the renewal threshold is 15 days: a token just inside it slides, one just outside does not', () => {
+  const db = openDb(':memory:');
+  const user = makeUser(db);
+  const inside = 'a1'.repeat(32);
+  const outside = 'b2'.repeat(32);
+  // A minute either side of the boundary, so this pins the threshold itself
+  // rather than merely "somewhere between 10 and 25 days".
+  const insideAt = new Date(Date.now() + FIFTEEN_DAYS_MS - 60_000).toISOString();
+  const outsideAt = new Date(Date.now() + FIFTEEN_DAYS_MS + 60_000).toISOString();
+  const insideHash = plantToken(db, user.id, { token: inside, expiresAt: insideAt });
+  const outsideHash = plantToken(db, user.id, { token: outside, expiresAt: outsideAt });
+
+  assert.ok(validateDeviceToken(db, inside));
+  assert.ok(validateDeviceToken(db, outside));
+
+  assert.notEqual(expiryOf(db, insideHash), insideAt, 'just inside 15 days must renew');
+  assert.equal(expiryOf(db, outsideHash), outsideAt, 'just outside 15 days must not');
+});
+
+// --- opportunistic cleanup on issue (I6) ---
+
+test('issuing a token deletes that user\'s expired rows, and only that user\'s', () => {
+  const db = openDb(':memory:');
+  const mine = makeUser(db, { username: 'cleanup-mine' });
+  const other = makeUser(db, { username: 'cleanup-other' });
+  const past = new Date(Date.now() - 1000).toISOString();
+
+  const myDead = plantToken(db, mine.id, { token: 'c1'.repeat(32), expiresAt: past, issuedAt: past });
+  const theirDead = plantToken(db, other.id, { token: 'c2'.repeat(32), expiresAt: past, issuedAt: past });
+  const myLive = issueDeviceToken(db, mine.id);
+  const myLiveHash = createHash('sha256').update(myLive.token).digest('hex');
+
+  const rows = (hash) => db.prepare('select count(*) n from device_tokens where token_hash=?').get(hash).n;
+  // The issue above already ran the cleanup once; assert on its effect.
+  assert.equal(rows(myDead), 0, 'this user\'s expired row must be swept on issue');
+  assert.equal(rows(theirDead), 1, 'another user\'s expired row must be left alone');
+  assert.equal(rows(myLiveHash), 1, 'the token just issued must survive its own cleanup');
+
+  // A live row of the same user is never swept either.
+  issueDeviceToken(db, mine.id);
+  assert.equal(rows(myLiveHash), 1, 'a LIVE row must survive a later issue for the same user');
+});
+
 // --- HTTP layer ---
 // The two functions above are exercised directly everywhere else in this
 // file; these tests exist to prove the two `if` branches in routes.js that
@@ -183,6 +303,56 @@ test('deactivating a user via the admin route revokes a device token issued to t
   // The control token was never touched by any of this.
   assert.ok(validateDeviceToken(db, leadToken), "another user's token must survive an unrelated deactivation");
   server.close();
+});
+
+// --- POST /logout revokes the presented device token (I6) ---
+
+test('logging out with a Bearer token revokes THAT token and leaves the user\'s other devices alone', async () => {
+  const { db, server, call } = await boot();
+  try {
+    const login = await call('POST', '/api/login', { username: 'tech', password: 'tech', wantDeviceToken: true });
+    const signingOut = login.body.device_token;
+    // A second device of the SAME user -- the control that proves this is a
+    // per-device sign-out, not a per-account one.
+    const otherDevice = issueDeviceToken(db, db.prepare("select id from users where username='tech'").get().id).token;
+    assert.ok(validateDeviceToken(db, signingOut));
+    assert.ok(validateDeviceToken(db, otherDevice));
+
+    const res = await call('POST', '/api/logout', undefined, { authorization: `Bearer ${signingOut}` });
+    assert.equal(res.status, 200);
+
+    assert.equal(validateDeviceToken(db, signingOut), null, 'the presented token must stop working immediately');
+    assert.ok(validateDeviceToken(db, otherDevice), "this user's other paired device must keep working");
+  } finally {
+    server.close();
+  }
+});
+
+test('a session-only logout revokes nothing -- the browser path is unchanged', async () => {
+  const { db, server, call } = await boot();
+  try {
+    const login = await call('POST', '/api/login', { username: 'tech', password: 'tech', wantDeviceToken: true });
+    const token = login.body.device_token;
+    // No Authorization header at all: exactly what the web client sends.
+    const res = await call('POST', '/api/logout');
+    assert.equal(res.status, 200);
+    assert.ok(validateDeviceToken(db, token), 'a browser sign-out must not surrender the device credential');
+  } finally {
+    server.close();
+  }
+});
+
+test('logging out with a garbage Bearer token is still a plain 200 and revokes nothing else', async () => {
+  const { db, server, call } = await boot();
+  try {
+    const login = await call('POST', '/api/login', { username: 'tech', password: 'tech', wantDeviceToken: true });
+    const token = login.body.device_token;
+    const res = await call('POST', '/api/logout', undefined, { authorization: 'Bearer not-a-real-token' });
+    assert.equal(res.status, 200, 'logout is best-effort -- an unknown token is not an error to report');
+    assert.ok(validateDeviceToken(db, token), 'an unknown token must delete nothing');
+  } finally {
+    server.close();
+  }
 });
 
 // --- tokenOrSession middleware ---

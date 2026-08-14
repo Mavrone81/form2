@@ -234,6 +234,55 @@ export function assertCanEdit(db, submissionId, user) {
   });
 }
 
+// Who may read a record's archival PDF. Lives here, beside every other rule
+// about who may do what to a record, so the HTTP route is left translating a
+// throw into a status code and nothing else -- the same division assertCanEdit
+// already establishes.
+//
+// Three rules, and the technician one is the newest:
+//   * an admin may always read it;
+//   * a team leader or engineer may read it only once THEIR OWN signature row
+//     exists -- proof they have actually signed this record, not merely that
+//     they hold the role;
+//   * a technician may read the PDF of a record THEY created, in any state.
+//     A technician was previously refused in every state, which was wrong in
+//     a way the Android app made obvious: a record they filled in and signed
+//     is their own work, the app already renders exactly this document
+//     on-device before it is synced, and the server's copy is the only
+//     renderer available once the record HAS synced (see the preview
+//     fallback in the design spec). Another technician's record stays
+//     refused -- ownership, not role, is the rule.
+export function assertCanViewPdf(db, sub, user) {
+  if (user.role === 'admin') return;
+  if (user.role === 'technician') {
+    if (sub.created_by === user.id) return;
+    throw forbidden('Your role cannot view another technician\'s record.');
+  }
+  const signedStages = db.prepare('select stage from signatures where submission_id=?')
+    .all(sub.id).map((s) => s.stage);
+  if ((user.role === 'team_leader' || user.role === 'engineer') && signedStages.includes(user.role)) return;
+  throw forbidden('Available once you have signed this record.');
+}
+
+// A record may only be scoped to an interval the controlled document itself
+// defines -- `frequencies` is that document's own list, as parsed from the
+// workbook, never a hardcoded set. Shared by PATCH /submissions/:id (a
+// browser changing the interval) and POST /api/sync (a device replaying a
+// record it created offline) so the two can never disagree about what counts
+// as a valid interval, or about the wording a caller is told when it isn't.
+//
+// INVALID rather than FORBIDDEN: an interval the form does not offer is bad
+// input, not a permission failure -- the same distinction saveFields' option
+// check and assertValidSignature already make, and what maps this to a 400
+// on the browser side and to a per-record INVALID on the device side.
+export function assertFrequencyOffered(frequencies, frequency) {
+  if (!frequencies.includes(String(frequency))) {
+    const err = new Error('That maintenance interval is not one this form offers.');
+    err.code = 'INVALID';
+    throw err;
+  }
+}
+
 // A signature is the one thing on this record that attests a named person
 // approved it, so what gets stored has to actually BE a signature image.
 //

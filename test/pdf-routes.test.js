@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ExcelJS from 'exceljs';
 import { openDb } from '../server/db.js';
+import { createUser } from '../server/auth.js';
 import { createApp } from '../server/index.js';
 import { seedDemoUsers } from '../server/seed.js';
 import { scanFolder } from '../server/scanner.js';
@@ -94,7 +95,14 @@ test('a team leader cannot preview before signing, and can after', async () => {
   }
 });
 
-test('a technician is refused the pdf in every state, including approved', async () => {
+// The technician rule (I7): a technician may read the PDF of a record THEY
+// created, in any state, and no one else's. The app's own on-device renderer
+// is the only thing that can draw an UNSYNCED record (it exists nowhere
+// else); once a record HAS synced, this route is the only place its
+// archival PDF can come from — so refusing its own author, as this route
+// used to in every state, left a technician with no way to see the document
+// they signed.
+test('a technician can read the PDF of their OWN record in every state, including approved', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pmforms-pdf-'));
   try {
     await writeSyntheticWorkbook(join(dir, 'form.xlsx'));
@@ -103,13 +111,14 @@ test('a technician is refused the pdf in every state, including approved', async
     await login(call, 'tech', 'tech');
     const sub = (await call('POST', '/api/submissions', { formId: form.id, machineId: 'ED04', frequency: 'Y' })).body;
 
-    // draft — before anyone has signed
-    assert.equal((await call('GET', `/api/submissions/${sub.id}/pdf`)).status, 403);
+    // draft — before anyone, including the author, has signed
+    const draft = await call('GET', `/api/submissions/${sub.id}/pdf`);
+    assert.equal(draft.status, 200);
+    assert.equal(draft.body.subarray(0, 4).toString('latin1'), '%PDF');
 
     await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG }); // -> pending_lead
-    // Still the technician's own session — pending_lead now, but a
-    // technician is refused regardless of the record's state.
-    assert.equal((await call('GET', `/api/submissions/${sub.id}/pdf`)).status, 403);
+    assert.equal((await call('GET', `/api/submissions/${sub.id}/pdf`)).status, 200,
+      'a record sitting with a reviewer is still the technician\'s own work');
 
     await login(call, 'lead', 'lead');
     await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG }); // -> pending_engineer
@@ -118,7 +127,31 @@ test('a technician is refused the pdf in every state, including approved', async
 
     await login(call, 'tech', 'tech');
     const approved = await call('GET', `/api/submissions/${sub.id}/pdf`);
-    assert.equal(approved.status, 403, 'a technician is never granted the PDF, even once the record is approved');
+    assert.equal(approved.status, 200, 'an approved record stays readable by the technician who made it');
+    assert.equal(approved.body.subarray(0, 4).toString('latin1'), '%PDF');
+
+    server.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a technician is refused ANOTHER technician\'s record — ownership, not role, is the rule', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pmforms-pdf-'));
+  try {
+    await writeSyntheticWorkbook(join(dir, 'form.xlsx'));
+    const { db, server, call, form } = await boot(dir);
+    createUser(db, { username: 'tech2', password: 'tech2', fullName: 'Tech Two', role: 'technician' });
+
+    await login(call, 'tech', 'tech');
+    const sub = (await call('POST', '/api/submissions', { formId: form.id, machineId: 'ED04', frequency: 'Y' })).body;
+    await call('POST', `/api/submissions/${sub.id}/sign`, { signaturePng: PNG }); // -> pending_lead
+
+    await login(call, 'tech2', 'tech2');
+    const res = await call('GET', `/api/submissions/${sub.id}/pdf`);
+    assert.equal(res.status, 403, 'a technician may not read a record they did not create');
+    // The refusal must not name the record's own state or its author.
+    assert.match(res.body.error, /another technician/i);
 
     server.close();
   } finally {

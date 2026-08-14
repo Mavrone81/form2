@@ -1,10 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import ExcelJS from 'exceljs';
 import { openDb } from '../server/db.js';
 import { createUser } from '../server/auth.js';
 import { createApp } from '../server/index.js';
 import { seedDemoUsers } from '../server/seed.js';
+import { scanFolder } from '../server/scanner.js';
 import { issueDeviceToken } from '../server/device-tokens.js';
 
 // A 1x1 PNG data URI -- the same fixture used throughout test/workflow.test.js
@@ -524,6 +529,125 @@ test('a record whose values is not a plain object is refused as INVALID, per-rec
       assert.match(r.error.message, /values/i);
       assert.equal(r.submissionId, null, 'a bad values shape must be caught before create-or-find');
     }
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Maintenance interval validation (M3)
+// ---------------------------------------------------------------------------
+// A record may only be scoped to an interval the controlled document itself
+// defines -- the same rule PATCH /submissions/:id has always enforced for the
+// browser (assertFrequencyOffered in server/workflow.js). Without it, a
+// device could create a record scoped to an interval the form has no band
+// for, which prints as an un-ticked frequency row on the archived PDF.
+//
+// These tests need a REAL workbook on disk (the fixture form used elsewhere
+// in this file has a file_path that does not exist, which is precisely the
+// "cannot be read -- do not validate" case covered by its own test below).
+
+// Same synthetic-workbook style as test/bundle.test.js: invented, generic
+// content, never real form text.
+async function writeSyntheticWorkbook(path, tasksByFreq) {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Sheet1');
+  ws.getRow(1).getCell(1).value = 'No';
+  ws.getRow(1).getCell(2).value = 'Freq.';
+  ws.getRow(1).getCell(3).value = 'Instruction';
+  ws.getRow(1).getCell(4).value = 'Status';
+  tasksByFreq.forEach(([freq, instruction], i) => {
+    const row = ws.getRow(i + 2);
+    row.getCell(1).value = i + 1;
+    row.getCell(2).value = freq;
+    row.getCell(3).value = instruction;
+  });
+  await wb.xlsx.writeFile(path);
+  return path;
+}
+
+test('a record whose frequency the form does not offer is INVALID; a valid one in the SAME batch still lands', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pmforms-sync-freq-'));
+  try {
+    // This form offers Y only -- 3M is a real interval elsewhere, just not
+    // one this document has a band for.
+    await writeSyntheticWorkbook(join(dir, 'freq.xlsx'), [['Y', 'Widget check A']]);
+    const { db, server, call } = await boot();
+    try {
+      await scanFolder(db, dir);
+      const form = db.prepare("select * from form_catalog where file_name='freq.xlsx'").get();
+      const { token } = issueDeviceToken(db, userId(db, 'tech'));
+
+      const res = await call('POST', '/api/sync', {
+        records: [
+          { client_uuid: randomUUID(), formId: form.id, frequency: '3M', values: {}, signaturePng: PNG },
+          { client_uuid: randomUUID(), formId: form.id, frequency: 'Y', values: {}, signaturePng: PNG }
+        ]
+      }, authHeader(token));
+
+      assert.equal(res.status, 200);
+      const [bad, good] = res.body.results;
+
+      assert.ok(bad.error, 'an interval the form does not offer must be refused');
+      assert.equal(bad.error.code, 'INVALID');
+      assert.match(bad.error.message, /interval/i);
+      assert.equal(bad.submissionId, null, 'a refused interval must leave no submission behind');
+
+      assert.equal(good.error, undefined, 'a valid record in the same batch must still land');
+      assert.equal(good.state, 'pending_lead');
+
+      const rows = db.prepare('select frequency from submissions').all();
+      assert.equal(rows.length, 1, 'exactly one record -- the valid one -- may exist');
+      assert.equal(rows[0].frequency, 'Y');
+    } finally {
+      server.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a record with no frequency at all is accepted -- an un-scoped record is a real state', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pmforms-sync-freq-empty-'));
+  try {
+    await writeSyntheticWorkbook(join(dir, 'freq.xlsx'), [['Y', 'Widget check A']]);
+    const { db, server, call } = await boot();
+    try {
+      await scanFolder(db, dir);
+      const form = db.prepare("select * from form_catalog where file_name='freq.xlsx'").get();
+      const { token } = issueDeviceToken(db, userId(db, 'tech'));
+
+      const res = await call('POST', '/api/sync', {
+        records: [{ client_uuid: randomUUID(), formId: form.id, values: {}, signaturePng: PNG }]
+      }, authHeader(token));
+
+      assert.equal(res.status, 200);
+      assert.equal(res.body.results[0].error, undefined);
+      assert.equal(res.body.results[0].state, 'pending_lead');
+    } finally {
+      server.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a form whose file cannot be read validates no interval at all rather than refusing the record', async () => {
+  const { db, server, call } = await boot();
+  try {
+    // setupForm's file_path ('/f.xlsx') does not exist -- a server-side
+    // problem the device can neither see nor fix. Every OTHER rule about the
+    // record still applies; the interval simply is not claimed either way.
+    setupForm(db);
+    const { token } = issueDeviceToken(db, userId(db, 'tech'));
+    const res = await call('POST', '/api/sync', {
+      records: [{ client_uuid: randomUUID(), formId: 1, frequency: 'Q', values: { result: 'Pass' }, signaturePng: PNG }]
+    }, authHeader(token));
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.results[0].error, undefined,
+      'an unreadable form file must not turn into a record the device can never sync');
+    assert.equal(res.body.results[0].state, 'pending_lead');
   } finally {
     server.close();
   }

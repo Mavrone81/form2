@@ -1,13 +1,13 @@
 import { Router } from 'express';
 import { readFileSync } from 'node:fs';
 import { authenticate, requireRole, createUser, ROLES } from './auth.js';
-import { issueDeviceToken, revokeUserTokens, validateDeviceToken } from './device-tokens.js';
+import { issueDeviceToken, revokeDeviceToken, revokeUserTokens, validateDeviceToken } from './device-tokens.js';
 import { listForms, scanFolder } from './scanner.js';
 import { buildGrid } from './grid-model.js';
 import { parseWorkbook } from './excel-parser.js';
 import { tasksInScope, scopeSummary } from './intervals.js';
 import { cellMapFor } from './cell-map.js';
-import { createSubmission, findByClientUuid, recoverFromDuplicateClientUuid, saveFields, signAndAdvance, rejectSubmission, queueFor, assertCanEdit, completenessFor, setFrequency, STAGES } from './workflow.js';
+import { createSubmission, findByClientUuid, recoverFromDuplicateClientUuid, saveFields, signAndAdvance, rejectSubmission, queueFor, assertCanEdit, assertCanViewPdf, assertFrequencyOffered, completenessFor, setFrequency, STAGES } from './workflow.js';
 import { renderRecordPdf } from './pdf-record.js';
 import { createLoginThrottle } from './login-throttle.js';
 
@@ -113,7 +113,13 @@ const SYNC_GENERIC_ERROR = 'This record could not be synced. Please try again.';
 // HERE and turned into this record's own `error`, never allowed to escape
 // and abort the records after it: a phone replaying twenty offline records
 // must not lose the other nineteen because one had a stale formId.
-function syncOneRecord(db, user, record) {
+//
+// `frequencies` is the batch-wide Map built by frequenciesForBatch: formId ->
+// the interval list that form offers, or null when it could not be
+// determined. Passed in rather than looked up here so this function stays
+// synchronous (no workbook parse inside the per-record loop) and so one
+// form's file is read once per BATCH, not once per record naming it.
+function syncOneRecord(db, user, record, frequencies) {
   // The device's own casing is echoed straight back in `out` unchanged, so
   // it always sees exactly what it sent -- normalization below is an
   // internal lookup/storage detail, not something the caller needs to know
@@ -164,6 +170,18 @@ function syncOneRecord(db, user, record) {
     if (!sub) {
       const form = db.prepare('select id from form_catalog where id=?').get(record?.formId);
       if (!form) throw syncError('NOT_FOUND', 'Form not found.');
+      // The interval is validated HERE, on the create path, because this is
+      // the only place a device's `frequency` is ever consumed: a record
+      // that already exists keeps the interval it was created with (the
+      // replay branch below re-applies nothing), so re-checking it on a
+      // replay could only turn a record the server already holds into a
+      // permanent error. An absent/empty frequency is left alone -- an
+      // un-scoped record is a real state the browser allows too -- and a
+      // null entry means the form's own list could not be read (see
+      // frequenciesForBatch), in which case nothing is claimed either way.
+      const frequency = String(record?.frequency ?? '');
+      const offered = frequencies?.get(record?.formId) ?? null;
+      if (frequency && offered) assertFrequencyOffered(offered, frequency);
       try {
         sub = createSubmission(db, {
           formId: record.formId,
@@ -344,6 +362,73 @@ async function formSpec(db, form) {
   return { form, fields, frequencies, tasks, cellFor, titleCell, intervalCells, calibrationCells, def };
 }
 
+// form_catalog columns that are server-internal bookkeeping and must not
+// travel to a device in GET /bundle.
+//
+//  * file_path is the absolute path of the controlled document on the
+//    server's filesystem. A phone has no possible use for it, and a bundle
+//    is cached on the device (and readable by anything that gets at that
+//    cache), so shipping the server's directory layout to every paired
+//    handset is a free gift to anyone who ends up holding one.
+//  * parse_error is an internal diagnostic written by the scanner. It can
+//    quote a filesystem path or a parser internal, it is meant for the
+//    admin screen in the browser, and a bundled form is `ready` anyway --
+//    so it is never useful here and can only leak.
+//
+// Deliberately KEPT: content_hash (the record's document identity -- the
+// same value createSubmission stamps onto a submission, so a device holding
+// it can tell that its cached form is the one a record was signed against),
+// plus title/doc_number/revision/file_name/state/file_type, which are what
+// the app actually displays. last_scanned_at stays too: it is a plain
+// timestamp with nothing sensitive in it, and it is the only signal a device
+// has for how fresh the server's own view of the form is.
+//
+// Applied ONLY to the bundle route, not to GET /forms/:id/fields: that route
+// answers a signed-in browser (the same audience as the admin screens, which
+// already read parse_error off GET /forms -- see web/js/admin.js), its
+// response shape is pinned by existing tests, and narrowing it here would be
+// a change to the web client's contract for no gain on the device side.
+const BUNDLE_INTERNAL_FORM_COLUMNS = ['file_path', 'parse_error'];
+
+function bundleFormRow(form) {
+  const out = { ...form };
+  for (const column of BUNDLE_INTERNAL_FORM_COLUMNS) delete out[column];
+  return out;
+}
+
+// Every distinct formId in one sync batch, mapped to the interval list that
+// form's own workbook offers -- parsed ONCE per form for the whole batch,
+// however many records name it, and never at all for a batch that names none.
+//
+// A form whose file cannot be read (moved, corrupted, deleted since the last
+// scan) maps to null, meaning "unknown -- do not validate": a device must not
+// have a record refused because of a server-side file problem it can neither
+// see nor fix, and every other rule about that record (createSubmission's own
+// readiness check, saveFields, the signature) still applies untouched.
+// A pdf or not-ready form maps to null for the same reason -- createSubmission
+// refuses those on its own, with a message about the form rather than a
+// confusing one about the interval.
+async function frequenciesForBatch(db, records) {
+  const byFormId = new Map();
+  for (const record of records) {
+    const formId = record?.formId;
+    if (formId === undefined || formId === null || byFormId.has(formId)) continue;
+    const form = db.prepare('select id, file_path, file_type, state from form_catalog where id=?').get(formId);
+    if (!form || form.file_type !== 'xlsx' || form.state !== 'ready') {
+      byFormId.set(formId, null);
+      continue;
+    }
+    try {
+      const { frequencies } = await parseWorkbook(form.file_path);
+      byFormId.set(formId, frequencies);
+    } catch (err) {
+      console.error(`Sync: form ${form.id} could not be read; skipping interval validation for it:`, err);
+      byFormId.set(formId, null);
+    }
+  }
+  return byFormId;
+}
+
 export { tokenOrSession, actingUser };
 
 export function makeRoutes(db) {
@@ -382,7 +467,24 @@ export function makeRoutes(db) {
     }
     res.json(user);
   });
-  r.post('/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
+  // Signs out both credentials this app can be holding at once, each only if
+  // it is actually present:
+  //  * the browser-style session, destroyed exactly as before;
+  //  * the device token, IF the request presents one -- "sign out" on a
+  //    phone must actually surrender the long-lived credential, not just the
+  //    session cookie it barely uses. Without this a signed-out handset kept
+  //    a working bearer token for up to 30 more days, and the only ways to
+  //    kill it were an admin deactivating the whole account or waiting out
+  //    the expiry.
+  // A session-only logout (every browser call) is unchanged: no
+  // Authorization header, nothing revoked. Only the row for the presented
+  // token is deleted, so this user's OTHER paired devices keep working (see
+  // revokeDeviceToken's own comment).
+  r.post('/logout', (req, res) => {
+    const [scheme, token] = String(req.get('authorization') ?? '').split(' ');
+    if (scheme?.toLowerCase() === 'bearer' && token) revokeDeviceToken(db, token);
+    req.session.destroy(() => res.json({ ok: true }));
+  });
   r.get('/me', (req, res) => res.json(req.session?.user ?? null));
 
   r.get('/forms', signedIn, (req, res) =>
@@ -478,7 +580,11 @@ export function makeRoutes(db) {
         // with GET /forms/:id/grid and unaffected by this.)
         const { def, ...rest } = spec;
         const grid = await buildGrid(form.file_path, def);
-        forms.push({ ...rest, grid });
+        // bundleFormRow, not `rest.form` verbatim: the catalog row carries
+        // server-internal columns (chiefly the document's absolute path on
+        // the server) that have no business being cached on a phone -- see
+        // BUNDLE_INTERNAL_FORM_COLUMNS.
+        forms.push({ ...rest, form: bundleFormRow(rest.form), grid });
       } catch (err) {
         console.error(`Bundle: form ${form.id} could not be read; skipping:`, err);
         skipped.push({ id: form.id, error: UNREADABLE_FORM_MESSAGE });
@@ -495,11 +601,14 @@ export function makeRoutes(db) {
   // non-technician device token gets 403, because every record in a batch is
   // necessarily a technician's own draft-and-sign.
   //
-  // Deliberately synchronous (no asyncRoute wrapper): syncOneRecord and
-  // everything it calls (findByClientUuid, createSubmission, saveFields,
-  // signAndAdvance) are all synchronous better-sqlite3 calls, so there is no
-  // promise here that could reject unhandled.
-  r.post('/sync', deviceTokenOnly(db), (req, res) => {
+  // asyncRoute-wrapped, per the contract at the top of this file: the
+  // per-record work in syncOneRecord is still entirely synchronous
+  // better-sqlite3, but the batch now awaits frequenciesForBatch first (one
+  // workbook parse per distinct form, to learn which intervals each form
+  // actually offers). Without the wrapper a form file that has moved since
+  // the last scan would reject inside an async handler and take the whole
+  // process down.
+  r.post('/sync', deviceTokenOnly(db), asyncRoute(async (req, res) => {
     const user = req.deviceUser;
     if (user.role !== 'technician') {
       return res.status(403).json({ error: 'Your role cannot sync records.' });
@@ -511,13 +620,18 @@ export function makeRoutes(db) {
     if (!Array.isArray(req.body?.records)) {
       return res.status(400).json({ error: 'records must be an array.' });
     }
+    // One parse per distinct form for the WHOLE batch (see
+    // frequenciesForBatch), computed before the loop so the loop itself
+    // stays synchronous and a twenty-record batch against one form reads
+    // that form's file once, not twenty times.
+    const frequencies = await frequenciesForBatch(db, req.body.records);
     // Every record is independent from here on: syncOneRecord catches its
     // own failures, so one bad record in a batch of twenty can never abort
     // the other nineteen, and the batch itself always answers 200 -- per-
     // record success or failure is carried in each result's own `error`,
     // never in the HTTP status of the call as a whole.
-    res.json({ results: req.body.records.map((record) => syncOneRecord(db, user, record)) });
-  });
+    res.json({ results: req.body.records.map((record) => syncOneRecord(db, user, record, frequencies)) });
+  }));
 
   r.post('/submissions', requireRole('technician'), (req, res) => {
     const { formId, machineId, frequency } = req.body ?? {};
@@ -577,9 +691,12 @@ export function makeRoutes(db) {
         try { ({ frequencies } = await parseWorkbook(form.file_path)); }
         catch (err) { return unreadableForm(res, formId, err); }
       }
-      if (!frequencies.includes(String(body.frequency))) {
-        return res.status(400).json({ error: 'That maintenance interval is not one this form offers.' });
-      }
+      // The rule itself lives in workflow.js (assertFrequencyOffered), shared
+      // with POST /api/sync so a browser and a phone are told the same thing
+      // about the same interval. Its INVALID code maps to the same 400 this
+      // route always answered here.
+      try { assertFrequencyOffered(frequencies, body.frequency); }
+      catch (err) { return res.status(statusFor(err, 400)).json({ error: err.message }); }
     }
 
     try {
@@ -620,11 +737,13 @@ export function makeRoutes(db) {
   });
 
   // Preview/download the record as an archival PDF. Access is enforced here,
-  // server-side, not merely by hiding the button in the UI: a technician is
-  // refused in every state (they are never a party to the reviewed record's
-  // PDF); a team leader or engineer may only see it once THEIR OWN signature
-  // row exists (proof they have signed this record); an admin may always
-  // preview. Awaits renderRecordPdf, so — per the asyncRoute contract at the
+  // server-side, not merely by hiding the button in the UI — and the rule
+  // itself lives in workflow.js (assertCanViewPdf), beside every other rule
+  // about who may act on a record, so no future route can reach this
+  // document by a laxer path. In short: a technician may read their OWN
+  // record in any state and no one else's; a team leader or engineer only
+  // once their own signature row exists; an admin always.
+  // Awaits renderRecordPdf, so — per the asyncRoute contract at the
   // top of this file — it MUST be wrapped, or a form whose file has moved
   // since the last scan (parseWorkbook/buildGrid rejecting) becomes an
   // unhandled rejection that kills the whole process for every signed-in
@@ -634,11 +753,8 @@ export function makeRoutes(db) {
     if (!sub) return res.status(404).json({ error: 'Record not found.' });
 
     const user = req.session.user;
-    const signedStages = db.prepare('select stage from signatures where submission_id=?')
-      .all(sub.id).map((s) => s.stage);
-    const allowed = user.role === 'admin'
-      || ((user.role === 'team_leader' || user.role === 'engineer') && signedStages.includes(user.role));
-    if (!allowed) return res.status(403).json({ error: 'Available once you have signed this record.' });
+    try { assertCanViewPdf(db, sub, user); }
+    catch (err) { return res.status(statusFor(err, 403)).json({ error: err.message }); }
 
     // A signed record is evidence, and evidence must stay retrievable and
     // unchanged. Its document identity (doc number, revision) comes from the

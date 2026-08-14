@@ -103,6 +103,50 @@ test('GET /api/bundle returns every ready xlsx form with fields, tasks, cellFor 
   }
 });
 
+// --- what the form row may and may not carry to a device (M1) ---
+
+test('the bundled form row carries no server-internal columns (no file_path, no parse_error) but keeps its identity', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pmforms-bundle-privacy-'));
+  try {
+    await writeSyntheticWorkbook(join(dir, 'form-e.xlsx'), [['Y', 'Widget check A']]);
+    const { db, server, call } = await boot();
+    try {
+      await scanFolder(db, dir);
+      // A parse_error left on a ready row (the scanner clears it, so this is
+      // planted deliberately) proves the column is stripped by the route, not
+      // merely absent by luck of the fixture.
+      db.prepare("update form_catalog set parse_error='internal detail from /some/server/path' where file_name='form-e.xlsx'").run();
+
+      await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+      const res = await call('GET', '/api/bundle');
+      assert.equal(res.status, 200);
+      const bundled = res.body.forms.find((f) => f.form.file_name === 'form-e.xlsx');
+      assert.ok(bundled, 'the form must appear in the bundle');
+
+      assert.equal('file_path' in bundled.form, false,
+        'the server\'s absolute path to the controlled document must never reach a device');
+      assert.equal('parse_error' in bundled.form, false,
+        'an internal scanner diagnostic must never reach a device');
+      // Nothing else may have been stripped along with them: the whole
+      // payload is useless to the app without these.
+      assert.ok(bundled.form.id);
+      assert.equal(bundled.form.file_name, 'form-e.xlsx');
+      assert.ok('content_hash' in bundled.form, 'content_hash is document identity and must survive');
+      assert.ok('title' in bundled.form && 'doc_number' in bundled.form && 'revision' in bundled.form);
+      assert.equal(bundled.form.state, 'ready');
+
+      // Belt and braces: the path must not have leaked anywhere else in the
+      // payload either (grid, cellFor, skipped, ...).
+      const raw = JSON.stringify(res.body);
+      assert.equal(raw.includes(dir), false, 'no filesystem path may appear anywhere in the bundle payload');
+    } finally {
+      server.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a field\'s options column (allowed answers) is carried through into the bundle', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pmforms-bundle-opts-'));
   try {
