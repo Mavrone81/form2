@@ -24,6 +24,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify signing secrets are present
+        # Belt 1 of 2 against a silent debug-signed release. A missing or
+        # typo'd secret name isn't a hard error on its own -- `${{ secrets.X
+        # }}` for an unset X just interpolates to an empty string, so
+        # `echo "" | base64 -d` decodes to an empty (or garbage) keystore
+        # file, `hasReleaseSigning` in build.gradle.kts goes false, and the
+        # release build type silently falls back to debug signing -- which
+        # is the correct behaviour for local dev (see the comment there) but
+        # must never happen here, where the result gets uploaded as a
+        # workflow artifact and, on a tag push, attached to a public
+        # release. Fail fast, before spending any build time, and name only
+        # which secret(s) are missing -- never their values.
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+        run: |
+          missing=""
+          [ -z "$KEYSTORE_B64" ] && missing="$missing ANDROID_KEYSTORE_B64"
+          [ -z "$KEYSTORE_PASS" ] && missing="$missing ANDROID_KEYSTORE_PASS"
+          [ -z "$KEY_ALIAS" ] && missing="$missing ANDROID_KEY_ALIAS"
+          [ -z "$KEY_PASS" ] && missing="$missing ANDROID_KEY_PASS"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing/empty repo secret(s):$missing -- refusing to build (this would otherwise silently fall back to debug signing)."
+            exit 1
+          fi
+          echo "All four signing secrets are present."
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -67,11 +96,23 @@ jobs:
         # GitHub's default shell is `bash -e`, NOT `-o pipefail`: without
         # this, the step exits with `tail`'s status (always 0) and a
         # failing suite goes green. Same discipline as ci.yml's "Run tests"
-        # step, verified there against a deliberately failing test.
+        # step, verified there against a deliberately failing test. Also
+        # tees to a file like ci.yml does, rather than piping straight to
+        # `tail`, so a failure's full output isn't lost to the 20-line
+        # truncation in the log -- see the "Upload full server test log on
+        # failure" step below.
         shell: bash
         run: |
           set -o pipefail
-          node --test 2>&1 | tail -20
+          node --test 2>&1 | tee test-output.txt | tail -20
+
+      - name: Upload full server test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-test-log
+          path: test-output.txt
+          retention-days: 30
 
       - name: Guard against committed form content and signing material
         run: npm run check:sensitive
@@ -106,11 +147,40 @@ jobs:
           KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
         run: flutter build apk --release
 
+      - name: Verify the APK is signed with the release key, not debug
+        # Belt 2 of 2. The secrets-present check earlier only proves the
+        # four env vars were non-empty -- it can't prove the base64 decoded
+        # to a valid keystore, that the passwords/alias were actually
+        # correct for it, or that it's the *expected* keystore. Any of
+        # those failing silently degrades signingConfig back to debug (see
+        # build.gradle.kts) or produces an APK Gradle happily calls "signed"
+        # under the wrong identity. Actually inspect the built APK's
+        # certificate before it goes anywhere near an artifact upload or a
+        # public release.
+        run: |
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::apksigner not found under \$ANDROID_HOME/build-tools"
+            exit 1
+          fi
+          apk="mobile/app/build/app/outputs/flutter-apk/app-release.apk"
+          certs="$("$APKSIGNER" verify --print-certs "$apk")"
+          echo "$certs"
+          if echo "$certs" | grep -q 'CN=Android Debug'; then
+            echo "::error::APK is signed with the Android DEBUG key, not the release keystore -- refusing to publish it."
+            exit 1
+          fi
+          if ! echo "$certs" | grep -q 'CN=PM Records'; then
+            echo "::error::APK signer CN is not 'PM Records' as expected -- refusing to publish an unexpectedly-signed APK."
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: pmrecords-release-apk
           path: mobile/app/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
+          retention-days: 30
 
       - name: Attach APK to the tag's GitHub release
         # Only on the tag trigger, not on workflow_dispatch runs (those have
