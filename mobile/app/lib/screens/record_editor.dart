@@ -112,26 +112,48 @@ class RecordEditorScreenState extends State<RecordEditorScreen> {
     );
   }
 
-  Future<void> _persist(LocalRecord updated) async {
-    await widget.db.updateRecord(updated);
-    if (!mounted) return;
+  /// Serializes every write this screen makes to [LocalDb] into one chain.
+  /// Two rapid edits used to race: each built its snapshot from `_record`
+  /// as it stood when the edit STARTED, and if edit A's write was still in
+  /// flight when edit B's write finished first, B's `updateRecord` (a full
+  /// row replace) would land, then A's stale write would land on top of it
+  /// and silently drop B's change. Chaining every write onto [_writeQueue]
+  /// fixes the completion-order half of that; [_applyAndEnqueue] mutating
+  /// `_record` synchronously (see below) fixes the other half, by making
+  /// each new snapshot always build on the previous edit's value even if
+  /// that edit's own write hasn't reached the database yet.
+  Future<void> _writeQueue = Future<void>.value();
+
+  /// Applies [updated] to in-memory state immediately -- synchronously,
+  /// before any `await` -- and enqueues the matching write. Returns the
+  /// Future for THIS write specifically, so a caller that needs to know
+  /// when its own change has landed (e.g. [_signAndQueue], which must not
+  /// navigate away before the queued status is actually persisted) can
+  /// await it, while a failure in one write never breaks the chain for a
+  /// later, unrelated one (that's what the `catchError` on [_writeQueue]
+  /// itself is for -- it only ever swallows the error for the QUEUE's
+  /// purposes; the returned Future for this specific call still carries it).
+  Future<void> _applyAndEnqueue(LocalRecord updated) {
     setState(() => _record = updated);
+    final thisWrite = _writeQueue.then((_) => widget.db.updateRecord(updated));
+    _writeQueue = thisWrite.catchError((_) {});
+    return thisWrite;
   }
 
   void _onFrequencyChange(String freq) {
     if (_locked) return;
-    unawaited(_persist(_copy(frequency: freq)));
+    unawaited(_applyAndEnqueue(_copy(frequency: freq)));
   }
 
   void _onFieldChange(String key, String value) {
     if (_locked) return;
     if (key == 'machine_id') {
-      unawaited(_persist(_copy(machineId: value)));
+      unawaited(_applyAndEnqueue(_copy(machineId: value)));
       return;
     }
     final values = Map<String, dynamic>.from(_record!.values);
     values[key] = value;
-    unawaited(_persist(_copy(values: values)));
+    unawaited(_applyAndEnqueue(_copy(values: values)));
   }
 
   Future<void> _signAndQueue() async {
@@ -143,11 +165,17 @@ class RecordEditorScreenState extends State<RecordEditorScreen> {
     }
     final bytes = await _sigController.exportPng();
     final updated = _copy(
-      signaturePng: base64Encode(bytes),
+      // The server's assertValidSignature requires the stored value to
+      // start with this exact data-URI prefix before it will even check
+      // the base64 payload's PNG magic number (server/workflow.js) -- the
+      // same shape a browser's canvas.toDataURL() produces, which is what
+      // the web app stores. A bare base64 string here would sync every
+      // signed record straight to a per-record INVALID error.
+      signaturePng: encodePngDataUri(bytes),
       signedAt: DateTime.now().toUtc().toIso8601String(),
       status: RecordStatus.queued,
     );
-    await _persist(updated);
+    await _applyAndEnqueue(updated);
     if (!mounted) return;
     Navigator.of(context).maybePop();
   }
@@ -285,7 +313,7 @@ class RecordEditorScreenState extends State<RecordEditorScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (hasImage)
-              Image.memory(base64Decode(record.signaturePng), height: 100, fit: BoxFit.contain)
+              Image.memory(decodePngDataUri(record.signaturePng), height: 100, fit: BoxFit.contain)
             else
               const Text('Not yet signed', style: TextStyle(color: AppColors.mute, fontSize: 12.5)),
             if (record.signedAt.trim().isNotEmpty) ...[

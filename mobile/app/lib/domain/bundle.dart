@@ -103,8 +103,14 @@ class FormBundle {
 
     final frequencies = ((json['frequencies'] as List?) ?? []).map((e) => e.toString()).toList();
 
+    // Guarded the same way the list fields above are: a missing/malformed
+    // `form` object must not throw a cast exception, it should just come
+    // through as every field defaulting empty (see FormMeta.fromJson).
+    final formJson = json['form'];
+    final form = FormMeta.fromJson(formJson is Map ? Map<String, dynamic>.from(formJson) : const <String, dynamic>{});
+
     return FormBundle(
-      form: FormMeta.fromJson(Map<String, dynamic>.from(json['form'] as Map)),
+      form: form,
       fields: fields,
       frequencies: frequencies,
       tasks: tasks,

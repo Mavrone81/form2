@@ -187,4 +187,102 @@ void main() {
     final stored = await db.getRecord(uuid);
     expect(stored!.values['task_11'], 'Pass');
   });
+
+  testWidgets('signing stores a PNG data URI the server accepts, not bare base64', (tester) async {
+    final db = _newDb();
+    addTearDown(db.close);
+    final uuid = await _seedDraft(db, frequency: 'Y');
+
+    // `Picture.toImage()`/`Image.toByteData()` (inside `exportPng()`) do
+    // genuine engine-level async work that plain `pumpAndSettle()` never
+    // waits for -- `runAsync` is the documented way to let that actually
+    // complete inside a widget test. Critically, the WHOLE interaction
+    // (`pumpWidget` through the final tap) has to happen inside the SAME
+    // `runAsync` call: `RecordEditorScreenState` chains its writes onto a
+    // `Future` seeded in `initState`, and chaining a real-zone `.then()`
+    // onto a Future that was seeded in the test's normal (fake-async) zone
+    // never resolves until the whole test body unwinds -- a zone-boundary
+    // artifact of the test harness, not a production bug (a real app has no
+    // fake-async zone to cross). Seeding that Future from inside the same
+    // `runAsync` zone that later chains onto it avoids the crossing.
+    await tester.runAsync(() async {
+      await tester.pumpWidget(_harness(db, uuid));
+      await tester.pumpAndSettle();
+
+      // The signature section is below the fold on the test surface --
+      // scroll it into view before interacting with it.
+      await tester.scrollUntilVisible(find.byType(SignaturePad), 300, scrollable: find.byType(Scrollable).first);
+      await tester.pumpAndSettle();
+
+      final gesture = await tester.startGesture(tester.getCenter(find.byType(SignaturePad)));
+      await gesture.moveBy(const Offset(60, 0));
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      await tester.scrollUntilVisible(find.text('Sign & queue'), 300, scrollable: find.byType(Scrollable).first);
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Sign & queue'));
+      // The screen's own write handler is private (can't be awaited
+      // directly from here), so poll the actual DB state to completion.
+      for (var i = 0; i < 60; i++) {
+        final r = await db.getRecord(uuid);
+        if (r?.status == RecordStatus.queued) break;
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+    });
+
+    final stored = await db.getRecord(uuid);
+    expect(stored!.status, RecordStatus.queued);
+    // The server's assertValidSignature (server/workflow.js) requires this
+    // exact prefix before it will even look at the base64 payload -- a bare
+    // base64 string here would sync every signed record to a per-record
+    // INVALID error that sticks forever.
+    expect(stored.signaturePng, startsWith(pngDataUriPrefix));
+    final bytes = decodePngDataUri(stored.signaturePng);
+    expect(bytes.length, greaterThan(8));
+    expect(bytes.sublist(0, 8), [137, 80, 78, 71, 13, 10, 26, 10]); // PNG magic number
+  });
+
+  testWidgets('signing with a blank pad keeps the record a draft and warns instead', (tester) async {
+    final db = _newDb();
+    addTearDown(db.close);
+    final uuid = await _seedDraft(db, frequency: 'Y');
+
+    await tester.pumpWidget(_harness(db, uuid));
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(find.text('Sign & queue'), 300, scrollable: find.byType(Scrollable).first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Sign & queue'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Draw a signature before signing.'), findsOneWidget);
+    final stored = await db.getRecord(uuid);
+    expect(stored!.status, RecordStatus.draft);
+    expect(stored.signaturePng, isEmpty);
+  });
+
+  testWidgets('two immediate sequential edits to different fields both land in the stored draft', (tester) async {
+    final db = _newDb();
+    addTearDown(db.close);
+    final uuid = await _seedDraft(db);
+
+    await tester.pumpWidget(_harness(db, uuid));
+    await tester.pumpAndSettle();
+
+    // Fire both onChanged callbacks back-to-back, synchronously, with no
+    // `await` (and so no completed write) in between -- the exact race a
+    // lost-update bug needs: edit B must not be built from a stale
+    // snapshot that predates edit A.
+    final textFields = tester.widgetList<TextField>(find.byType(TextField)).toList();
+    // Section order: machine_id first, then remarks.
+    textFields[0].onChanged!('MID-1');
+    textFields[1].onChanged!('Cleaned and greased');
+    await tester.pumpAndSettle();
+
+    final stored = await db.getRecord(uuid);
+    expect(stored!.machineId, 'MID-1');
+    expect(stored.values['remarks'], 'Cleaned and greased');
+  });
 }

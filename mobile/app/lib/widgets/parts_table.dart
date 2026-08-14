@@ -68,7 +68,28 @@ class PartsTable extends StatelessWidget {
       return _partsFallback[column]!;
     }
 
-    final sortedRows = rows.keys.toList()..sort();
+    var displayRows = rows.keys.toList()..sort();
+
+    if (locked) {
+      // A read-only record shows only the rows something was actually
+      // written in -- five rows of em-dashes would state that five parts
+      // were considered and rejected, which is not what a blank row means.
+      // Mirrors `partsGrid()`'s own filter in web/js/field-panel.js.
+      bool hasAnyValue(int rowNo) {
+        final row = rows[rowNo]!;
+        for (final c in _partsOrder) {
+          final field = row[c];
+          if (field == null) continue;
+          if ((values[field.fieldKey] ?? '').toString().trim().isNotEmpty) return true;
+        }
+        return false;
+      }
+
+      displayRows = displayRows.where(hasAnyValue).toList();
+      if (displayRows.isEmpty) {
+        return const Text('No parts recorded.', style: TextStyle(color: AppColors.mute, fontSize: 12));
+      }
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -85,14 +106,15 @@ class PartsTable extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 4),
-        for (final rowNo in sortedRows) _PartsRow(row: rows[rowNo]!, values: values, locked: locked, onChanged: onChanged),
+        for (final rowNo in displayRows)
+          _PartsRow(key: ValueKey('parts-row-$rowNo'), row: rows[rowNo]!, values: values, locked: locked, onChanged: onChanged),
       ],
     );
   }
 }
 
 class _PartsRow extends StatelessWidget {
-  const _PartsRow({required this.row, required this.values, required this.locked, required this.onChanged});
+  const _PartsRow({super.key, required this.row, required this.values, required this.locked, required this.onChanged});
 
   final Map<String, BundleField> row;
   final Map<String, dynamic> values;

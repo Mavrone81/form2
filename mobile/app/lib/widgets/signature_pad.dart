@@ -1,9 +1,31 @@
+import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
 import 'app_colors.dart';
+
+/// The `data:image/png;base64,` prefix the server's `assertValidSignature`
+/// requires before it will even look at the base64 payload's magic number
+/// (see `server/workflow.js`) -- exactly what a browser's own
+/// `canvas.toDataURL()` produces, which is what the web app stores. Every
+/// `LocalRecord.signaturePng` this app writes must carry it too, so the
+/// stored value IS the wire value end to end, never a bare base64 string a
+/// sync would reject.
+const pngDataUriPrefix = 'data:image/png;base64,';
+
+/// Wraps [bytes] as the PNG data URI the server (and the web app) expect.
+String encodePngDataUri(Uint8List bytes) => '$pngDataUriPrefix${base64Encode(bytes)}';
+
+/// The inverse of [encodePngDataUri]. Tolerant of a bare base64 string with
+/// no prefix too, so an older fixture or a value from before this
+/// convention still decodes rather than throwing.
+Uint8List decodePngDataUri(String value) {
+  final trimmed = value.trim();
+  final b64 = trimmed.startsWith(pngDataUriPrefix) ? trimmed.substring(pngDataUriPrefix.length) : trimmed;
+  return base64Decode(b64);
+}
 
 /// Owns one signature pad's in-progress strokes and renders them to PNG
 /// bytes on demand -- no drawing package, just `dart:ui`'s own
@@ -18,6 +40,17 @@ class SignaturePadController extends ChangeNotifier {
   List<List<Offset>> get strokes => List.unmodifiable(_strokes);
 
   bool get isEmpty => _strokes.isEmpty;
+
+  /// The pad's actual on-screen box, reported by [SignaturePad] on every
+  /// layout (see its `LayoutBuilder`). [exportPng] renders at this size --
+  /// never a fixed guess -- so a wide tablet's signature is not squashed
+  /// into (or a narrow phone's stretched out of) a canvas shaped for some
+  /// other device. `null` only before the pad has ever been laid out.
+  Size? paintedSize;
+
+  void reportSize(Size size) {
+    paintedSize = size;
+  }
 
   void startStroke(Offset point) {
     _strokes.add([point]);
@@ -42,13 +75,18 @@ class SignaturePadController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Renders every recorded stroke onto a white [size]-shaped canvas and
-  /// returns the result as PNG bytes -- exactly what `LocalRecord.signaturePng`
-  /// stores (base64-encoded by the caller).
-  Future<Uint8List> exportPng({Size size = const Size(600, 200)}) async {
+  /// Renders every recorded stroke onto a white canvas and returns the
+  /// result as PNG bytes -- exactly what [encodePngDataUri] wraps for
+  /// `LocalRecord.signaturePng`. Defaults to [paintedSize] (the pad's real,
+  /// currently-laid-out box) so strokes are drawn 1:1, not rescaled onto an
+  /// arbitrary canvas; an explicit [size] can still be passed (tests that
+  /// never mount a [SignaturePad] have no other way to get one) and falls
+  /// back to a fixed guess only if neither is available.
+  Future<Uint8List> exportPng({Size? size}) async {
+    final exportSize = size ?? paintedSize ?? const Size(600, 200);
     final recorder = ui.PictureRecorder();
-    final canvas = Canvas(recorder, Rect.fromLTWH(0, 0, size.width, size.height));
-    canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), Paint()..color = AppColors.paper);
+    final canvas = Canvas(recorder, Rect.fromLTWH(0, 0, exportSize.width, exportSize.height));
+    canvas.drawRect(Rect.fromLTWH(0, 0, exportSize.width, exportSize.height), Paint()..color = AppColors.paper);
 
     final paint = Paint()
       ..color = AppColors.ink
@@ -68,7 +106,7 @@ class SignaturePadController extends ChangeNotifier {
     }
 
     final picture = recorder.endRecording();
-    final image = await picture.toImage(size.width.round(), size.height.round());
+    final image = await picture.toImage(exportSize.width.round(), exportSize.height.round());
     final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
     return byteData!.buffer.asUint8List();
   }
@@ -126,15 +164,25 @@ class _SignaturePadState extends State<SignaturePad> {
       height: 160,
       width: double.infinity,
       decoration: BoxDecoration(border: Border.all(color: AppColors.rule), color: AppColors.paper),
-      child: widget.locked
-          ? pad
-          : GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onPanStart: (details) => widget.controller.startStroke(details.localPosition),
-              onPanUpdate: (details) => widget.controller.extendStroke(details.localPosition),
-              onPanEnd: (_) => widget.controller.endStroke(),
-              child: pad,
-            ),
+      // LayoutBuilder's constraints ARE this Container's inner content box
+      // -- the exact rectangle strokes are drawn into and gestures are read
+      // from -- so reporting `constraints.biggest` here (a plain field
+      // write, no notifyListeners/setState) is what lets `exportPng()`
+      // render at the pad's real size instead of a fixed guess.
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          widget.controller.reportSize(constraints.biggest);
+          return widget.locked
+              ? pad
+              : GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onPanStart: (details) => widget.controller.startStroke(details.localPosition),
+                  onPanUpdate: (details) => widget.controller.extendStroke(details.localPosition),
+                  onPanEnd: (_) => widget.controller.endStroke(),
+                  child: pad,
+                );
+        },
+      ),
     );
   }
 }
