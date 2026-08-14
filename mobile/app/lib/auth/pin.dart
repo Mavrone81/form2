@@ -184,7 +184,7 @@ class PinLock {
     if (salt == null || hash == null) return PinVerifyResult.wrongPin(_attemptsBeforeLock);
 
     final now = _now();
-    final state = await _readAttemptState();
+    final state = await _readAttemptState(now);
     if (state.lockedUntil != null && now.isBefore(state.lockedUntil!)) {
       return PinVerifyResult.lockedOut(state.lockedUntil!);
     }
@@ -232,10 +232,27 @@ class PinLock {
   /// Reads the whole attempt/lockout unit as one value. Absent (never set,
   /// or just reset) reads back as the zeroed/unlocked default -- there is no
   /// separate "not present" branch to keep in sync with the zero case.
-  Future<_AttemptState> _readAttemptState() async {
+  ///
+  /// A blob that exists but fails to decode (truncated write, on-disk
+  /// tampering, a future schema this build doesn't understand) is NOT
+  /// treated as "no lockout" -- that would hand anyone who can corrupt the
+  /// stored state, deliberately or by a badly-timed power loss, a free
+  /// attempt-counter reset. Fail CLOSED instead: treat it exactly as if a
+  /// lockout had just triggered at the base 30s tier, timed from `now`, and
+  /// persist that synthetic state immediately so the corrupt blob is
+  /// self-healed on the very next read rather than re-triggering a fresh
+  /// 30s lock forever. A legitimate user with a genuinely corrupted store
+  /// waits 30 seconds once; an attacker who corrupts the blob gains nothing.
+  Future<_AttemptState> _readAttemptState(DateTime now) async {
     final raw = await _storage.read(_attemptStateKey);
     if (raw == null) return const _AttemptState();
-    return _AttemptState.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    try {
+      return _AttemptState.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      final repaired = _AttemptState(lockoutStage: 1, lockedUntil: now.add(const Duration(seconds: _baseLockSeconds)));
+      await _writeAttemptState(repaired);
+      return repaired;
+    }
   }
 
   /// Writes the whole attempt/lockout unit as one value, in one

@@ -279,5 +279,36 @@ void main() {
       expect(result.status, PinVerifyStatus.wrongPin);
       expect(result.remainingBeforeLock, 4);
     });
+
+    test('a corrupted attempt-state blob fails closed (locked, base 30s tier) instead of throwing', () async {
+      await storage.write('pin_attempt_state', 'not valid json at all {{{');
+
+      // Must not throw out of verify() into UI code.
+      final result = await pin.verify('1234'); // even the CORRECT pin
+      expect(result.status, PinVerifyStatus.lockedOut);
+      expect(result.lockedUntil, clock.add(const Duration(seconds: 30)));
+
+      // The corrupt blob is self-healed by the read that discovered it --
+      // it now holds valid JSON describing that same lockout.
+      final repairedRaw = await storage.read('pin_attempt_state');
+      expect(repairedRaw, isNotNull);
+      expect(() => jsonDecode(repairedRaw!), returnsNormally);
+
+      // Once the (synthetic) lockout window passes, a correct PIN succeeds
+      // normally and the blob is rewritten clean (deleted, like any other
+      // successful verify).
+      clock = clock.add(const Duration(seconds: 31));
+      final afterRepairWindow = await pin.verify('1234');
+      expect(afterRepairWindow.isOk, isTrue);
+      expect(await storage.read('pin_attempt_state'), isNull);
+    });
+
+    test('a corrupted blob with a malformed lockedUntil date also fails closed rather than throwing', () async {
+      await storage.write('pin_attempt_state', jsonEncode({'failCount': 0, 'lockoutStage': 0, 'lockedUntil': 'not-a-date'}));
+
+      final result = await pin.verify('0000');
+      expect(result.status, PinVerifyStatus.lockedOut);
+      expect(result.lockedUntil, clock.add(const Duration(seconds: 30)));
+    });
   });
 }
