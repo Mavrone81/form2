@@ -2,9 +2,11 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
+import '../api/client.dart';
 import '../db/local_db.dart';
 import '../db/models.dart';
 import '../domain/bundle.dart';
+import '../services/connectivity_source.dart';
 import '../widgets/app_colors.dart';
 import 'record_editor.dart';
 
@@ -15,7 +17,14 @@ import 'record_editor.dart';
 /// brief. Nothing here talks to the network; a form only appears once it has
 /// been synced down at least once.
 class FormsListScreen extends StatefulWidget {
-  const FormsListScreen({super.key, required this.db, required this.username});
+  const FormsListScreen({
+    super.key,
+    required this.db,
+    required this.username,
+    required this.userFullName,
+    this.api,
+    this.connectivity,
+  });
 
   final LocalDb db;
 
@@ -26,6 +35,17 @@ class FormsListScreen extends StatefulWidget {
   /// "my drafts" apart from "the previous technician's drafts" instead of
   /// silently mixing (and, worse, syncing) both under one identity.
   final String username;
+
+  /// Passed straight through to [RecordEditorScreen] for the draft this
+  /// screen creates -- the display name its preview prints in the signature
+  /// block. Nothing here uses it itself.
+  final String userFullName;
+
+  /// Likewise pass-through, and likewise only for the editor's preview: the
+  /// "view the server's copy" fallback, which only ever applies to a record
+  /// that has already synced (never to the brand-new draft this screen makes).
+  final ApiClient? api;
+  final ConnectivitySource? connectivity;
 
   @override
   State<FormsListScreen> createState() => _FormsListScreenState();
@@ -64,7 +84,15 @@ class _FormsListScreenState extends State<FormsListScreen> {
     await widget.db.setRecordOwner(record.clientUuid, widget.username);
     if (!mounted) return;
     await Navigator.of(context).push<void>(
-      MaterialPageRoute(builder: (_) => RecordEditorScreen(db: widget.db, clientUuid: record.clientUuid)),
+      MaterialPageRoute(
+        builder: (_) => RecordEditorScreen(
+          db: widget.db,
+          clientUuid: record.clientUuid,
+          userFullName: widget.userFullName,
+          api: widget.api,
+          connectivity: widget.connectivity,
+        ),
+      ),
     );
     // A new draft (or a queue) may have been created by the screen just
     // popped -- nothing here depends on the list changing, so no reload is

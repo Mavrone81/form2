@@ -3,9 +3,12 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
+import '../api/client.dart';
 import '../db/local_db.dart';
 import '../db/models.dart';
 import '../domain/bundle.dart';
+import '../preview/engine.dart';
+import '../services/connectivity_source.dart';
 import '../widgets/app_colors.dart';
 import '../widgets/calibration_table.dart';
 import '../widgets/field_input.dart';
@@ -13,6 +16,7 @@ import '../widgets/interval_picker.dart';
 import '../widgets/parts_table.dart';
 import '../widgets/signature_pad.dart';
 import '../widgets/task_list.dart';
+import 'preview.dart';
 
 final _taskFieldPattern = RegExp(r'^task_\d+$');
 final _partsFieldPattern = RegExp(r'^part_\d+_(no|desc|qty|remarks)$');
@@ -30,12 +34,45 @@ final _calFieldPattern = RegExp(r'^cal_\d+_(reading|result)$');
 ///    `signed_at`, and moves the record `draft` -> `queued`;
 ///  - once the record is no longer `draft` (`queued`/`synced`/`error`), the
 ///    whole screen renders read-only: no editable input anywhere, values as
-///    plain text, exactly matching a completed paper form under glass.
+///    plain text, exactly matching a completed paper form under glass;
+///  - a Preview action in the app bar renders the record as the actual
+///    final document ([PdfPreviewScreen]) -- offered in EVERY state, because
+///    "what will this look like on paper" is a question a technician has
+///    while filling it in, not only once it is signed.
 class RecordEditorScreen extends StatefulWidget {
-  const RecordEditorScreen({super.key, required this.db, required this.clientUuid});
+  const RecordEditorScreen({
+    super.key,
+    required this.db,
+    required this.clientUuid,
+    required this.userFullName,
+    this.api,
+    this.connectivity,
+    this.previewEngine,
+  });
 
   final LocalDb db;
   final String clientUuid;
+
+  /// The signed-in technician's display name, threaded from the app shell
+  /// exactly as it is to every other screen that needs user context. Used
+  /// only by the preview: a `LocalRecord` has nowhere to store one, so the
+  /// name printed in the signature block has to travel in from whoever is
+  /// signed in (see `buildEngineInput`'s own doc).
+  final String userFullName;
+
+  /// Both optional and both only ever reach [PdfPreviewScreen], which uses
+  /// them for one thing: offering the server's archival copy of a record
+  /// that has already SYNCED, when the local render fails and the device is
+  /// online. Omitted, the preview is purely on-device and makes no network
+  /// call at all.
+  final ApiClient? api;
+  final ConnectivitySource? connectivity;
+
+  /// Injectable renderer for the preview screen this one opens. `null` (the
+  /// default, and what the whole app passes) lets [PdfPreviewScreen] build
+  /// the real WebView-backed engine itself; a test passes a fake transport
+  /// so tapping Preview never touches a platform channel.
+  final PreviewEngine? previewEngine;
 
   @override
   State<RecordEditorScreen> createState() => RecordEditorScreenState();
@@ -180,6 +217,32 @@ class RecordEditorScreenState extends State<RecordEditorScreen> {
     Navigator.of(context).maybePop();
   }
 
+  /// Opens the on-device preview of THIS record as the final document.
+  ///
+  /// Awaits [_writeQueue] first. Every edit is written to [LocalDb] as it is
+  /// made, but a write can still be in flight when the button is tapped --
+  /// and [PdfPreviewScreen] reads the record back FROM the database rather
+  /// than from this screen's memory. Draining the chain is what guarantees
+  /// the document a technician is shown is the record as it stands now, not
+  /// as it stood one keystroke ago. (The chain never rejects -- see
+  /// [_applyAndEnqueue]'s `catchError` -- so this cannot throw here.)
+  Future<void> _openPreview() async {
+    await _writeQueue;
+    if (!mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => PdfPreviewScreen(
+          db: widget.db,
+          clientUuid: widget.clientUuid,
+          userFullName: widget.userFullName,
+          api: widget.api,
+          connectivity: widget.connectivity,
+          engine: widget.previewEngine,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) {
@@ -205,6 +268,18 @@ class RecordEditorScreenState extends State<RecordEditorScreen> {
         backgroundColor: AppColors.ink,
         foregroundColor: AppColors.paper,
         title: Text(bundle.form.title),
+        // Deliberately NOT gated on `_locked`: a draft is previewed to check
+        // the work before signing, and a queued/synced record is previewed
+        // to read back what was actually submitted. Both are the same
+        // question -- "what does this look like as the document?" -- and the
+        // renderer answers it identically either way.
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.picture_as_pdf_outlined),
+            tooltip: 'Preview',
+            onPressed: _openPreview,
+          ),
+        ],
       ),
       body: SafeArea(
         child: ListView(

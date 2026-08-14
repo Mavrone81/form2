@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pmrecords/db/local_db.dart';
 import 'package:pmrecords/db/models.dart';
+import 'package:pmrecords/preview/engine.dart';
+import 'package:pmrecords/screens/preview.dart';
 import 'package:pmrecords/screens/record_editor.dart';
 import 'package:pmrecords/widgets/app_colors.dart';
 import 'package:pmrecords/widgets/signature_pad.dart';
@@ -64,7 +66,28 @@ Future<String> _seedQueued(LocalDb db) async {
   return uuid;
 }
 
-Widget _harness(LocalDb db, String uuid) => MaterialApp(home: RecordEditorScreen(db: db, clientUuid: uuid));
+/// A transport that answers with the harness's own error shape, so a tapped
+/// Preview exercises the real [PreviewEngine] code path and lands on the
+/// preview screen's error state -- without ever constructing a WebView.
+class _ErrorTransport implements EngineTransport {
+  @override
+  Future<Map<String, dynamic>> render(Map<String, dynamic> input) async => {
+        'type': 'error',
+        'id': '0',
+        'message': 'no engine in a unit test',
+      };
+}
+
+Widget _harness(LocalDb db, String uuid) => MaterialApp(
+      home: RecordEditorScreen(
+        db: db,
+        clientUuid: uuid,
+        userFullName: 'Tech One',
+        // Always injected in tests: without it, tapping Preview would build
+        // the real WebView-backed engine and touch a platform channel.
+        previewEngine: PreviewEngine(transport: _ErrorTransport()),
+      ),
+    );
 
 Color _colorOf(WidgetTester tester, Finder textFinder) {
   final text = tester.widget<Text>(textFinder);
@@ -284,5 +307,78 @@ void main() {
     final stored = await db.getRecord(uuid);
     expect(stored!.machineId, 'MID-1');
     expect(stored.values['remarks'], 'Cleaned and greased');
+  });
+
+  // The spec's first promise about this app is "The Preview button renders
+  // the actual final document from the current values" -- so there has to be
+  // a Preview button, on the screen where the values are.
+  group('Preview action', () {
+    testWidgets('is offered for an editable draft', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final uuid = await _seedDraft(db);
+
+      await tester.pumpWidget(_harness(db, uuid));
+      await tester.pumpAndSettle();
+
+      expect(find.byTooltip('Preview'), findsOneWidget);
+    });
+
+    testWidgets('is offered for a read-only queued record too', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final uuid = await _seedQueued(db);
+
+      await tester.pumpWidget(_harness(db, uuid));
+      await tester.pumpAndSettle();
+
+      // Locked for editing, but "what did I actually submit?" is exactly the
+      // question a technician asks about a record in this state.
+      expect(find.textContaining('Read-only'), findsOneWidget);
+      expect(find.byTooltip('Preview'), findsOneWidget);
+    });
+
+    testWidgets('tapping it opens the preview screen for this record', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final uuid = await _seedDraft(db);
+
+      await tester.pumpWidget(_harness(db, uuid));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Preview'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PdfPreviewScreen), findsOneWidget);
+      final screen = tester.widget<PdfPreviewScreen>(find.byType(PdfPreviewScreen));
+      expect(screen.clientUuid, uuid);
+      expect(screen.userFullName, 'Tech One');
+      // The injected engine is what the screen actually renders with -- so
+      // this test path never constructs a WebView.
+      expect(find.textContaining('no engine in a unit test'), findsOneWidget);
+    });
+
+    testWidgets('previews the record as it stands RIGHT NOW, including an edit not yet written', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final uuid = await _seedDraft(db);
+
+      await tester.pumpWidget(_harness(db, uuid));
+      await tester.pumpAndSettle();
+
+      // Type, then tap Preview immediately -- no settle in between, so the
+      // write for this edit may still be in flight when the tap lands. The
+      // preview reads the record back from LocalDb, so the editor must drain
+      // its write chain before navigating.
+      final textFields = tester.widgetList<TextField>(find.byType(TextField)).toList();
+      textFields[1].onChanged!('Filter replaced');
+      await tester.tap(find.byTooltip('Preview'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PdfPreviewScreen), findsOneWidget);
+      final stored = await db.getRecord(uuid);
+      expect(stored!.values['remarks'], 'Filter replaced',
+          reason: 'the edit must have landed in the database before the preview screen read it back');
+    });
   });
 }

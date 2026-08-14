@@ -126,7 +126,17 @@ class TechnicianHomeScreenState extends State<TechnicianHomeScreen> {
 
   Future<void> _openForms() async {
     await Navigator.of(context).push<void>(
-      MaterialPageRoute(builder: (_) => FormsListScreen(db: widget.db, username: widget.username)),
+      MaterialPageRoute(
+        builder: (_) => FormsListScreen(
+          db: widget.db,
+          username: widget.username,
+          // Threaded on for the editor's preview, which this screen never
+          // opens directly -- see FormsListScreen's own doc.
+          userFullName: widget.userFullName,
+          api: widget.api,
+          connectivity: widget.connectivity,
+        ),
+      ),
     );
     await _load();
     _bannerKey.currentState?.refreshCounts();
@@ -134,7 +144,15 @@ class TechnicianHomeScreenState extends State<TechnicianHomeScreen> {
 
   Future<void> _openRecord(LocalRecord record) async {
     await Navigator.of(context).push<void>(
-      MaterialPageRoute(builder: (_) => RecordEditorScreen(db: widget.db, clientUuid: record.clientUuid)),
+      MaterialPageRoute(
+        builder: (_) => RecordEditorScreen(
+          db: widget.db,
+          clientUuid: record.clientUuid,
+          userFullName: widget.userFullName,
+          api: widget.api,
+          connectivity: widget.connectivity,
+        ),
+      ),
     );
     await _load();
     _bannerKey.currentState?.refreshCounts();
