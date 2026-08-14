@@ -11,6 +11,10 @@
   storage, no styling worth the name; if this page ever grows logic of its own,
   that logic is by definition something the archived record does not have.
 
+  Both scripts are external files, and nothing here is inline, so the app can
+  serve this page under a strict `script-src 'self'` policy without needing
+  'unsafe-inline' or a nonce.
+
   Protocol
   --------
   in   { type: 'render', id?: any, record: object | string }
@@ -20,60 +24,20 @@
 
   `record` is exactly what server/pdf-record.js's renderRecordPdf takes.
 
-  Replies go back three ways, whichever the host actually provides: to the
-  window that sent the message (an iframe host), to a Flutter JavaScript
-  channel called PdfEngine, and to this window itself. A WebView host binds
-  the channel; a browser tab opened by hand sees the self-post. Sending to all
-  three costs nothing and means the harness does not have to know which kind
-  of host it is running under.
+  Messages are accepted only from this page's own origin — which for a page
+  loaded from app assets is '' or 'null' — and replies are addressed back to
+  the sender rather than broadcast, because a reply carries the finished
+  record: signatories' names and their signature ink. Replies also go to a
+  Flutter JavaScript channel called PdfEngine if the host has bound one, and
+  to this window itself, so a browser tab opened by hand can see them too.
+  Sending to whichever of the three exists means the harness does not have to
+  know what kind of host it is running under.
+
+  A render that somehow fails to finish is answered with an `error` reply
+  after 30 seconds rather than left silent — see harness.js.
 -->
 <body>
 <pre id="status">loading…</pre>
 <script src="dist/pdf-engine.js"></script>
-<script>
-  const status = document.getElementById('status');
-
-  // btoa() takes a string, and a whole record's worth of bytes handed over in
-  // one call overflows the argument list on some engines. Chunked, with the
-  // chunk a multiple of 3 so no chunk boundary ever falls mid-quantum and
-  // introduces padding in the middle of the result.
-  function toBase64(bytes) {
-    const CHUNK = 0x8000 * 3;
-    let binary = '';
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-    }
-    return btoa(binary);
-  }
-
-  function reply(message, source) {
-    const json = JSON.stringify(message);
-    try { source?.postMessage(message, '*'); } catch { /* no opener, or a closed one */ }
-    try { window.PdfEngine?.postMessage(json); } catch { /* no Flutter channel bound */ }
-    try { window.postMessage(message, '*'); } catch { /* nothing listening here */ }
-  }
-
-  window.addEventListener('message', async (event) => {
-    const data = typeof event.data === 'string' ? safeParse(event.data) : event.data;
-    if (!data || data.type !== 'render') return;
-
-    try {
-      status.textContent = 'rendering…';
-      const bytes = await window.renderRecordPdf(data.record);
-      status.textContent = `rendered ${bytes.length} bytes`;
-      reply({ type: 'rendered', id: data.id ?? null, pdf: toBase64(bytes), bytes: bytes.length }, event.source);
-    } catch (err) {
-      status.textContent = `error: ${err && err.message}`;
-      reply({ type: 'error', id: data.id ?? null, message: String((err && err.message) || err) }, event.source);
-    }
-  });
-
-  function safeParse(text) {
-    try { return JSON.parse(text); } catch { return null; }
-  }
-
-  status.textContent = typeof window.renderRecordPdf === 'function'
-    ? 'ready' : 'dist/pdf-engine.js did not load — run `node build.mjs`';
-  if (typeof window.renderRecordPdf === 'function') reply({ type: 'ready' });
-</script>
+<script src="harness.js"></script>
 </body>

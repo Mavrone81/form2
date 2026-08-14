@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { runInThisContext } from 'node:vm';
 import { renderRecordPdf } from '../server/pdf-record.js';
 
@@ -15,7 +16,12 @@ import { renderRecordPdf } from '../server/pdf-record.js';
 // The bundle is a build artefact and is gitignored, so a checkout without it
 // skips — the same discipline test/helpers/fixtures.js uses for the sensitive
 // form fixtures.
-const BUNDLE = new URL('../mobile/pdf-engine/dist/pdf-engine.js', import.meta.url).pathname;
+// fileURLToPath, not `.pathname`: a URL percent-encodes, so under a checkout
+// whose path contains a space (or any other reserved character) `.pathname`
+// yields a path existsSync cannot find — and the guard below would then report
+// the bundle missing while it sits there built, telling the developer to build
+// what they already built.
+const BUNDLE = fileURLToPath(new URL('../mobile/pdf-engine/dist/pdf-engine.js', import.meta.url));
 const SKIP = 'no pdf-engine bundle — run `npm install && node build.mjs` in mobile/pdf-engine';
 
 // A 1x1 transparent PNG. Synthetic — no form content anywhere in this file.
@@ -135,4 +141,48 @@ test('the bundle is deterministic across calls', { skip: existsSync(BUNDLE) ? fa
   const first = Buffer.from(await render(JSON.stringify(FIXTURE)));
   const second = Buffer.from(await render(JSON.stringify(FIXTURE)));
   assert.ok(first.equals(second), 'two renders of one submission must produce identical bytes');
+});
+
+// The same 1x1 PNG, structurally intact — signature, IHDR, IDAT and IEND all
+// where a decoder expects them — but with the IDAT's deflate payload replaced
+// by a valid zlib header over garbage. png-js gets far enough to start
+// inflating and then fails, which is the failure that happens a TURN LATE:
+// PDFKit is decoding the image from inside a callback by then, so the throw
+// has no caller, the document's stream never ends, and the render's promise
+// used to sit pending for ever. In the app that is a preview spinner that
+// never stops — the technician is told nothing at all, which is worse than
+// being told the record could not be drawn.
+const PNG_CORRUPT_IDAT = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB' +
+  'CAYAAAAfFcSJAAAADUlEQVR4nP//////////////hKmMIQAAAABJRU5ErkJggg==';
+
+test('a render that cannot finish rejects rather than hanging', { skip: existsSync(BUNDLE) ? false : SKIP }, async () => {
+  const render = loadBundle();
+  const record = {
+    ...FIXTURE,
+    signatures: [{ stage: 'technician', full_name: 'A Person', image_png: PNG_CORRUPT_IDAT, signed_at: '2026-08-02T09:00:00Z' }]
+  };
+
+  // The whole point is that the promise SETTLES, so a hang has to fail the
+  // test rather than hang the suite. Note this is asserted for the bundle
+  // only: the server's own behaviour on this input is a separate matter, and
+  // rendering it here would take the test process with it.
+  // Not unref'd: the timer must actually fire and name the failure, rather
+  // than letting the event loop drain and leaving the runner to report a
+  // pending promise. It is always cleared below, so it cannot hold the suite
+  // open on a passing run.
+  let timer;
+  const hung = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('HUNG')), 3000); });
+
+  await assert.rejects(
+    Promise.race([render(JSON.stringify(record)), hung]).finally(() => clearTimeout(timer)),
+    (err) => {
+      assert.notEqual(err.message, 'HUNG',
+        'the bundle never settled — a deferred image-decode failure must reject, not hang');
+      return true;
+    }
+  );
+
+  // And the failure is not contagious: the next record still renders.
+  const good = Buffer.from(await render(JSON.stringify(FIXTURE)));
+  assert.ok(good.length > 20000, 'a later render must still succeed');
 });

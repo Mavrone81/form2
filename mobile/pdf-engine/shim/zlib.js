@@ -59,23 +59,34 @@ export function inflateRawSync(data, opts) {
 // enough: the whole render up to doc.end() is synchronous, so anything queued
 // here necessarily runs after it, and before any timer the host might have
 // pending.
-const defer = (fn) => queueMicrotask(fn);
+//
+// It is deferred through ./deferred.js rather than through a bare
+// queueMicrotask because the callback is also where png-js RETHROWS a decode
+// failure, and a throw on a later turn has no caller to reach. Left alone it
+// leaves the render's promise pending for ever — a preview spinner that never
+// stops. See shim/deferred.js.
+import { deferred } from './deferred.js';
 
-export function inflate(data, opts, callback) {
+const callbackForm = (work) => (data, opts, callback) => {
   const cb = typeof opts === 'function' ? opts : callback;
-  defer(() => {
-    try { cb(null, inflateSync(data, typeof opts === 'function' ? undefined : opts)); }
-    catch (err) { cb(err); }
+  const settings = typeof opts === 'function' ? undefined : opts;
+  deferred(() => {
+    let result;
+    try {
+      result = work(data, settings);
+    } catch (err) {
+      // Node's contract: a compression failure is reported THROUGH the
+      // callback, not thrown. Whatever the callback then does with it —
+      // png-js rethrows — is caught by `deferred` and turned into a rejection.
+      cb(err);
+      return;
+    }
+    cb(null, result);
   });
-}
+};
 
-export function deflate(data, opts, callback) {
-  const cb = typeof opts === 'function' ? opts : callback;
-  defer(() => {
-    try { cb(null, deflateSync(data, typeof opts === 'function' ? undefined : opts)); }
-    catch (err) { cb(err); }
-  });
-}
+export const inflate = callbackForm(inflateSync);
+export const deflate = callbackForm(deflateSync);
 
 export default {
   deflate, inflate,
