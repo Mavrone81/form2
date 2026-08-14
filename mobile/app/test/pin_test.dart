@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pmrecords/auth/pin.dart';
 import 'package:pmrecords/auth/secure_storage.dart';
@@ -227,6 +229,55 @@ void main() {
       await pin.setPin('9999');
       final result = await pin.verify('9999');
       expect(result.isOk, isTrue);
+    });
+
+    test('lockout state round-trips through a single storage key (no multi-write crash window)', () async {
+      for (var i = 0; i < 3; i++) {
+        await pin.verify('0000'); // 3 failures, not yet locked
+      }
+
+      // Exactly one key holds the whole attempt/lockout unit -- the fix for
+      // the crash window a 3-key write sequence had (a kill between writes
+      // could leave a bumped lockout stage with no enforced lockedUntil).
+      final raw = await storage.read('pin_attempt_state');
+      expect(raw, isNotNull);
+      expect(await storage.read('pin_fail_count'), isNull);
+      expect(await storage.read('pin_lockout_stage'), isNull);
+      expect(await storage.read('pin_locked_until'), isNull);
+
+      final decoded = jsonDecode(raw!) as Map<String, dynamic>;
+      expect(decoded['failCount'], 3);
+      expect(decoded['lockoutStage'], 0);
+      expect(decoded['lockedUntil'], isNull);
+
+      // Round trip: a fresh instance over the same storage reads the exact
+      // same state back out (this is also what makes persistence across a
+      // cold start work at all).
+      final reopened = makeLock();
+      final fourth = await reopened.verify('0000');
+      expect(fourth.remainingBeforeLock, 1);
+
+      // Push it into an actual lockout and confirm the single key still
+      // carries the lockedUntil timestamp faithfully.
+      final fifth = await reopened.verify('0000');
+      expect(fifth.status, PinVerifyStatus.lockedOut);
+      final lockedRaw = jsonDecode((await storage.read('pin_attempt_state'))!) as Map<String, dynamic>;
+      expect(DateTime.parse(lockedRaw['lockedUntil'] as String), fifth.lockedUntil);
+    });
+
+    test('a legacy split-key attempt state (pre-single-key) is never read back as a fallback', () async {
+      // Simulate state as if written by an earlier (hypothetical) build
+      // that used the three separate keys this version replaced.
+      await storage.write('pin_fail_count', '4');
+      await storage.write('pin_lockout_stage', '1');
+      await storage.write('pin_locked_until', clock.add(const Duration(hours: 1)).toIso8601String());
+
+      // No `pin_attempt_state` key exists, so this must read back as a
+      // completely fresh, unlocked budget -- the legacy keys must not
+      // resurrect a phantom lockout.
+      final result = await pin.verify('0000');
+      expect(result.status, PinVerifyStatus.wrongPin);
+      expect(result.remainingBeforeLock, 4);
     });
   });
 }

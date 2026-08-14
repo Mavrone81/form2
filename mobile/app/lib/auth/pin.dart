@@ -34,6 +34,30 @@ class PinVerifyResult {
   bool get isOk => status == PinVerifyStatus.ok;
 }
 
+/// The failure counter, lockout stage, and lockout-until timestamp, as one
+/// unit. Kept together deliberately (see [PinLock._writeAttemptState]):
+/// these three values must change atomically, as a single storage write,
+/// never as separate writes a process kill could interleave.
+class _AttemptState {
+  const _AttemptState({this.failCount = 0, this.lockoutStage = 0, this.lockedUntil});
+
+  final int failCount;
+  final int lockoutStage;
+  final DateTime? lockedUntil;
+
+  Map<String, dynamic> toJson() => {
+        'failCount': failCount,
+        'lockoutStage': lockoutStage,
+        'lockedUntil': lockedUntil?.toIso8601String(),
+      };
+
+  static _AttemptState fromJson(Map<String, dynamic> json) => _AttemptState(
+        failCount: json['failCount'] as int? ?? 0,
+        lockoutStage: json['lockoutStage'] as int? ?? 0,
+        lockedUntil: json['lockedUntil'] == null ? null : DateTime.parse(json['lockedUntil'] as String),
+      );
+}
+
 /// A device-local PIN gate, 4-6 digits, so a technician can reopen the app
 /// while offline without a server round trip -- there is no connection to
 /// check a password against out on the shop floor. Only a salted sha256 of
@@ -58,6 +82,16 @@ class PinVerifyResult {
 /// worse than the problem it defends against. Escalating lockout is the
 /// full defense for now -- a wipe policy is a deliberate non-goal here, not
 /// an oversight to revisit casually.
+///
+/// **No authentication precondition of its own on [setPin]:** this class
+/// does not require a caller to prove they hold the current PIN before
+/// replacing it -- there is no "old PIN" concept at all in here. That is
+/// safe today only because nothing yet calls [setPin] outside first-time
+/// setup. The moment a "change PIN" screen exists, IT must gate its call to
+/// [setPin] behind a successful [verify] of the CURRENT PIN first; without
+/// that, anyone holding the unlocked app (e.g. someone who grabbed the
+/// device while it happened to be open) could silently take over the PIN
+/// gate. See the warning repeated on [setPin] itself.
 class PinLock {
   PinLock(this._storage, {DateTime Function()? now}) : _now = now ?? DateTime.now;
 
@@ -66,9 +100,13 @@ class PinLock {
 
   static const _hashKey = 'pin_hash';
   static const _saltKey = 'pin_salt';
-  static const _failCountKey = 'pin_fail_count';
-  static const _lockoutStageKey = 'pin_lockout_stage';
-  static const _lockedUntilKey = 'pin_locked_until';
+
+  /// Single key for the whole attempt/lockout unit -- see [_AttemptState].
+  /// Deliberately new (nothing has shipped yet), so there is no legacy
+  /// split-key state to migrate; any old `pin_fail_count` /
+  /// `pin_lockout_stage` / `pin_locked_until` keys some earlier build might
+  /// have written are simply never read again.
+  static const _attemptStateKey = 'pin_attempt_state';
 
   static final RegExp _pinShape = RegExp(r'^\d{4,6}$');
 
@@ -109,6 +147,13 @@ class PinLock {
   /// calling this, but the gate never trusts that alone. Also clears any
   /// attempt count / lockout: a newly-set PIN always starts with a clean
   /// slate.
+  ///
+  /// **Carries no authentication check of its own.** This call will happily
+  /// overwrite an existing PIN for anyone who can reach it -- it does NOT
+  /// verify the caller knows the current PIN first. First-time setup (no
+  /// PIN exists yet) is the only case that is safe to call directly; a
+  /// "change PIN" flow MUST call [verify] with the current PIN and check
+  /// `.isOk` before ever calling this. See the class doc for why.
   Future<void> setPin(String pin) async {
     if (!_pinShape.hasMatch(pin)) {
       throw ArgumentError('PIN must be 4 to 6 digits.');
@@ -139,9 +184,9 @@ class PinLock {
     if (salt == null || hash == null) return PinVerifyResult.wrongPin(_attemptsBeforeLock);
 
     final now = _now();
-    final lockedUntil = await _readLockedUntil();
-    if (lockedUntil != null && now.isBefore(lockedUntil)) {
-      return PinVerifyResult.lockedOut(lockedUntil);
+    final state = await _readAttemptState();
+    if (state.lockedUntil != null && now.isBefore(state.lockedUntil!)) {
+      return PinVerifyResult.lockedOut(state.lockedUntil!);
     }
 
     if (_hashesMatch(hashPin(pin, salt), hash)) {
@@ -149,14 +194,14 @@ class PinLock {
       return PinVerifyResult.ok();
     }
 
-    final failCount = (await _readInt(_failCountKey)) + 1;
-    final lockoutStage = await _readInt(_lockoutStageKey);
+    final failCount = state.failCount + 1;
+    final lockoutStage = state.lockoutStage;
 
     // Still inside the initial 5-attempt budget: no lockout has ever
     // triggered yet (lockoutStage == 0) and this failure alone doesn't spend
     // the last of it.
     if (lockoutStage == 0 && failCount < _attemptsBeforeLock) {
-      await _storage.write(_failCountKey, '$failCount');
+      await _writeAttemptState(_AttemptState(failCount: failCount));
       return PinVerifyResult.wrongPin(_attemptsBeforeLock - failCount);
     }
 
@@ -166,9 +211,7 @@ class PinLock {
     final nextStage = lockoutStage + 1;
     final delaySeconds = min(_baseLockSeconds * pow(2, nextStage - 1).toInt(), _maxLockSeconds);
     final until = now.add(Duration(seconds: delaySeconds));
-    await _storage.write(_failCountKey, '0');
-    await _storage.write(_lockoutStageKey, '$nextStage');
-    await _storage.write(_lockedUntilKey, until.toIso8601String());
+    await _writeAttemptState(_AttemptState(failCount: 0, lockoutStage: nextStage, lockedUntil: until));
     return PinVerifyResult.lockedOut(until);
   }
 
@@ -183,19 +226,26 @@ class PinLock {
   }
 
   Future<void> _resetAttempts() async {
-    await _storage.delete(_failCountKey);
-    await _storage.delete(_lockoutStageKey);
-    await _storage.delete(_lockedUntilKey);
+    await _storage.delete(_attemptStateKey);
   }
 
-  Future<int> _readInt(String key) async {
-    final raw = await _storage.read(key);
-    return raw == null ? 0 : int.parse(raw);
+  /// Reads the whole attempt/lockout unit as one value. Absent (never set,
+  /// or just reset) reads back as the zeroed/unlocked default -- there is no
+  /// separate "not present" branch to keep in sync with the zero case.
+  Future<_AttemptState> _readAttemptState() async {
+    final raw = await _storage.read(_attemptStateKey);
+    if (raw == null) return const _AttemptState();
+    return _AttemptState.fromJson(jsonDecode(raw) as Map<String, dynamic>);
   }
 
-  Future<DateTime?> _readLockedUntil() async {
-    final raw = await _storage.read(_lockedUntilKey);
-    if (raw == null) return null;
-    return DateTime.parse(raw);
+  /// Writes the whole attempt/lockout unit as one value, in one
+  /// [SecureStorage.write] call -- the fix for the crash window a 3-key
+  /// write sequence had: a kill between "fail count cleared" and "lockout
+  /// timestamp set" used to be able to leave a bumped lockout STAGE with NO
+  /// enforced `lockedUntil`, letting the very next correct PIN slip through
+  /// a lockout that should have held. A single write cannot be interleaved
+  /// with itself.
+  Future<void> _writeAttemptState(_AttemptState state) async {
+    await _storage.write(_attemptStateKey, jsonEncode(state.toJson()));
   }
 }
