@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import fs, { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ExcelJS from 'exceljs';
@@ -186,5 +186,65 @@ test('a form whose file fails to parse is skipped, not a 500 for the whole bundl
     assert.equal(me.status, 200);
   } finally {
     server.close();
+  }
+});
+
+// --- One parse per form, not two -------------------------------------------
+//
+// Bundling a form used to call parseWorkbook TWICE: once inside formSpec (for
+// tasks/frequencies/cellFor) and once more, redundantly, right before
+// buildGrid -- two full reads and XLSX parses of the same file per form, in
+// the one endpoint whose whole point is a single bulk sync call. It also left
+// a window where the two parses of the same file could observe different
+// content if a rescan/write raced mid-request.
+//
+// ExcelJS's workbook.xlsx.readFile ultimately opens the file via
+// fs.createReadStream (node_modules/exceljs/lib/xlsx/xlsx.js) -- both
+// parseWorkbook (server/excel-parser.js) and buildGrid's own internal,
+// SEPARATE workbook read (server/grid-model.js: buildGrid always does its own
+// `new ExcelJS.Workbook(); await wb.xlsx.readFile(path)`, regardless of
+// whether a `definition` is passed -- that second argument only supplies
+// taskRows, never a parsed workbook to reuse) go through it, so counting
+// calls against this one form's path is a reliable proxy for how many times
+// its file was opened during one bundle request.
+test('bundling a form opens its file exactly twice: formSpec\'s one parseWorkbook call, plus buildGrid\'s own separate read -- never a redundant extra parse', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pmforms-bundle-singleparse-'));
+  try {
+    await writeSyntheticWorkbook(join(dir, 'form-d.xlsx'), [['Y', 'Widget check A']]);
+    const { db, server, call } = await boot();
+    try {
+      await scanFolder(db, dir);
+      const form = db.prepare("select * from form_catalog where file_name='form-d.xlsx'").get();
+      const target = form.file_path;
+
+      const orig = fs.createReadStream;
+      let opens = 0;
+      fs.createReadStream = function (...args) {
+        if (args[0] === target) opens++;
+        return orig.apply(this, args);
+      };
+
+      let res;
+      try {
+        await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+        res = await call('GET', '/api/bundle');
+      } finally {
+        fs.createReadStream = orig;
+      }
+
+      assert.equal(res.status, 200);
+      assert.ok(res.body.forms.some((f) => f.form.file_name === 'form-d.xlsx'), 'the form must have parsed');
+      // 2, not 3: formSpec's single parseWorkbook call, plus buildGrid's own
+      // structurally-separate read of the same path (also present,
+      // unchanged, in the pre-existing GET /forms/:id/grid route). A third
+      // open here would mean the bundle route went back to calling
+      // parseWorkbook a second time on top of formSpec's.
+      assert.equal(opens, 2,
+        'expected exactly two opens of the form file: formSpec\'s parseWorkbook and buildGrid\'s own read -- a redundant extra parseWorkbook call would make this 3');
+    } finally {
+      server.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

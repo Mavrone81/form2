@@ -112,10 +112,14 @@ const asyncRoute = (handler) => (req, res, next) => {
 // have been deleted, renamed, or corrupted since. Any route that reads it
 // off disk must treat that as an ordinary, expected failure: log the real
 // error server-side, and never let the underlying message (which can
-// contain absolute filesystem paths) reach the client.
+// contain absolute filesystem paths) reach the client. Shared by every route
+// that surfaces this failure to a caller, single- or multi-form alike, so
+// the wording never drifts between them.
+const UNREADABLE_FORM_MESSAGE = 'This form could not be read. Ask an admin to rescan.';
+
 function unreadableForm(res, formId, err) {
   console.error(`Could not read form ${formId} from disk:`, err);
-  res.status(500).json({ error: 'This form could not be read. Ask an admin to rescan.' });
+  res.status(500).json({ error: UNREADABLE_FORM_MESSAGE });
 }
 
 // The permission rules in workflow.js mark their errors with `code` so a
@@ -138,6 +142,17 @@ const statusFor = (err, fallback) =>
 // supplies, which the bundle route has no such thing to supply on any one
 // form's behalf, so they stay in that route alone.)
 //
+// Also returns `def`, the raw parseWorkbook() result -- an internal detail
+// callers that only want the /forms/:id/fields-shaped payload must strip
+// back out before responding (see its one destructuring use below), but
+// which GET /bundle needs so it can feed the SAME parse into buildGrid
+// instead of paying for a second one. Threading it through here is what
+// keeps parseWorkbook called exactly once per form per bundle request:
+// calling it again for buildGrid used to mean two full reads and XLSX
+// parses of the same file per form (and a window where the two could
+// observe different content if a rescan/write raced mid-request) in the one
+// endpoint whose entire point is a single bulk sync call.
+//
 // Throws (never catches) when the file cannot be parsed — parseWorkbook's
 // own rejection propagates straight out — so each caller decides for itself
 // what a parse failure means for ITS response: one form's fields route turns
@@ -145,7 +160,7 @@ const statusFor = (err, fallback) =>
 // `skipped` and keeps going for every other form.
 async function formSpec(db, form) {
   const fields = db.prepare('select * from form_fields where form_id=? order by sort_order').all(form.id);
-  let tasks = [], frequencies = [];
+  let tasks = [], frequencies = [], def = null;
   // Where each entered value belongs on the reproduced sheet, so the left
   // pane can show the record as it will look on paper instead of a blank
   // form. Derived from the parsed definition, never guessed: a field with
@@ -158,11 +173,11 @@ async function formSpec(db, form) {
   // paper. Absent for an interval the form does not offer.
   let cellFor = {}, titleCell = null, intervalCells = {}, calibrationCells = {};
   if (form.file_type === 'xlsx' && form.state === 'ready') {
-    const def = await parseWorkbook(form.file_path);
+    def = await parseWorkbook(form.file_path);
     tasks = def.tasks; frequencies = def.frequencies;
     ({ cellFor, titleCell, intervalCells, calibrationCells } = cellMapFor(def));
   }
-  return { form, fields, frequencies, tasks, cellFor, titleCell, intervalCells, calibrationCells };
+  return { form, fields, frequencies, tasks, cellFor, titleCell, intervalCells, calibrationCells, def };
 }
 
 export { tokenOrSession, actingUser };
@@ -244,10 +259,14 @@ export function makeRoutes(db) {
     } catch (err) {
       return unreadableForm(res, form.id, err);
     }
-    const { tasks } = spec;
+    // `def` is formSpec's internal handoff to the bundle route (see the
+    // comment on formSpec) — never part of this route's own response shape,
+    // which existing tests pin exactly as it was before that handoff existed.
+    const { def: _def, ...rest } = spec;
+    const { tasks } = rest;
     const selected = String(req.query.frequency ?? '');
     const response = {
-      ...spec,
+      ...rest,
       inScope: (selected ? tasksInScope(tasks, selected) : tasks).map((t) => t.row),
       summary: selected ? scopeSummary(tasks, selected) : null
     };
@@ -286,12 +305,19 @@ export function makeRoutes(db) {
     for (const form of readyForms) {
       try {
         const spec = await formSpec(db, form);
-        const def = await parseWorkbook(form.file_path);
+        // spec.def is the SAME parseWorkbook() result formSpec already
+        // computed above -- reused here rather than parsed a second time,
+        // so this form's file is read once, not twice, on its way into the
+        // bundle. (buildGrid does its own separate, structurally distinct
+        // read of the same path for its own ExcelJS.Workbook -- see the
+        // comment on formSpec -- which is pre-existing behaviour shared
+        // with GET /forms/:id/grid and unaffected by this.)
+        const { def, ...rest } = spec;
         const grid = await buildGrid(form.file_path, def);
-        forms.push({ ...spec, grid });
+        forms.push({ ...rest, grid });
       } catch (err) {
         console.error(`Bundle: form ${form.id} could not be read; skipping:`, err);
-        skipped.push({ id: form.id, error: 'This form could not be read.' });
+        skipped.push({ id: form.id, error: UNREADABLE_FORM_MESSAGE });
       }
     }
     res.json({ generated_at: new Date().toISOString(), forms, skipped });
