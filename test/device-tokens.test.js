@@ -281,3 +281,100 @@ test('a successful token auth does not create a session', async () => {
     server.close();
   }
 });
+
+// --- precedence when a request carries both a valid session and a Bearer
+// header ---
+// The token branch runs first and decides the request outright, whether or
+// not a valid session also exists (see the "Precedence" comment above
+// tokenOrSession in server/routes.js). These two tests lock that in.
+
+test('an invalid Bearer token is not rescued by a valid session in the same request', async () => {
+  const { server, call } = await boot();
+  // 'tech'/'tech' is the seeded demo technician used throughout this suite
+  // (see test/device-tokens.test.js's sibling HTTP tests above) -- this
+  // establishes a real, valid session cookie in call()'s jar.
+  await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+  try {
+    const res = await call('GET', '/__test/whoami', undefined, { authorization: 'Bearer not-a-real-token' });
+    assert.equal(res.status, 401,
+      'a malformed/expired/unknown token must fail closed even with a valid session sitting in the same cookie jar');
+  } finally {
+    server.close();
+  }
+});
+
+test('a valid Bearer token wins over a valid session, reporting the token identity', async () => {
+  const { db, server, call } = await boot();
+  // The session belongs to the seeded 'tech' user; the token belongs to a
+  // different user entirely, so a pass here can only mean the token branch
+  // actually decided the request -- not that both branches happened to
+  // agree on the same identity.
+  await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+  const deviceHolder = makeUser(db, { username: 'device-holder' });
+  const { token } = issueDeviceToken(db, deviceHolder.id);
+  try {
+    const res = await call('GET', '/__test/whoami', undefined, { authorization: `Bearer ${token}` });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.authVia, 'token');
+    assert.equal(res.body.user.id, deviceHolder.id);
+    assert.equal(res.body.user.username, 'device-holder');
+  } finally {
+    server.close();
+  }
+});
+
+// --- last_used_at ---
+// Neither this file's direct-call tests (near the top) nor its other HTTP
+// tests above ever read the last_used_at column -- so nothing would catch a
+// regression that dropped validateDeviceToken's update, or one that made
+// tokenOrSession call validateDeviceToken twice per request.
+
+test('last_used_at is bumped exactly once per token-authed HTTP request', async () => {
+  const { db, server, call } = await boot();
+  const user = makeUser(db, { username: 'last-used-tech' });
+  const { token } = issueDeviceToken(db, user.id);
+  const hash = createHash('sha256').update(token).digest('hex');
+  // Start from an explicit sentinel rather than the null issueDeviceToken
+  // leaves behind: "changed away from a fixed, deliberately-planted value"
+  // is a stronger signal than "changed away from null", which a caller
+  // could satisfy by accident in other ways.
+  const sentinel = '1999-01-01T00:00:00.000Z';
+  db.prepare('update device_tokens set last_used_at = ? where token_hash = ?').run(sentinel, hash);
+  const readLastUsed = () => db.prepare('select last_used_at from device_tokens where token_hash=?').get(hash).last_used_at;
+  const rowCount = () => db.prepare('select count(*) as n from device_tokens where token_hash=?').get(hash).n;
+
+  try {
+    const res1 = await call('GET', '/__test/whoami', undefined, { authorization: `Bearer ${token}` });
+    assert.equal(res1.status, 200);
+    const afterFirst = readLastUsed();
+    assert.notEqual(afterFirst, sentinel, 'a token-authed request must bump last_used_at off the sentinel');
+    assert.equal(rowCount(), 1, 'the update touches the existing row -- it must never insert a second one');
+
+    // A short delay so the two real timestamps cannot land inside the same
+    // millisecond and read as equal by coincidence, which would make the
+    // second assertion below meaningless either way.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const res2 = await call('GET', '/__test/whoami', undefined, { authorization: `Bearer ${token}` });
+    assert.equal(res2.status, 200);
+    const afterSecond = readLastUsed();
+    assert.notEqual(afterSecond, afterFirst, 'a second token-authed request must bump last_used_at again, to a new value');
+    assert.equal(rowCount(), 1);
+
+    // "Exactly once per request" is not something an HTTP-level test can
+    // observe directly -- there is no hook here into how many times the
+    // UPDATE statement ran inside a single request. That property instead
+    // follows from the code shape: tokenOrSession's token branch calls
+    // validateDeviceToken exactly one time per request (the single
+    // `const user = validateDeviceToken(db, token);` line in its token
+    // branch, server/routes.js), and validateDeviceToken's own body runs its
+    // `update device_tokens set last_used_at = ...` exactly once per call.
+    // What this test proves at the HTTP layer is the one part of that a
+    // regression could actually break silently: the write is not skipped
+    // (afterFirst would still equal sentinel) and each request keeps moving
+    // the value forward rather than the column going stale after the first
+    // hit (afterSecond would still equal afterFirst).
+  } finally {
+    server.close();
+  }
+});

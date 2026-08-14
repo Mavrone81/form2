@@ -27,10 +27,23 @@ const signedIn = requireRole(...ROLES);
 // session state on its behalf. `validateDeviceToken` itself stamps
 // `last_used_at` on every successful lookup, so this middleware does not
 // repeat that write.
+//
+// Precedence when a request carries BOTH a well-formed `Bearer` header and a
+// valid session cookie: the token is checked first and, if well-formed,
+// decides the request outright -- an INVALID token gets 401 even though a
+// valid session sits right there, rather than silently falling back to it.
+// This is deliberate, not an oversight: presenting a token is the client
+// asking to be judged as a device, and a fallback to the session would let a
+// revoked or expired device token keep working for as long as the browser
+// tab that issued it (or an admin's shared kiosk session) stays signed in --
+// exactly the hole `revokeUserTokens` exists to close. Failing closed here
+// keeps that guarantee regardless of what else is sitting in the cookie jar.
 function tokenOrSession(db) {
   return (req, res, next) => {
+    // toLowerCase(): RFC 7235 auth-scheme tokens are case-insensitive, and
+    // nothing in the HTTP spec requires a client to send exactly `Bearer`.
     const [scheme, token] = String(req.get('authorization') ?? '').split(' ');
-    if (scheme === 'Bearer' && token) {
+    if (scheme?.toLowerCase() === 'bearer' && token) {
       const user = validateDeviceToken(db, token);
       if (!user) return res.status(401).json({ error: 'Invalid or expired device token.' });
       req.deviceUser = user;
