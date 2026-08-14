@@ -190,7 +190,7 @@ test('no auth at all is refused with 401', async () => {
   }
 });
 
-test('a signature that fails PNG validation is refused per-record, with a generic message (assertValidSignature throws uncoded)', async () => {
+test('a signature that fails PNG validation is refused per-record, with the actionable message', async () => {
   const { db, server, call } = await boot();
   try {
     setupForm(db);
@@ -201,13 +201,15 @@ test('a signature that fails PNG validation is refused per-record, with a generi
     assert.equal(res.status, 200);
     const r = res.body.results[0];
     assert.ok(r.error);
-    // assertValidSignature (server/workflow.js) throws WITHOUT a `.code`, by
-    // design -- so this falls into the uncoded branch of the route's catch,
-    // which never relays the raw exception's own wording to a device. It
-    // must NOT read "please try again" as "your signature was fine" —
-    // that's covered by the code + submissionId/state assertions below.
-    assert.equal(r.error.code, 'ERROR');
-    assert.match(r.error.message, /try again/i);
+    // assertValidSignature (server/workflow.js) now marks its throws
+    // `code = 'INVALID'` -- part of the same user-facing vocabulary as a
+    // bad option value or an unready form, so the route's known-code filter
+    // passes its actual, actionable wording through rather than folding it
+    // into the generic "could not be synced" message: a malformed
+    // signature is something the device (or its user) can fix and should
+    // be told about specifically.
+    assert.equal(r.error.code, 'INVALID');
+    assert.match(r.error.message, /signature/i);
     // The submission was still created (create-or-find happens before
     // signing), so it must be visible for the app to retry with a real
     // signature on the next sync.

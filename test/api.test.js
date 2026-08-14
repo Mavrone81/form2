@@ -162,6 +162,33 @@ test('PATCH /api/submissions/:id returns 403 when the caller is not the current 
   server.close();
 });
 
+test('POST /api/submissions for a needs_setup form is a 400 with an actionable message, not an opaque 500', async () => {
+  const { db, server, call } = await boot();
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/needs-setup.xlsx','needs-setup.xlsx','xlsx','needs_setup')`).run();
+  const { id: formId } = db.prepare("select id from form_catalog where file_name='needs-setup.xlsx'").get();
+
+  await call('POST', '/api/login', { username: 'tech', password: 'tech' });
+  // createSubmission (server/workflow.js) throws an INVALID-coded error for
+  // a form that is not a ready, mapped xlsx -- this route must catch it and
+  // map it to 400 (statusFor), exactly like PATCH /submissions/:id, /sign
+  // and /reject already do for their own workflow.js errors, rather than
+  // letting it fall through to the generic error middleware's opaque 500.
+  const res = await call('POST', '/api/submissions', { formId, machineId: 'ED04', frequency: 'Y' });
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /not ready/i);
+
+  // And a normal create against a ready, mapped form is unaffected by this
+  // route now having a try/catch around it.
+  db.prepare(`insert into form_catalog (file_path,file_name,file_type,state)
+    values ('/f.xlsx','f.xlsx','xlsx','ready')`).run();
+  const { id: readyFormId } = db.prepare("select id from form_catalog where file_name='f.xlsx'").get();
+  const ok = await call('POST', '/api/submissions', { formId: readyFormId, machineId: 'ED04', frequency: 'Y' });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.state, 'draft');
+  server.close();
+});
+
 test('admin user-list responses never include password_hash', async () => {
   const { server, call } = await boot();
   await call('POST', '/api/login', { username: 'admin', password: 'admin' });

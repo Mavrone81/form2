@@ -276,35 +276,53 @@ const MAX_BASE64_CHARS = Math.ceil(MAX_SIGNATURE_BYTES / 3) * 4;
 // payload is checked against the strict base64 grammar first.
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
+// INVALID, like saveFields' constrained-option check and createSubmission's
+// form-readiness check: a bad signature is the caller's input being
+// unusable, not a permission failure, and every one of those three is the
+// same kind of thing from a caller's point of view. Marking it lets a route
+// map it to 400 (statusFor) without string-matching, and lets a caller like
+// POST /api/sync tell it apart from a genuinely internal failure -- see the
+// FORBIDDEN/NOT_FOUND/INVALID handling in that route's own catch.
+//
+// This does NOT change signAndAdvance's own behaviour: it already reads as
+// a 400 everywhere it is called (every existing caller's `statusFor(err,
+// 400)` fallback already lands there for an uncoded error) -- this only
+// gives that same outcome an explicit code instead of an implicit fallback.
+function invalidSignature(message) {
+  const err = new Error(message);
+  err.code = 'INVALID';
+  return err;
+}
+
 // Exported so that any FUTURE path which stores a signature can apply the
 // identical rule. It is not a substitute for calling signAndAdvance: that
 // function enforces this itself, for the same reason saveFields enforces
 // assertCanEdit rather than trusting its callers to remember.
 export function assertValidSignature(signaturePng) {
-  if (!signaturePng) throw new Error('A signature is required before submitting.');
+  if (!signaturePng) throw invalidSignature('A signature is required before submitting.');
   if (typeof signaturePng !== 'string') {
-    throw new Error('That signature is not a PNG image and cannot be accepted.');
+    throw invalidSignature('That signature is not a PNG image and cannot be accepted.');
   }
   if (!signaturePng.startsWith(PNG_DATA_URI_PREFIX)) {
-    throw new Error('That signature is not a PNG image and cannot be accepted.');
+    throw invalidSignature('That signature is not a PNG image and cannot be accepted.');
   }
 
   const payload = signaturePng.slice(PNG_DATA_URI_PREFIX.length);
   // Length first, before decoding, so an oversized payload is never expanded
   // into memory just to be thrown away.
   if (payload.length > MAX_BASE64_CHARS) {
-    throw new Error(`That signature is too large — a signature must be under ${MAX_SIGNATURE_BYTES / 1024} KB.`);
+    throw invalidSignature(`That signature is too large — a signature must be under ${MAX_SIGNATURE_BYTES / 1024} KB.`);
   }
   if (!BASE64_RE.test(payload) || payload.length % 4 !== 0) {
-    throw new Error('That signature is not a valid PNG image and cannot be accepted.');
+    throw invalidSignature('That signature is not a valid PNG image and cannot be accepted.');
   }
 
   const bytes = Buffer.from(payload, 'base64');
   if (bytes.length > MAX_SIGNATURE_BYTES) {
-    throw new Error(`That signature is too large — a signature must be under ${MAX_SIGNATURE_BYTES / 1024} KB.`);
+    throw invalidSignature(`That signature is too large — a signature must be under ${MAX_SIGNATURE_BYTES / 1024} KB.`);
   }
   if (bytes.length < PNG_MAGIC.length || !bytes.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
-    throw new Error('That signature is not a PNG image and cannot be accepted.');
+    throw invalidSignature('That signature is not a PNG image and cannot be accepted.');
   }
 }
 

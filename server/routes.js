@@ -521,7 +521,16 @@ export function makeRoutes(db) {
 
   r.post('/submissions', requireRole('technician'), (req, res) => {
     const { formId, machineId, frequency } = req.body ?? {};
-    res.json(createSubmission(db, { formId, userId: req.session.user.id, machineId, frequency }));
+    // createSubmission (server/workflow.js) throws an INVALID-coded error for
+    // a formId that is missing or not a ready, mapped xlsx -- without this
+    // try/catch that escaped straight to the generic error middleware as an
+    // opaque 500, exactly the failure POST /api/sync's own try/catch around
+    // the same call already guards against. statusFor's INVALID branch maps
+    // it to 400, matching every other route (PATCH /submissions/:id,
+    // /sign, /reject) that surfaces a workflow.js error this way.
+    try {
+      res.json(createSubmission(db, { formId, userId: req.session.user.id, machineId, frequency }));
+    } catch (err) { res.status(statusFor(err, 400)).json({ error: err.message }); }
   });
 
   r.get('/submissions', signedIn, (req, res) => res.json(queueFor(db, req.session.user)));
