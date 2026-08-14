@@ -17,6 +17,15 @@ jobs:
       - run: npm ci
       - name: Guard against committed form content
         run: npm run check:sensitive
+      - name: Build the Android app's PDF engine
+        # The bundle is a build artefact and is gitignored, so it has to be
+        # built here or test/pdf-engine-golden.test.js skips — and that test is
+        # the only thing holding the app's offline preview to being the same
+        # bytes as the archived record. Its own npm project: the server keeps
+        # five runtime dependencies and no devDependencies.
+        run: |
+          npm ci --prefix mobile/pdf-engine
+          node mobile/pdf-engine/build.mjs
       - name: Run tests
         # GitHub's default shell is `bash -e`, NOT `-o pipefail`: without the
         # two lines below, this step exits with `tee`'s status (always 0) and

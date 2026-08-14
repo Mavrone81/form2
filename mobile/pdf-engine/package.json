@@ -1,0 +1,19 @@
+{
+  "name": "pdf-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bundles server/pdf-record.js into a self-contained browser script so the Android app can render the archival record offline, byte-for-byte as the server does.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "build:dev": "node build.mjs --dev"
+  },
+  "devDependencies": {
+    "buffer": "^6.0.3",
+    "esbuild": "^0.25.0",
+    "pako": "^1.0.11"
+  }
+}

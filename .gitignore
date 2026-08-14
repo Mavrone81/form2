@@ -35,3 +35,9 @@ PM Document 2026/
 
 # Host-specific compose override; only the .example is committed
 compose.override.yaml
+
+# The Android app's PDF engine is BUILT from server/pdf-record.js and the
+# vendored fonts (mobile/pdf-engine/build.mjs). Committing the bundle would
+# commit a second, silently forkable copy of the renderer; CI and the app
+# build it, and test/pdf-engine-golden.test.js skips when it is absent.
+mobile/pdf-engine/dist/
