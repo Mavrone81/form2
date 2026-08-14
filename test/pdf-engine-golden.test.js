@@ -3,15 +3,29 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { runInThisContext } from 'node:vm';
+import { inflateSync, deflateSync } from 'node:zlib';
 import { renderRecordPdf } from '../server/pdf-record.js';
 
 // The offline preview the Android app draws must not be a lookalike of the
 // archived record — it must BE the record. The app renders with a browser
 // bundle of this very renderer (mobile/pdf-engine), so the only honest test is
-// to run both and compare the bytes: anything the bundle's shims get subtly
-// wrong (a different deflate, a different font subset, a wider Buffer
-// conversion) shows up here as a byte that moved, not as a preview somebody
-// has to eyeball.
+// to run both and compare what they produced: anything the bundle's shims get
+// subtly wrong (a different font subset, a wider Buffer conversion, a decode
+// that fires in a different order) shows up here as content that moved, not as
+// a preview somebody has to eyeball.
+//
+// WHAT "THE SAME" MEANS, precisely. When both renders run over the same
+// deflate implementation the files are byte-identical and that is asserted
+// directly — the strictest possible check, and the one that holds on any one
+// machine. Across environments it CANNOT hold: the server compresses its
+// streams with Node's bundled zlib, which changes output between Node patch
+// releases (v22.23.1 and v22.23.2 compress the same bytes differently), while
+// the bundle carries its own fixed pako. The bytes INSIDE the streams — every
+// drawing operator, every glyph, every tick — are what make the document the
+// record, and those must be identical everywhere. So: byte-equality as the
+// fast path, and when the containers differ, object-by-object equality of the
+// DECOMPRESSED content, with the comparator itself proven below by a
+// recompressed copy (must pass) and a tampered stream (must fail).
 //
 // The bundle is a build artefact and is gitignored, so a checkout without it
 // skips — the same discipline test/helpers/fixtures.js uses for the sensitive
@@ -92,6 +106,70 @@ function normalizeId(buffer) {
   return { bytes: Buffer.from(normalized, 'latin1'), seen };
 }
 
+// ---------------------------------------------------------------------------
+// Content comparison: the document, independent of its deflate container
+// ---------------------------------------------------------------------------
+// A PDF body is a sequence of `N 0 obj … endobj` objects; everything after the
+// body (xref table, trailer, startxref) is byte offsets and bookkeeping that
+// legitimately shift when a stream compresses to a different size. Each object
+// is either a dictionary alone or a dictionary plus a stream. The dictionary
+// is compared with its /Length normalised (it counts COMPRESSED bytes); a
+// /FlateDecode stream is compared by its inflated bytes; any other stream by
+// its raw bytes. Object numbers must match position for position — both sides
+// run the same code, so a reordered object is itself a difference worth
+// failing on.
+const OBJ_RE = /(\d+) 0 obj\b([\s\S]*?)endobj/g;
+
+function parseObjects(buffer) {
+  const text = buffer.toString('latin1');
+  const objects = [];
+  for (const m of text.matchAll(OBJ_RE)) {
+    const [, num, body] = m;
+    const streamAt = body.search(/stream\r?\n/);
+    if (streamAt === -1) {
+      objects.push({ num: Number(num), dict: body.trim(), stream: null });
+      continue;
+    }
+    const dict = body.slice(0, streamAt).trim();
+    const payloadStart = streamAt + /stream\r?\n/.exec(body.slice(streamAt))[0].length;
+    const endAt = body.lastIndexOf('endstream');
+    // The spec puts an EOL before `endstream`; strip exactly one if present.
+    let payload = body.slice(payloadStart, endAt).replace(/\r?\n$/, '');
+    objects.push({ num: Number(num), dict, stream: Buffer.from(payload, 'latin1') });
+  }
+  return objects;
+}
+
+const normalizeDict = (dict) => dict
+  .replace(/\/Length \d+/g, '/Length 0')
+  .replace(ID_RE, '/ID [<0> <0>]');
+
+// Streams whose dictionaries declare /FlateDecode are compared inflated;
+// everything else raw. Returns null when equal, else a one-line description.
+function compareObjects(a, b) {
+  if (a.length !== b.length) return `object counts differ: ${a.length} vs ${b.length}`;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i], y = b[i];
+    if (x.num !== y.num) return `object ${i} numbered ${x.num} vs ${y.num}`;
+    if (normalizeDict(x.dict) !== normalizeDict(y.dict)) return `object ${x.num}: dictionaries differ`;
+    if (!!x.stream !== !!y.stream) return `object ${x.num}: stream present on one side only`;
+    if (!x.stream) continue;
+    const flate = /\/FlateDecode/.test(x.dict);
+    let xs = x.stream, ys = y.stream;
+    if (flate) {
+      try { xs = inflateSync(x.stream); ys = inflateSync(y.stream); }
+      catch (err) { return `object ${x.num}: stream failed to inflate (${err.message})`; }
+    }
+    if (!xs.equals(ys)) {
+      let at = 0;
+      while (at < xs.length && xs[at] === ys[at]) at++;
+      return `object ${x.num}: ${flate ? 'inflated ' : ''}stream differs at byte ${at} ` +
+        `(lengths ${xs.length} vs ${ys.length})`;
+    }
+  }
+  return null;
+}
+
 // Run the IIFE bundle exactly as a WebView would: no CommonJS, no Node
 // builtins reachable from inside it (every one it needs was bundled as a
 // shim), just a `window` to hang the export off.
@@ -109,7 +187,7 @@ function loadBundle() {
   return win.renderRecordPdf;
 }
 
-test('the browser bundle renders the same bytes as the server renderer', { skip: existsSync(BUNDLE) ? false : SKIP }, async () => {
+test('the browser bundle renders the same document as the server renderer', { skip: existsSync(BUNDLE) ? false : SKIP }, async () => {
   const render = loadBundle();
 
   const fromServer = await renderRecordPdf(structuredClone(FIXTURE));
@@ -120,20 +198,54 @@ test('the browser bundle renders the same bytes as the server renderer', { skip:
   const bundleBytes = Buffer.from(fromBundle);
 
   assert.ok(fromServer.length > 20000, 'sanity: the server rendered a real document');
-  assert.equal(bundleBytes.length, fromServer.length,
-    `byte counts differ: server ${fromServer.length}, bundle ${bundleBytes.length}`);
 
   const server = normalizeId(fromServer);
   const bundle = normalizeId(bundleBytes);
   assert.equal(server.seen.length, 1, 'the server document must carry exactly one /ID trailer array');
   assert.equal(bundle.seen.length, 1, 'the bundle document must carry exactly one /ID trailer array');
 
-  if (!server.bytes.equals(bundle.bytes)) {
-    let at = 0;
-    while (at < server.bytes.length && server.bytes[at] === bundle.bytes[at]) at++;
-    const window = (b) => JSON.stringify(b.toString('latin1', Math.max(0, at - 60), at + 60));
-    assert.fail(`first difference at byte ${at}\n  server: ${window(server.bytes)}\n  bundle: ${window(bundle.bytes)}`);
-  }
+  // Fast path: same deflate implementation → the files are identical outright.
+  if (server.bytes.equals(bundle.bytes)) return;
+
+  // Containers differ (a zlib version gap between Node's and the bundle's
+  // pako). The DOCUMENT must still be identical: same objects, same
+  // dictionaries, same decompressed stream bytes.
+  const verdict = compareObjects(parseObjects(server.bytes), parseObjects(bundle.bytes));
+  assert.equal(verdict, null, `documents differ beyond their deflate containers — ${verdict}`);
+});
+
+// The content comparator is itself load-bearing now, so it is proven both
+// ways against the real render: a copy whose streams are RECOMPRESSED (what a
+// zlib version gap actually does) must compare equal, and a copy with one
+// byte of CONTENT changed inside a stream must not.
+test('the content comparator tolerates recompression and catches tampering', { skip: existsSync(BUNDLE) ? false : SKIP }, async () => {
+  const fromServer = await renderRecordPdf(structuredClone(FIXTURE));
+  const original = parseObjects(normalizeId(fromServer).bytes);
+
+  const rebuild = (mutate) => original.map((o) => {
+    if (!o.stream || !/\/FlateDecode/.test(o.dict)) return o;
+    let inflated = inflateSync(o.stream);
+    if (mutate) inflated = mutate(inflated);
+    // level 1 vs PDFKit's default: guaranteed different container bytes.
+    return { ...o, stream: deflateSync(inflated, { level: 1 }) };
+  });
+
+  const recompressed = rebuild(null);
+  assert.equal(compareObjects(original, recompressed), null,
+    'recompressed streams carry the same content and must compare equal');
+
+  let mutated = false;
+  const tampered = rebuild((inflated) => {
+    if (mutated || inflated.length < 10) return inflated;
+    const copy = Buffer.from(inflated);
+    copy[5] ^= 0xff;
+    mutated = true;
+    return copy;
+  });
+  assert.ok(mutated, 'sanity: the tamper actually landed on a stream');
+  const verdict = compareObjects(original, tampered);
+  assert.match(String(verdict), /stream differs/,
+    'a changed byte inside a stream must be reported, not absorbed');
 });
 
 test('the bundle is deterministic across calls', { skip: existsSync(BUNDLE) ? false : SKIP }, async () => {
