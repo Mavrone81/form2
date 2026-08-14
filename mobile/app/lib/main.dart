@@ -182,11 +182,53 @@ class AppShellState extends State<AppShell> {
 
     _user = storedUser;
     final role = (storedUser['role'] ?? '').toString();
-    if (role == 'technician' && await widget.pin.hasPin()) {
-      setState(() => _stage = _Stage.pinGate);
-    } else {
+    if (role != 'technician') {
       setState(() => _stage = _Stage.home);
+      return;
     }
+    // Every technician cold start with a session goes through EITHER
+    // pinSetup or pinGate -- never straight to home -- see `_needsPinSetup`'s
+    // doc for the two failure modes this closes: an interrupted first-time
+    // setup (session saved, PIN never actually set) and a stale PIN left
+    // behind by a PREVIOUS technician on a shared device.
+    final username = (storedUser['username'] ?? '').toString();
+    if (await _needsPinSetup(username)) {
+      setState(() => _stage = _Stage.pinSetup);
+    } else {
+      setState(() => _stage = _Stage.pinGate);
+    }
+  }
+
+  /// True if [username] must go through [PinSetupScreen] before anything
+  /// else -- shared by both [_bootstrap] and [_onLoginSuccess] so this
+  /// decision is made exactly the same way regardless of which one asks.
+  /// Two independent conditions force it:
+  ///  - **no PIN exists on this device at all.** This is deliberately
+  ///    checked on EVERY technician session, not only right after a fresh
+  ///    login: a session that got persisted ([SessionStore.save]) but was
+  ///    then interrupted before [PinLock.setPin] ever ran (app killed
+  ///    between the two) used to fall through `_bootstrap` straight to
+  ///    [TechnicianHomeScreen] on the next cold start -- a tokened session
+  ///    and every local record behind no gate at all, and the technician
+  ///    was never asked again. Gating on `hasPin()` itself, not merely on
+  ///    "did a login just succeed", closes that regardless of where the
+  ///    interruption happened.
+  ///  - **a PIN exists but for a KNOWN different owner** (see
+  ///    [PinLock.owner]) -- a previous technician's PIN left on a shared
+  ///    device. Checked at `_bootstrap` too, not only at login: tech A signs
+  ///    out, tech B logs in (their session is saved immediately, before
+  ///    [PinSetupScreen] even opens) and the app is killed before B
+  ///    completes setup -- the NEXT cold start must still recognise B's
+  ///    session doesn't own the PIN sitting on this device, or B lands on
+  ///    [PinGateScreen] with no way to ever satisfy it (A's PIN, which B
+  ///    does not know) short of the "sign in with password instead" escape
+  ///    hatch. An unattributed PIN (owner `null` -- set before this
+  ///    bookkeeping existed) is treated as this technician's own; only a
+  ///    KNOWN different owner forces a reset.
+  Future<bool> _needsPinSetup(String username) async {
+    if (!(await widget.pin.hasPin())) return true;
+    final owner = await widget.pin.owner();
+    return owner != null && owner != username;
   }
 
   Future<void> _onLoginSuccess(LoginResult result) async {
@@ -198,19 +240,9 @@ class AppShellState extends State<AppShell> {
     _user = result.user;
     final role = (result.user['role'] ?? '').toString();
     final username = (result.user['username'] ?? '').toString();
-    if (role == 'technician') {
-      final hasPin = await widget.pin.hasPin();
-      final pinOwner = await widget.pin.owner();
-      // A PIN already exists but was never attributed to anyone (an old
-      // build, or a device paired before this bookkeeping existed) is
-      // treated as this technician's own -- only a KNOWN different owner
-      // forces a reset. See PinLock.owner's doc for why an unattributed PIN
-      // must not, by itself, force a reset every single login.
-      final staleOwner = pinOwner != null && pinOwner != username;
-      if (!hasPin || staleOwner) {
-        setState(() => _stage = _Stage.pinSetup);
-        return;
-      }
+    if (role == 'technician' && await _needsPinSetup(username)) {
+      setState(() => _stage = _Stage.pinSetup);
+      return;
     }
     await _finishSignIn();
   }
@@ -236,24 +268,43 @@ class AppShellState extends State<AppShell> {
   Future<void> _signOut() async {
     if (widget.connectivity.isOnline) {
       try {
-        await widget.api.logout();
+        await widget.api.logout(); // clears the cookie jar itself on success
       } catch (_) {
         // Best-effort server sign-out only -- see the brief: local sign-out
-        // must succeed regardless of whether the server round trip does.
+        // must succeed regardless of whether the server round trip does
+        // (offline, a timeout, a 500, ...). The cookie jar still needs
+        // forgetting locally even though the network call never confirmed
+        // it server-side -- a later sign-in must not replay a stale cookie.
+        widget.api.clearCookies();
       }
+    } else {
+      widget.api.clearCookies();
     }
     await widget.session.clear();
     widget.api.setDeviceToken(null);
     // PIN and local records deliberately survive a sign-out (see the
     // brief): only the session itself is cleared here. A different
-    // technician signing in next lands back on the PIN gate under their OWN
-    // session only if they, too, have already set a PIN on this device --
-    // otherwise a fresh online login (and first-time PIN setup) runs again,
-    // same as this device's very first sign-in.
+    // technician signing in next is forced through PinSetupScreen instead
+    // of silently reusing this PIN -- see `_needsPinSetup`.
     _user = null;
     _bundleNotice = null;
+    _loginNotice = null;
     if (!mounted) return;
     setState(() => _stage = _Stage.login);
+  }
+
+  /// The PIN gate's escape hatch: abandons the PIN attempt entirely and
+  /// goes straight to a full online login instead. This is what keeps a
+  /// device from being a dead end when the PIN sitting on it isn't (or is
+  /// no longer) this technician's own -- see `_needsPinSetup`'s doc for how
+  /// that can happen even after this build's own fixes (an interruption
+  /// mid-setup) -- and it is also simply the right way out of a lockout
+  /// countdown a technician doesn't want to wait through.
+  void _usePasswordInstead() {
+    setState(() {
+      _stage = _Stage.login;
+      _loginNotice = null;
+    });
   }
 
   @override
@@ -275,7 +326,12 @@ class AppShellState extends State<AppShell> {
           onDone: _finishSignIn,
         );
       case _Stage.pinGate:
-        return PinGateScreen(pin: widget.pin, onUnlocked: () => setState(() => _stage = _Stage.home));
+        return PinGateScreen(
+          pin: widget.pin,
+          connectivity: widget.connectivity,
+          onUnlocked: () => setState(() => _stage = _Stage.home),
+          onUsePassword: _usePasswordInstead,
+        );
       case _Stage.home:
         return _buildHome();
     }

@@ -87,6 +87,7 @@ class SyncBannerState extends State<SyncBanner> {
 
   Future<void> _replay() async {
     if (_syncing) return;
+    if (!mounted) return;
     setState(() => _syncing = true);
     try {
       final allowed = (await widget.db.getQueuedRecordsOwnedBy(widget.username)).map((r) => r.clientUuid).toSet();

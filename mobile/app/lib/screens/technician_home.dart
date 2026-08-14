@@ -188,7 +188,7 @@ class TechnicianHomeScreenState extends State<TechnicianHomeScreen> {
                     child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.paper),
                   )
                 : const Icon(Icons.refresh),
-            tooltip: 'Refresh forms',
+            tooltip: _online ? 'Refresh forms' : 'Refresh forms (needs a connection)',
             onPressed: _online && !_refreshingBundle ? _refreshBundle : null,
           ),
           if (widget.onSignOut != null)
@@ -217,7 +217,7 @@ class TechnicianHomeScreenState extends State<TechnicianHomeScreen> {
               _Notice(text: _bundleNotice!, onDismiss: () => setState(() => _bundleNotice = null)),
             if (_foreignCount > 0)
               _Notice(
-                text: '$_foreignCount record(s) on this device belong to another technician and are read-only '
+                text: '$_foreignCount record(s) on this device belong to another technician and are hidden '
                     'until they sign in.',
               ),
             Padding(

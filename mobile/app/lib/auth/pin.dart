@@ -34,6 +34,33 @@ class PinVerifyResult {
   bool get isOk => status == PinVerifyStatus.ok;
 }
 
+/// The salt, hash, and owning username, as one unit. Kept together
+/// deliberately (see [PinLock._writeCredential]): a process kill between two
+/// separate writes used to be able to leave a NEW salt paired with the OLD
+/// hash (or vice versa) -- a gate no PIN, old or new, could ever open again.
+/// A single storage write cannot be interleaved with itself.
+class _PinCredential {
+  const _PinCredential({required this.salt, required this.hash, this.owner});
+
+  final String salt;
+  final String hash;
+
+  /// See [PinLock.owner]'s doc.
+  final String? owner;
+
+  Map<String, dynamic> toJson() => {
+        'salt': salt,
+        'hash': hash,
+        'owner': owner,
+      };
+
+  static _PinCredential fromJson(Map<String, dynamic> json) => _PinCredential(
+        salt: json['salt'] as String,
+        hash: json['hash'] as String,
+        owner: json['owner'] as String?,
+      );
+}
+
 /// The failure counter, lockout stage, and lockout-until timestamp, as one
 /// unit. Kept together deliberately (see [PinLock._writeAttemptState]):
 /// these three values must change atomically, as a single storage write,
@@ -98,19 +125,12 @@ class PinLock {
   final SecureStorage _storage;
   final DateTime Function() _now;
 
-  static const _hashKey = 'pin_hash';
-  static const _saltKey = 'pin_salt';
-
-  /// Which signed-in username this device's current PIN belongs to --
-  /// bookkeeping only, no bearing on [verify] itself (the hash/salt above
-  /// are the entire gate). Exists so the app shell can tell "the PIN
-  /// already set on this device is still this technician's own" apart from
-  /// "a PREVIOUS technician's PIN is still sitting here, and this newly
-  /// logged-in technician has never set one of their own" -- the latter
-  /// must force a fresh [setPin], never silently reuse the old hash a
-  /// different person's password can't possibly reproduce. See
-  /// `main.dart`'s `AppShellState._onLoginSuccess`.
-  static const _ownerKey = 'pin_owner_username';
+  /// Single key for the whole credential unit -- salt, hash, and owner
+  /// together, see [_PinCredential]. Deliberately new (nothing has shipped
+  /// yet), so there is no legacy split-key (`pin_salt`/`pin_hash`/
+  /// `pin_owner_username`) state to migrate; any such keys an earlier build
+  /// wrote are simply never read again.
+  static const _credentialKey = 'pin_credential';
 
   /// Single key for the whole attempt/lockout unit -- see [_AttemptState].
   /// Deliberately new (nothing has shipped yet), so there is no legacy
@@ -167,29 +187,35 @@ class PinLock {
   /// `.isOk` before ever calling this. See the class doc for why.
   ///
   /// [owner], when given, is stamped as this PIN's owning username -- see
-  /// [_ownerKey] -- purely so a later caller can tell whose PIN this is;
-  /// omitted, any previously stored owner is left untouched (existing
-  /// callers that never pass it see no behaviour change at all).
+  /// [owner]'s doc -- purely so a later caller can tell whose PIN this is;
+  /// omitted, any previously stored owner is carried forward unchanged (a
+  /// caller that never passes it sees no behaviour change at all). Written
+  /// together with the salt and hash in ONE storage write -- see
+  /// [_PinCredential]'s doc for why that matters.
   Future<void> setPin(String pin, {String? owner}) async {
     if (!_pinShape.hasMatch(pin)) {
       throw ArgumentError('PIN must be 4 to 6 digits.');
     }
+    final existing = await _readCredential();
     final salt = generateSalt();
     final hash = hashPin(pin, salt);
-    await _storage.write(_saltKey, salt);
-    await _storage.write(_hashKey, hash);
-    if (owner != null) {
-      await _storage.write(_ownerKey, owner);
-    }
+    await _writeCredential(_PinCredential(salt: salt, hash: hash, owner: owner ?? existing?.owner));
     await _resetAttempts();
   }
 
   /// The username [setPin] was last called with an explicit `owner` for, or
   /// `null` if none was ever recorded (never set, or set by an older/other
-  /// caller that didn't pass one).
-  Future<String?> owner() => _storage.read(_ownerKey);
+  /// caller that didn't pass one). Bookkeeping only -- no bearing on
+  /// [verify] itself (the salt/hash are the entire gate). Exists so the app
+  /// shell can tell "the PIN already set on this device is still this
+  /// technician's own" apart from "a PREVIOUS technician's PIN is still
+  /// sitting here, and this newly signed-in technician has never set one of
+  /// their own" -- the latter must force a fresh [setPin], never silently
+  /// gate the new technician behind a PIN only the OLD technician knows.
+  /// See `main.dart`'s `AppShellState._needsPinSetup`.
+  Future<String?> owner() async => (await _readCredential())?.owner;
 
-  Future<bool> hasPin() async => (await _storage.read(_hashKey)) != null;
+  Future<bool> hasPin() async => (await _readCredential()) != null;
 
   /// Gates app open. Returns a [PinVerifyResult] so the caller can
   /// distinguish "wrong, N attempts left" from "locked until <time>" -- see
@@ -203,9 +229,8 @@ class PinLock {
   /// locked-out attempt cannot be timed to learn whether the guess was
   /// close.
   Future<PinVerifyResult> verify(String pin) async {
-    final salt = await _storage.read(_saltKey);
-    final hash = await _storage.read(_hashKey);
-    if (salt == null || hash == null) return PinVerifyResult.wrongPin(_attemptsBeforeLock);
+    final credential = await _readCredential();
+    if (credential == null) return PinVerifyResult.wrongPin(_attemptsBeforeLock);
 
     final now = _now();
     final state = await _readAttemptState(now);
@@ -213,7 +238,7 @@ class PinLock {
       return PinVerifyResult.lockedOut(state.lockedUntil!);
     }
 
-    if (_hashesMatch(hashPin(pin, salt), hash)) {
+    if (_hashesMatch(hashPin(pin, credential.salt), credential.hash)) {
       await _resetAttempts();
       return PinVerifyResult.ok();
     }
@@ -244,13 +269,38 @@ class PinLock {
   Future<bool> verifyBool(String pin) async => (await verify(pin)).isOk;
 
   Future<void> clear() async {
-    await _storage.delete(_saltKey);
-    await _storage.delete(_hashKey);
+    await _storage.delete(_credentialKey);
     await _resetAttempts();
   }
 
   Future<void> _resetAttempts() async {
     await _storage.delete(_attemptStateKey);
+  }
+
+  /// Reads the whole salt/hash/owner unit as one value, or `null` if no PIN
+  /// has ever been set (or it was [clear]ed). A blob that exists but fails
+  /// to decode is treated the same as absent -- `null` -- rather than
+  /// thrown: with everything now written in a single [_storage] call (see
+  /// [_writeCredential]), a torn write across the three fields can no longer
+  /// happen, so a corrupt blob here would mean the underlying storage
+  /// itself was tampered with or damaged outside this class entirely; a
+  /// technician in that situation has no salt/hash to recover ANYWAY, and
+  /// the app shell's own "sign in with password instead" escape hatch
+  /// (`PinGateScreen`) is the correct recovery path, not a synthetic
+  /// fail-closed lockout the way [_readAttemptState] uses for its own,
+  /// narrower blob.
+  Future<_PinCredential?> _readCredential() async {
+    final raw = await _storage.read(_credentialKey);
+    if (raw == null) return null;
+    try {
+      return _PinCredential.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _writeCredential(_PinCredential credential) async {
+    await _storage.write(_credentialKey, jsonEncode(credential.toJson()));
   }
 
   /// Reads the whole attempt/lockout unit as one value. Absent (never set,

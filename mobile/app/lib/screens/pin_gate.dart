@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../auth/pin.dart';
+import '../services/connectivity_source.dart';
 import '../widgets/app_colors.dart';
 
 /// Offline-capable device unlock: the technician's cold-start gate whenever
@@ -18,11 +21,27 @@ import '../widgets/app_colors.dart';
 /// `lockedUntil`) -- avoids a `Timer.periodic` this screen would otherwise
 /// have to cancel precisely on every dispose path, for a cosmetic tick most
 /// technicians won't be staring at anyway.
+///
+/// [onUsePassword] is the escape hatch: a PIN that can never be satisfied on
+/// this device -- a lockout the technician doesn't want to wait through, or
+/// (the case the app shell's own bootstrap can still land here for, despite
+/// its own best-effort checks -- see `AppShellState._needsPinSetup`'s doc) a
+/// PIN that plain isn't this technician's own -- must never be a true dead
+/// end. It requires a connection (a full online login), so it is disabled,
+/// with a plain caption saying why, whenever this device is offline.
 class PinGateScreen extends StatefulWidget {
-  const PinGateScreen({super.key, required this.pin, required this.onUnlocked});
+  const PinGateScreen({
+    super.key,
+    required this.pin,
+    required this.connectivity,
+    required this.onUnlocked,
+    required this.onUsePassword,
+  });
 
   final PinLock pin;
+  final ConnectivitySource connectivity;
   final VoidCallback onUnlocked;
+  final VoidCallback onUsePassword;
 
   @override
   State<PinGateScreen> createState() => _PinGateScreenState();
@@ -32,9 +51,22 @@ class _PinGateScreenState extends State<PinGateScreen> {
   final _ctrl = TextEditingController();
   String? _message;
   bool _submitting = false;
+  late bool _online;
+  StreamSubscription<bool>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _online = widget.connectivity.isOnline;
+    _sub = widget.connectivity.onChange.listen((online) {
+      if (!mounted) return;
+      setState(() => _online = online);
+    });
+  }
 
   @override
   void dispose() {
+    unawaited(_sub?.cancel());
     _ctrl.dispose();
     super.dispose();
   }
@@ -111,6 +143,20 @@ class _PinGateScreenState extends State<PinGateScreen> {
                     onPressed: _submitting ? null : _submit,
                     child: const Text('Unlock'),
                   ),
+                  const SizedBox(height: 12),
+                  TextButton(
+                    onPressed: _online ? widget.onUsePassword : null,
+                    child: const Text('Sign in with password instead'),
+                  ),
+                  if (!_online)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 4),
+                      child: Text(
+                        'Needs a connection.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: AppColors.mute, fontSize: 11.5),
+                      ),
+                    ),
                 ],
               ),
             ),

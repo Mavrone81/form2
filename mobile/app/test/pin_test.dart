@@ -72,17 +72,18 @@ void main() {
       final storage = InMemorySecureStorage();
       final lock = PinLock(storage);
 
+      // Salt/hash/owner are written as one JSON blob under a single key
+      // (see PinLock's `_PinCredential`) -- read it back the same way
+      // rather than assuming split keys still exist.
       await lock.setPin('123456');
-      final saltA = await storage.read('pin_salt');
-      final hashA = await storage.read('pin_hash');
+      final blobA = jsonDecode((await storage.read('pin_credential'))!) as Map<String, dynamic>;
 
       await lock.setPin('123456');
-      final saltB = await storage.read('pin_salt');
-      final hashB = await storage.read('pin_hash');
+      final blobB = jsonDecode((await storage.read('pin_credential'))!) as Map<String, dynamic>;
 
-      expect(saltA, isNotNull);
-      expect(saltA, isNot(equals(saltB)));
-      expect(hashA, isNot(equals(hashB)));
+      expect(blobA['salt'], isNotNull);
+      expect(blobA['salt'], isNot(equals(blobB['salt'])));
+      expect(blobA['hash'], isNot(equals(blobB['hash'])));
       // Both remain valid for the same PIN against their own generation.
       expect(await lock.verifyBool('123456'), isTrue);
     });
@@ -92,6 +93,38 @@ void main() {
       await pin.clear();
       expect(await pin.hasPin(), isFalse);
       expect(await pin.verifyBool('1234'), isFalse);
+    });
+  });
+
+  group('PinLock owner', () {
+    test('no owner recorded until setPin is called with one', () async {
+      final lock = PinLock(InMemorySecureStorage());
+      await lock.setPin('1234');
+      expect(await lock.owner(), isNull);
+    });
+
+    test('setPin with an owner records it', () async {
+      final lock = PinLock(InMemorySecureStorage());
+      await lock.setPin('1234', owner: 'tech1');
+      expect(await lock.owner(), 'tech1');
+      expect(await lock.verifyBool('1234'), isTrue);
+    });
+
+    test('a later setPin with no owner argument carries the previous owner forward', () async {
+      final lock = PinLock(InMemorySecureStorage());
+      await lock.setPin('1234', owner: 'tech1');
+      await lock.setPin('5678'); // no `owner:` -- must not erase the existing one
+      expect(await lock.owner(), 'tech1');
+      expect(await lock.verifyBool('5678'), isTrue);
+    });
+
+    test('setPin with a new owner overwrites the previous one', () async {
+      final lock = PinLock(InMemorySecureStorage());
+      await lock.setPin('1234', owner: 'tech1');
+      await lock.setPin('9999', owner: 'tech2');
+      expect(await lock.owner(), 'tech2');
+      expect(await lock.verifyBool('9999'), isTrue);
+      expect(await lock.verifyBool('1234'), isFalse);
     });
   });
 

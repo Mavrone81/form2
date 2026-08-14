@@ -276,14 +276,20 @@ class LocalDb {
   Future<List<LocalRecord>> getQueuedRecordsOwnedBy(String username) =>
       getRecordsByStatusOwnedBy(RecordStatus.queued, username);
 
-  /// Every record on this device (any status) NOT owned by [username] --
-  /// i.e. left behind by a previously signed-in technician. Used to show a
-  /// "N records belong to another technician" notice; never used to decide
-  /// what to sync (see [getQueuedRecordsOwnedBy] for that).
+  /// Every NOT-YET-SYNCED record on this device (draft/queued/error) that is
+  /// NOT owned by [username] -- i.e. left behind by a previously signed-in
+  /// technician and still needing attention. Used to show a "N records
+  /// belong to another technician" notice; never used to decide what to
+  /// sync (see [getQueuedRecordsOwnedBy] for that). `synced` records are
+  /// deliberately excluded: a synced record is already safely on the
+  /// server and needs nothing further from anyone, so it has no business
+  /// prompting a "belongs to someone else" notice on a device that is,
+  /// otherwise, doing nothing wrong.
   Future<int> countRecordsOwnedByOthers(String username) async {
     final all = await getAllRecords();
     var count = 0;
     for (final r in all) {
+      if (r.status == RecordStatus.synced) continue;
       final owner = await getRecordOwner(r.clientUuid);
       if (owner != null && owner != username) count++;
     }

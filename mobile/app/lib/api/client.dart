@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -115,7 +116,39 @@ class ApiClient {
   /// [SessionStore] on a cold start). Passing `null` forgets it.
   void setDeviceToken(String? token) => _deviceToken = token;
 
+  /// Forgets every cookie this client is holding -- what [logout] itself
+  /// does on a successful server round trip, and what a caller reaches for
+  /// directly when it needs the SAME local effect with no network call at
+  /// all (signing out while offline, when [logout] is never even invoked;
+  /// or a [logout] call that itself failed/timed out -- see `main.dart`'s
+  /// `AppShellState._signOut`, which never leaves a stale cookie behind
+  /// regardless of which of those paths it took).
+  void clearCookies() => _cookies.clear();
+
   Uri _uri(String path) => Uri.parse('$baseUrl$path');
+
+  /// Every request this client makes -- online, offline, or somewhere in
+  /// between (a captive portal that accepts the TCP connection but never
+  /// answers) -- goes through here. Without a bound, `connectivity_plus`
+  /// reporting "online" is not a promise the server will ever actually
+  /// respond, and a hung `await` on, say, the login-flow bundle refresh or
+  /// `logout()` would otherwise wedge the app shell indefinitely instead of
+  /// surfacing a plain, recoverable error.
+  static const _requestTimeout = Duration(seconds: 15);
+
+  Future<http.Response> _send(Future<http.Response> Function() request) async {
+    try {
+      return await request().timeout(_requestTimeout);
+    } on TimeoutException {
+      throw ApiException(0, 'The request timed out. Check your connection and try again.');
+    }
+  }
+
+  Future<http.Response> _get(Uri uri, {required Map<String, String> headers}) =>
+      _send(() => _client.get(uri, headers: headers));
+
+  Future<http.Response> _post(Uri uri, {required Map<String, String> headers, Object? body}) =>
+      _send(() => _client.post(uri, headers: headers, body: body));
 
   Map<String, String> _headers({bool withBody = false}) {
     final headers = <String, String>{};
@@ -173,7 +206,7 @@ class ApiClient {
   }
 
   Future<LoginResult> login(String username, String password, {bool wantDeviceToken = false}) async {
-    final response = await _client.post(
+    final response = await _post(
       _uri('/login'),
       headers: _headers(withBody: true),
       body: jsonEncode({
@@ -191,26 +224,28 @@ class ApiClient {
   }
 
   /// Best-effort server-side sign-out: destroys the session this client's
-  /// cookie jar is holding. Deliberately does NOT touch [_deviceToken] --
-  /// that is a separate credential the device keeps for its own later
-  /// syncing, and this call has no opinion on it; a caller that wants the
-  /// token forgotten too (a full local sign-out) clears [SessionStore] and
-  /// calls [setDeviceToken] `null` itself, same as sign-in never assumes a
-  /// server round trip either.
+  /// cookie jar is holding, then forgets those cookies locally too (see
+  /// [clearCookies]). Deliberately does NOT touch [_deviceToken] -- that is
+  /// a separate credential the device keeps for its own later syncing, and
+  /// this call has no opinion on it; a caller that wants the token
+  /// forgotten too (a full local sign-out) clears [SessionStore] and calls
+  /// [setDeviceToken] `null` itself, same as sign-in never assumes a server
+  /// round trip either.
   Future<void> logout() async {
-    final response = await _client.post(_uri('/logout'), headers: _headers());
+    final response = await _post(_uri('/logout'), headers: _headers());
     _captureCookies(response);
     _decodeOrThrow(response);
+    clearCookies();
   }
 
   Future<Map<String, dynamic>> bundle() async {
-    final response = await _client.get(_uri('/bundle'), headers: _headers());
+    final response = await _get(_uri('/bundle'), headers: _headers());
     _captureCookies(response);
     return Map<String, dynamic>.from(_decodeOrThrow(response) as Map);
   }
 
   Future<List<SyncResult>> sync(List<SyncRecord> records) async {
-    final response = await _client.post(
+    final response = await _post(
       _uri('/sync'),
       headers: _headers(withBody: true),
       body: jsonEncode({'records': records.map((r) => r.toJson()).toList()}),
@@ -230,19 +265,19 @@ class ApiClient {
   }
 
   Future<List<dynamic>> queue() async {
-    final response = await _client.get(_uri('/submissions'), headers: _headers());
+    final response = await _get(_uri('/submissions'), headers: _headers());
     _captureCookies(response);
     return _decodeOrThrow(response) as List;
   }
 
   Future<Map<String, dynamic>> submission(int id) async {
-    final response = await _client.get(_uri('/submissions/$id'), headers: _headers());
+    final response = await _get(_uri('/submissions/$id'), headers: _headers());
     _captureCookies(response);
     return Map<String, dynamic>.from(_decodeOrThrow(response) as Map);
   }
 
   Future<Map<String, dynamic>> sign(int id, String signaturePng) async {
-    final response = await _client.post(
+    final response = await _post(
       _uri('/submissions/$id/sign'),
       headers: _headers(withBody: true),
       body: jsonEncode({'signaturePng': signaturePng}),
@@ -252,7 +287,7 @@ class ApiClient {
   }
 
   Future<Map<String, dynamic>> reject(int id, String reason) async {
-    final response = await _client.post(
+    final response = await _post(
       _uri('/submissions/$id/reject'),
       headers: _headers(withBody: true),
       body: jsonEncode({'reason': reason}),
@@ -264,7 +299,7 @@ class ApiClient {
   /// Raw PDF bytes. Handled separately from [_decodeOrThrow] because a
   /// successful response here is never JSON -- only a failure is.
   Future<Uint8List> pdf(int id) async {
-    final response = await _client.get(_uri('/submissions/$id/pdf'), headers: _headers());
+    final response = await _get(_uri('/submissions/$id/pdf'), headers: _headers());
     _captureCookies(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw ApiException(response.statusCode, _extractErrorMessage(response.body));

@@ -12,6 +12,7 @@ import 'package:pmrecords/main.dart';
 import 'package:pmrecords/screens/admin_notice.dart';
 import 'package:pmrecords/screens/login.dart';
 import 'package:pmrecords/screens/pin_gate.dart';
+import 'package:pmrecords/screens/pin_setup.dart';
 import 'package:pmrecords/screens/review_queue.dart';
 import 'package:pmrecords/screens/technician_home.dart';
 import 'package:pmrecords/services/connectivity_source.dart';
@@ -34,6 +35,15 @@ class _FakeApi extends ApiClient {
   int loginCalls = 0;
 
   int logoutCalls = 0;
+  Object? logoutError;
+
+  Object? bundleError;
+  Map<String, dynamic> bundleResult = const {'forms': <dynamic>[], 'skipped': <dynamic>[]};
+
+  /// Every `sync` call's client_uuids, in call order -- what test (a) below
+  /// (the cross-owner replay filter) asserts against.
+  final List<List<String>> syncBatches = [];
+  Map<String, SyncResult> syncResultsFor = const {};
 
   @override
   Future<List<dynamic>> queue() async => queueRows;
@@ -49,6 +59,23 @@ class _FakeApi extends ApiClient {
   @override
   Future<void> logout() async {
     logoutCalls++;
+    final err = logoutError;
+    if (err != null) throw err;
+  }
+
+  @override
+  Future<Map<String, dynamic>> bundle() async {
+    final err = bundleError;
+    if (err != null) throw err;
+    return bundleResult;
+  }
+
+  @override
+  Future<List<SyncResult>> sync(List<SyncRecord> records) async {
+    syncBatches.add(records.map((r) => r.clientUuid).toList());
+    return records
+        .map((r) => syncResultsFor[r.clientUuid] ?? SyncResult(clientUuid: r.clientUuid, submissionId: 1, state: 'pending_lead'))
+        .toList();
   }
 }
 
@@ -91,11 +118,11 @@ class _CountingSyncQueue extends SyncQueue {
 Map<String, dynamic> _user({required String role, String username = 'tech1', String fullName = 'Tech One'}) =>
     {'id': 1, 'username': username, 'full_name': fullName, 'role': role, 'active': 1};
 
-LocalRecord _record(String uuid, RecordStatus status, {String? error}) => LocalRecord(
+LocalRecord _record(String uuid, RecordStatus status, {String machineId = 'GEN-1', String? error}) => LocalRecord(
       clientUuid: uuid,
       formId: 7,
       frequency: 'Y',
-      machineId: 'GEN-1',
+      machineId: machineId,
       values: const {'field_a': 'Pass'},
       signaturePng: status == RecordStatus.draft ? '' : 'data:image/png;base64,abc',
       signedAt: status == RecordStatus.draft ? '' : '2026-08-14T10:00:00.000Z',
@@ -103,19 +130,27 @@ LocalRecord _record(String uuid, RecordStatus status, {String? error}) => LocalR
       error: error,
     );
 
+/// Unlocks a [PinGateScreen] already on screen with [pinValue] and settles.
+Future<void> _unlockPin(WidgetTester tester, String pinValue) async {
+  await tester.enterText(find.byType(TextField), pinValue);
+  await tester.tap(find.widgetWithText(FilledButton, 'Unlock'));
+  await tester.pumpAndSettle();
+}
+
 void main() {
   setUpAll(() {
     sqfliteFfiInit();
   });
 
   group('AppShell role routing', () {
-    testWidgets('technician lands on their records + forms entry', (tester) async {
+    testWidgets('technician unlocks via their own PIN then lands on records + forms entry', (tester) async {
       final db = _newDb();
       addTearDown(db.close);
       final storage = InMemorySecureStorage();
       final session = SessionStore(storage);
       await session.save(user: _user(role: 'technician'));
-      final pin = PinLock(storage); // no PIN set yet -- bootstrap must not gate on it
+      final pin = PinLock(storage);
+      await pin.setPin('1234', owner: 'tech1'); // matches the session's own username
       final api = _FakeApi();
       final connectivity = _FakeConnectivity(true);
       addTearDown(connectivity.dispose);
@@ -124,6 +159,12 @@ void main() {
         home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
       ));
       await tester.pumpAndSettle();
+
+      // A technician with a session AND their own owned PIN always unlocks
+      // via the PIN gate first -- see the Critical 1/2 fixes, which stopped
+      // `_bootstrap` from ever routing a technician straight to home.
+      expect(find.byType(PinGateScreen), findsOneWidget);
+      await _unlockPin(tester, '1234');
 
       expect(find.byType(TechnicianHomeScreen), findsOneWidget);
       // "forms list" entry point -- the FAB that opens FormsListScreen.
@@ -186,6 +227,123 @@ void main() {
 
       expect(find.byType(AdminNoticeScreen), findsOneWidget);
       expect(find.textContaining('web'), findsWidgets);
+    });
+  });
+
+  group('AppShell cold start: stranded-device fixes (Critical 1 + 2)', () {
+    testWidgets('C2: a technician session with no PIN at all is routed to PIN setup, not home', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final storage = InMemorySecureStorage();
+      final session = SessionStore(storage);
+      await session.save(user: _user(role: 'technician'));
+      final pin = PinLock(storage); // interrupted-first-time-setup: no PIN was ever set
+      final api = _FakeApi();
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PinSetupScreen), findsOneWidget);
+      expect(find.byType(TechnicianHomeScreen), findsNothing);
+    });
+
+    testWidgets('C1: a technician session whose PIN belongs to a different (stale) owner is routed to PIN setup',
+        (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final storage = InMemorySecureStorage();
+      final session = SessionStore(storage);
+      await session.save(user: _user(role: 'technician', username: 'tech1'));
+      final pin = PinLock(storage);
+      await pin.setPin('1234', owner: 'other_tech'); // left behind by a previous technician
+      final api = _FakeApi();
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PinSetupScreen), findsOneWidget);
+      expect(find.byType(PinGateScreen), findsNothing);
+    });
+
+    testWidgets('offline cold start with a stored session (unattributed PIN) shows the PIN gate', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final storage = InMemorySecureStorage();
+      final session = SessionStore(storage);
+      await session.save(user: _user(role: 'technician'));
+      final pin = PinLock(storage);
+      await pin.setPin('1234'); // no owner recorded -- treated as this technician's own
+      final api = _FakeApi();
+      final connectivity = _FakeConnectivity(false); // offline cold start
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PinGateScreen), findsOneWidget);
+    });
+  });
+
+  group('PinGateScreen "sign in with password instead" (Critical 1 escape hatch)', () {
+    testWidgets('is enabled online and invokes the callback', (tester) async {
+      final storage = InMemorySecureStorage();
+      final pin = PinLock(storage);
+      await pin.setPin('1234', owner: 'other_tech');
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+      var usedPassword = false;
+
+      await tester.pumpWidget(MaterialApp(
+        home: PinGateScreen(
+          pin: pin,
+          connectivity: connectivity,
+          onUnlocked: () {},
+          onUsePassword: () => usedPassword = true,
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.widgetWithText(TextButton, 'Sign in with password instead'));
+      await tester.pumpAndSettle();
+
+      expect(usedPassword, isTrue);
+    });
+
+    testWidgets('is disabled offline and explains why', (tester) async {
+      final storage = InMemorySecureStorage();
+      final pin = PinLock(storage);
+      await pin.setPin('1234', owner: 'other_tech');
+      final connectivity = _FakeConnectivity(false);
+      addTearDown(connectivity.dispose);
+      var usedPassword = false;
+
+      await tester.pumpWidget(MaterialApp(
+        home: PinGateScreen(
+          pin: pin,
+          connectivity: connectivity,
+          onUnlocked: () {},
+          onUsePassword: () => usedPassword = true,
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      final button = tester.widget<TextButton>(find.widgetWithText(TextButton, 'Sign in with password instead'));
+      expect(button.onPressed, isNull);
+      expect(find.textContaining('Needs a connection'), findsOneWidget);
+
+      await tester.tap(find.widgetWithText(TextButton, 'Sign in with password instead'), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      expect(usedPassword, isFalse);
     });
   });
 
@@ -265,17 +423,132 @@ void main() {
     });
   });
 
-  group('AppShell cold start', () {
-    testWidgets('offline with a stored session shows the PIN gate', (tester) async {
+  group('SyncBanner cross-owner replay filter (I3a)', () {
+    testWidgets('a manual sync only replays the current user\'s own queued records', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      const mine = '11111111-1111-4111-8111-111111111111';
+      const theirs = '22222222-2222-4222-8222-222222222222';
+      await db.insertRecord(_record(mine, RecordStatus.queued));
+      await db.setRecordOwner(mine, 'tech1');
+      await db.insertRecord(_record(theirs, RecordStatus.queued));
+      await db.setRecordOwner(theirs, 'tech2');
+
+      final api = _FakeApi();
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+      final syncQueue = SyncQueue(db); // the REAL queue -- exercising the real include filter
+
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: SyncBanner(db: db, api: api, syncQueue: syncQueue, connectivity: connectivity, username: 'tech1'),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      final state = tester.state<SyncBannerState>(find.byType(SyncBanner));
+      await state.syncNow();
+      await tester.pumpAndSettle();
+
+      expect(api.syncBatches, [
+        [mine],
+      ]);
+      final theirRecord = await db.getRecord(theirs);
+      expect(theirRecord!.status, RecordStatus.queued); // untouched, never sent
+      final myRecord = await db.getRecord(mine);
+      expect(myRecord!.status, RecordStatus.synced);
+    });
+  });
+
+  group('TechnicianHomeScreen foreign records (I3b)', () {
+    testWidgets('a foreign ERROR record is absent from the list and not retryable, only counted', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      const foreignUuid = '44444444-4444-4444-8444-444444444444';
+      await db.insertRecord(_record(foreignUuid, RecordStatus.error, machineId: 'OTHER-MACHINE', error: 'INVALID: bad'));
+      await db.setRecordOwner(foreignUuid, 'other_tech');
+
+      final api = _FakeApi();
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: TechnicianHomeScreen(
+          api: api,
+          db: db,
+          connectivity: connectivity,
+          syncQueue: SyncQueue(db),
+          username: 'tech1',
+          userFullName: 'Tech One',
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      // Not listed at all -- no ERROR chip, no machine id, nothing tappable.
+      expect(find.text('ERROR'), findsNothing);
+      expect(find.textContaining('OTHER-MACHINE'), findsNothing);
+      // But still surfaced as a count so the technician knows it's there.
+      expect(find.textContaining('belong to another technician'), findsOneWidget);
+      expect(find.textContaining('hidden until they sign in'), findsOneWidget);
+    });
+  });
+
+  group('AppShell sign-out (I3c/I3f)', () {
+    testWidgets('clears the device token locally, calls the server once, and leaves PIN + records intact', (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      const uuid = '55555555-5555-4555-8555-555555555555';
+      await db.insertRecord(_record(uuid, RecordStatus.draft));
+      await db.setRecordOwner(uuid, 'tech1');
+
+      final storage = InMemorySecureStorage();
+      final session = SessionStore(storage);
+      await session.save(
+        user: _user(role: 'technician'),
+        deviceToken: 'tok-123',
+        deviceTokenExpiresAt: DateTime.now().add(const Duration(days: 1)).toIso8601String(),
+      );
+      final pin = PinLock(storage);
+      await pin.setPin('1234', owner: 'tech1');
+      final api = _FakeApi();
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
+      ));
+      await tester.pumpAndSettle();
+      await _unlockPin(tester, '1234');
+      expect(find.byType(TechnicianHomeScreen), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Sign out'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(LoginScreen), findsOneWidget);
+      expect(api.logoutCalls, 1);
+      expect(await session.loadDeviceToken(), isNull);
+      expect(api.deviceToken, isNull);
+      // Survive sign-out: the PIN and every local record.
+      expect(await pin.hasPin(), isTrue);
+      expect(await db.getRecord(uuid), isNotNull);
+    });
+  });
+
+  group('AppShell login flow with a failing bundle refresh (I3d)', () {
+    testWidgets('a throwing bundle() still lands on the technician home, with a visible notice', (tester) async {
       final db = _newDb();
       addTearDown(db.close);
       final storage = InMemorySecureStorage();
       final session = SessionStore(storage);
-      await session.save(user: _user(role: 'technician'));
-      final pin = PinLock(storage);
-      await pin.setPin('1234');
-      final api = _FakeApi();
-      final connectivity = _FakeConnectivity(false); // offline cold start
+      final pin = PinLock(storage); // fresh device: no PIN yet
+      final api = _FakeApi()
+        ..loginResult = LoginResult(
+          user: _user(role: 'technician'),
+          deviceToken: 'tok-abc',
+          deviceTokenExpiresAt: DateTime.now().add(const Duration(days: 1)).toIso8601String(),
+        )
+        ..bundleError = ApiException(500, 'Internal error');
+      final connectivity = _FakeConnectivity(true);
       addTearDown(connectivity.dispose);
 
       await tester.pumpWidget(MaterialApp(
@@ -283,7 +556,23 @@ void main() {
       ));
       await tester.pumpAndSettle();
 
-      expect(find.byType(PinGateScreen), findsOneWidget);
+      expect(find.byType(LoginScreen), findsOneWidget);
+      await tester.enterText(find.widgetWithText(TextField, 'Username'), 'tech1');
+      await tester.enterText(find.widgetWithText(TextField, 'Password'), 'secret');
+      await tester.tap(find.widgetWithText(FilledButton, 'Sign in'));
+      await tester.pumpAndSettle();
+
+      // No PIN existed yet -- first-time setup runs before the bundle
+      // refresh (and the home screen) is ever reached.
+      expect(find.byType(PinSetupScreen), findsOneWidget);
+      await tester.enterText(find.widgetWithText(TextField, 'New PIN'), '1234');
+      await tester.enterText(find.widgetWithText(TextField, 'Confirm PIN'), '1234');
+      await tester.tap(find.widgetWithText(FilledButton, 'Save PIN'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(TechnicianHomeScreen), findsOneWidget);
+      expect(find.textContaining('Could not refresh forms'), findsOneWidget);
+      expect(find.textContaining('Internal error'), findsOneWidget);
     });
   });
 
@@ -299,8 +588,15 @@ void main() {
       }
 
       var unlocked = false;
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
       await tester.pumpWidget(MaterialApp(
-        home: PinGateScreen(pin: pin, onUnlocked: () => unlocked = true),
+        home: PinGateScreen(
+          pin: pin,
+          connectivity: connectivity,
+          onUnlocked: () => unlocked = true,
+          onUsePassword: () {},
+        ),
       ));
       await tester.pumpAndSettle();
 
