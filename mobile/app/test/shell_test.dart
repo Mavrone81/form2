@@ -532,6 +532,46 @@ void main() {
       expect(await pin.hasPin(), isTrue);
       expect(await db.getRecord(uuid), isNotNull);
     });
+
+    testWidgets('a failing server logout still clears the session/device token locally and lands on login',
+        (tester) async {
+      final db = _newDb();
+      addTearDown(db.close);
+      final storage = InMemorySecureStorage();
+      final session = SessionStore(storage);
+      await session.save(
+        user: _user(role: 'technician'),
+        deviceToken: 'tok-456',
+        deviceTokenExpiresAt: DateTime.now().add(const Duration(days: 1)).toIso8601String(),
+      );
+      final pin = PinLock(storage);
+      await pin.setPin('1234', owner: 'tech1');
+      // logoutError previously sat unused in this fake -- exercised here so
+      // a failed/timed-out server round trip (offline mid-tap, a 500, the
+      // new request timeout, ...) is actually proven not to block a local
+      // sign-out, not merely asserted by comment.
+      final api = _FakeApi()..logoutError = ApiException(500, 'Internal error');
+      final connectivity = _FakeConnectivity(true);
+      addTearDown(connectivity.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        home: AppShell(api: api, db: db, session: session, pin: pin, connectivity: connectivity, syncQueue: SyncQueue(db)),
+      ));
+      await tester.pumpAndSettle();
+      await _unlockPin(tester, '1234');
+      expect(find.byType(TechnicianHomeScreen), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Sign out'));
+      await tester.pumpAndSettle();
+
+      // The failed server call is not swallowed silently -- it was
+      // attempted -- but it never blocks the local sign-out that follows.
+      expect(api.logoutCalls, 1);
+      expect(find.byType(LoginScreen), findsOneWidget);
+      expect(await session.loadDeviceToken(), isNull);
+      expect(api.deviceToken, isNull);
+      expect(await pin.hasPin(), isTrue); // still survives
+    });
   });
 
   group('AppShell login flow with a failing bundle refresh (I3d)', () {

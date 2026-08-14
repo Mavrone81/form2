@@ -256,6 +256,74 @@ void main() {
     });
   });
 
+  group('ApiClient cookie jar', () {
+    test('clearCookies() actually empties the jar -- no Cookie header on the next request', () async {
+      String? cookieHeaderBeforeClear;
+      String? cookieHeaderAfterClear;
+      var requestCount = 0;
+      final server = await _startServer((request) async {
+        requestCount++;
+        if (request.uri.path == '/login') {
+          _writeJson(request, 200, {'id': 1, 'role': 'team_leader'}, setCookie: 'connect.sid=jar-test; Path=/');
+        } else if (requestCount == 2) {
+          cookieHeaderBeforeClear = request.headers.value('cookie');
+          _writeJson(request, 200, {'generated_at': 'now', 'forms': [], 'skipped': []});
+        } else {
+          cookieHeaderAfterClear = request.headers.value('cookie');
+          _writeJson(request, 200, {'generated_at': 'now', 'forms': [], 'skipped': []});
+        }
+        await request.response.close();
+      });
+      addTearDown(server.close);
+
+      final client = ApiClient(baseUrl: _baseUrlFor(server));
+      await client.login('lead1', 'secret'); // captures the session cookie
+      await client.bundle(); // replays it
+
+      expect(cookieHeaderBeforeClear, contains('connect.sid=jar-test'));
+
+      // This is exactly what `logout()` does on success, and what
+      // `AppShellState._signOut` calls directly for the offline / failed-
+      // logout paths -- see client.dart's own doc on `clearCookies`.
+      client.clearCookies();
+      await client.bundle();
+
+      expect(cookieHeaderAfterClear, isNull);
+    });
+  });
+
+  group('ApiClient request timeout', () {
+    test('a request that never gets a response surfaces a timed-out ApiException', () async {
+      // Accepts the connection and reads the request, then simply never
+      // writes or closes a response -- a real (if crude) stand-in for a
+      // captive portal that answers the TCP handshake but never actually
+      // responds. requestTimeout is injected far below the 15s production
+      // default so this test proves the timeout path itself fires without
+      // waiting anywhere near that long.
+      final server = await _startServer((request) async {
+        await _readJsonBody(request); // drain the request; response never sent
+      });
+      addTearDown(server.close);
+
+      final client = ApiClient(baseUrl: _baseUrlFor(server), requestTimeout: const Duration(milliseconds: 300));
+
+      final stopwatch = Stopwatch()..start();
+      await expectLater(
+        () => client.login('tech1', 'secret'),
+        throwsA(
+          isA<ApiException>()
+              .having((e) => e.statusCode, 'statusCode', 0)
+              .having((e) => e.message, 'message', 'The request timed out. Check your connection and try again.'),
+        ),
+      );
+      stopwatch.stop();
+      // A generous upper bound (well under the 15s production default) --
+      // just proving this test's own short timeout was actually honoured,
+      // not the production one.
+      expect(stopwatch.elapsed, lessThan(const Duration(seconds: 5)));
+    });
+  });
+
   group('ApiClient default base URL', () {
     test('defaults to the production API root when unset', () {
       final client = ApiClient();

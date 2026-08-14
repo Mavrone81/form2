@@ -96,16 +96,25 @@ class SyncResult {
 ///
 /// `baseUrl` and `httpClient` are both constructor parameters specifically
 /// so a test can point this at a local `dart:io` HttpServer instead of the
-/// real deployment.
+/// real deployment. [requestTimeout] is likewise injectable -- defaulting to
+/// a real-world-sane 15s, but overridable so a test can prove the timeout
+/// path itself actually fires without an in-process test waiting 15 real
+/// seconds to see it.
 class ApiClient {
   ApiClient({
     String baseUrl = 'https://eform.bevorasg.com/api',
     http.Client? httpClient,
+    Duration requestTimeout = const Duration(seconds: 15),
   })  : baseUrl = baseUrl.endsWith('/') ? baseUrl.substring(0, baseUrl.length - 1) : baseUrl,
-        _client = httpClient ?? http.Client();
+        _client = httpClient ?? http.Client(),
+        // The public param name (`requestTimeout`) is deliberately not the
+        // private field's name, so an initializing formal can't do this.
+        // ignore: prefer_initializing_formals
+        _requestTimeout = requestTimeout;
 
   final String baseUrl;
   final http.Client _client;
+  final Duration _requestTimeout;
 
   String? _deviceToken;
   final Map<String, String> _cookies = {};
@@ -134,8 +143,6 @@ class ApiClient {
   /// respond, and a hung `await` on, say, the login-flow bundle refresh or
   /// `logout()` would otherwise wedge the app shell indefinitely instead of
   /// surfacing a plain, recoverable error.
-  static const _requestTimeout = Duration(seconds: 15);
-
   Future<http.Response> _send(Future<http.Response> Function() request) async {
     try {
       return await request().timeout(_requestTimeout);
